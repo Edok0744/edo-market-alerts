@@ -98,5 +98,8 @@ def test():
 @APP.route('/health')
 def health(): return jsonify(ok=True)
 
-if __name__=='__main__':
-    init_db(); threading.Thread(target=monitor,daemon=True).start(); APP.run(host='0.0.0.0',port=int(os.environ.get('PORT','8080')))
+init_db()
+threading.Thread(target=monitor, daemon=True).start()
+
+if __name__ == '__main__':
+    APP.run(host='0.0.0.0', port=int(os.environ.get('PORT', '8080')))
