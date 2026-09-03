@@ -116,7 +116,7 @@ a{text-decoration:none}
 <option value="ABOVE">ABOVE</option>
 <option value="BELOW">BELOW</option>
 </select>
-
+<input name="note" type="text" placeholder="Note: WINNING, DANGER, Take Profit...">
 <button>ARM</button>
 </div>
 
@@ -202,7 +202,11 @@ style="background:{{ colors[m['grp']] }}22;color:{{ colors[m['grp']] }}">
 <div class="small">
 Target {{m['direction']}} {{m['target']}}
 </div>
-
+{% if m['note'] %}
+<div class="small">
+📝 {{m['note']}}
+</div>
+{% endif %}
 </div>
 
 <div style="text-align:right">
@@ -277,7 +281,8 @@ def init_db():
             target REAL,
             triggered INTEGER DEFAULT 0,
             last_price REAL,
-            created TEXT
+            created TEXT,
+            note TEXT
         )
         ''')
 
@@ -289,7 +294,10 @@ def init_db():
             UNIQUE(symbol,grp)
         )
         ''')
-
+        try:
+            c.execute("ALTER TABLE alerts ADD COLUMN note TEXT")
+        except sqlite3.OperationalError:
+            pass
         c.commit()
 
 
@@ -385,7 +393,8 @@ def monitor():
                             send_push(
                                 f"🚨 {a['symbol']} PRICE ALERT",
                                 f"{a['symbol']} is {p}\n"
-                                f"Target: {a['direction']} {a['target']}"
+                                f"Target: {a['direction']} {a['target']}\n"
+                                f"Note: {a['note'] or '-'}"
                             )
 
                 c.commit()
@@ -429,22 +438,23 @@ def add():
     grp = request.form['group']
     direction = request.form['direction']
     target = float(request.form['target'])
-
+    note = request.form.get('note', '').strip()
     with db_conn() as c:
 
         c.execute(
             '''
             INSERT INTO alerts(
-                symbol,grp,direction,target,created
+symbol,grp,direction,target,created,note
             )
-            VALUES(?,?,?,?,?)
+            VALUES(?,?,?,?,?,?)
             ''',
             (
                 symbol,
                 grp,
                 direction,
                 target,
-                datetime.utcnow().isoformat()
+datetime.utcnow().isoformat(),
+note
             )
         )
 
