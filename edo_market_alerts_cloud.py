@@ -358,12 +358,14 @@ def monitor():
             with db_conn() as c:
 
                 rows = c.execute(
-                    'SELECT * FROM alerts'
+                    'SELECT * FROM alerts WHERE triggered=0'
                 ).fetchall()
-
+                price_cache = {}
                 for a in rows:
 
-                    p = latest_price(a['symbol'])
+                    if a['symbol'] not in price_cache:
+                        price_cache[a['symbol']] = latest_price(a['symbol'])
+                    p = price_cache[a['symbol']]
 
                     if p is None:
                         continue
