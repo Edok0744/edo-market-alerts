@@ -59,7 +59,7 @@ button{
     display:flex;
     justify-content:space-between;
     align-items:center;
-    gap:10px;
+    gap:8px;
     padding:12px;
     border-radius:14px;
     margin:8px 0;
@@ -75,6 +75,46 @@ button{
 .danger{background:#ff5e73;color:#fff}
 .secondary{background:#23394f;color:#fff}
 .favorite{background:#f2c94c;color:#07111f}
+.saved-actions{
+    display:flex;
+    gap:6px;
+    flex-wrap:nowrap;
+    align-items:center;
+    justify-content:flex-end;
+}
+.saved-actions button{
+    padding:10px 11px;
+    font-size:14px;
+    white-space:nowrap;
+}
+.saved-market{
+    flex-wrap:nowrap;
+}
+.saved-market > div:first-child{
+    min-width:0;
+}
+.saved-market b{
+    font-size:16px;
+}
+@media(max-width:600px){
+    .saved-market{
+        gap:6px;
+    }
+    .saved-actions{
+        gap:5px;
+    }
+    .saved-actions button{
+        padding:9px 8px;
+        font-size:13px;
+    }
+    .saved-market .pill{
+        font-size:10px;
+        padding:4px 7px;
+    }
+    .saved-market b{
+        font-size:15px;
+    }
+}
 h1{font-size:27px;margin-bottom:3px}
 h2{font-size:18px}
 .price{font-variant-numeric:tabular-nums;font-weight:700}
@@ -157,7 +197,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 
 {% for f in favorites %}
 
-<div class="market">
+<div class="market saved-market">
 
 <div>
 <span class="pill"
@@ -168,7 +208,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <b>{{f['symbol']}}</b>
 </div>
 
-<div>
+<div class="saved-actions">
 <a href="/favorite/use/{{f['id']}}">
 <button>USE</button>
 </a>
