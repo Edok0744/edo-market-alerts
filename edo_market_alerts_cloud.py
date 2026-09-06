@@ -98,21 +98,46 @@ button{
 }
 @media(max-width:600px){
     .saved-market{
-        gap:6px;
+        display:block;
+        padding:12px;
+    }
+    .saved-market > div:first-child{
+        width:100%;
+        margin-bottom:10px;
+        display:flex;
+        align-items:center;
+        gap:7px;
     }
     .saved-actions{
-        gap:5px;
+        width:100%;
+        display:grid;
+        grid-template-columns:0.85fr 1.15fr 1.35fr 1fr;
+        gap:6px;
+    }
+    .saved-actions a{
+        min-width:0;
     }
     .saved-actions button{
-        padding:9px 8px;
-        font-size:13px;
+        width:100%;
+        padding:9px 3px;
+        font-size:11px;
+        white-space:nowrap;
     }
     .saved-market .pill{
         font-size:10px;
         padding:4px 7px;
     }
     .saved-market b{
-        font-size:15px;
+        font-size:17px;
+        white-space:nowrap;
+    }
+
+    /* Non-FOREX rows only have USE, TREND and Delete. */
+    .three-actions{
+        grid-template-columns:0.85fr 1.25fr 1fr;
+    }
+    .forex-actions{
+        grid-template-columns:0.8fr 1.15fr 1.35fr 1fr;
     }
 }
 h1{font-size:27px;margin-bottom:3px}
@@ -212,7 +237,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <b>{{f['symbol']}}</b>
 </div>
 
-<div class="saved-actions">
+<div class="saved-actions {{ 'forex-actions' if f['grp']=='FOREX' else 'three-actions' }}">
 <a href="/favorite/use/{{f['id']}}">
 <button>USE</button>
 </a>
