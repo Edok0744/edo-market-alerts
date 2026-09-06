@@ -532,7 +532,7 @@ a{text-decoration:none}
 <body>
 <div class="wrap">
     <h1>⚡ {{ symbol }} EDO SETUP SIGNAL</h1>
-    <div class="small">Your price-action method • 8H and higher • Manual trade decision</div>
+    <div class="small">Your price-action method • 8H and higher • Wicks define levels, body closes confirm • Manual trade decision</div>
 
     <div class="tfrow">
         {% for tf in timeframes %}
@@ -926,10 +926,10 @@ def previous_target(candles, direction, before_index, search_back=60):
 def detect_bounce_retest(candles, conf):
     """
     Edo level/retest setup:
-      old structural high/low
+      wick LOW/HIGH is a valid structural support/resistance point
       meaningful candle separation
-      return to roughly the same zone
-      >50% candle-close confirmation
+      return to roughly the same wick-defined zone
+      >50% candle BODY-close confirmation
     """
     i = conf["index"]
     direction = conf["direction"]
@@ -940,17 +940,26 @@ def detect_bounce_retest(candles, conf):
     if ar <= 0:
         return None
 
-    # Include a few candles before confirmation because the actual zone touch can
-    # happen before the confirmation candle.
+    # The support/resistance point is allowed to come from the WICK.
+    # The second bounce/retest may occur a few candles before the confirmation.
     touch_start = max(2, i - 4)
     touch_end = i + 1
+    touch_slice = candles[touch_start:touch_end]
 
     if direction == "bullish":
-        retest_price = min(c["low"] for c in candles[touch_start:touch_end])
+        # Lowest lower-wick in the recent retest area = second support test.
+        rel_touch_i = min(range(len(touch_slice)), key=lambda k: touch_slice[k]["low"])
+        retest_price = touch_slice[rel_touch_i]["low"]
+        retest_index = touch_start + rel_touch_i
         swings = swing_points(candles[:touch_start], "low")
+        level_source = "lower wick"
     else:
-        retest_price = max(c["high"] for c in candles[touch_start:touch_end])
+        # Highest upper-wick in the recent retest area = second resistance test.
+        rel_touch_i = max(range(len(touch_slice)), key=lambda k: touch_slice[k]["high"])
+        retest_price = touch_slice[rel_touch_i]["high"]
+        retest_index = touch_start + rel_touch_i
         swings = swing_points(candles[:touch_start], "high")
+        level_source = "upper wick"
 
     # Adaptive support/resistance zone. Keeps the rule useful across JPY and
     # normal 1.x forex prices.
@@ -1017,6 +1026,8 @@ def detect_bounce_retest(candles, conf):
         "level": (old_price + retest_price) / 2.0,
         "old_level": old_price,
         "retest_price": retest_price,
+        "retest_date": candles[retest_index].get("datetime", ""),
+        "level_source": level_source,
         "old_date": candles[old_i].get("datetime", ""),
         "separation": separation,
         "weak_retest": weak_retest,
@@ -1091,13 +1102,15 @@ def describe_setup(p):
         detail = (
             f"{direction_word} candle-close confirmation on {p['confirmation_date']}. "
             f"The confirmation candle closed {p['penetration']:.0f}% back through the previous "
-            f"opposite-colour candle body. Price revisited a structural level after "
+            f"opposite-colour candle BODY. The structural support/resistance is allowed to be "
+            f"formed by the candle WICK. Price revisited that area after "
             f"{p['separation']} candles.{weak_text}"
         )
 
         level_text = (
-            f"Retest zone: {p['level']:.5f} • "
-            f"Earlier level: {p['old_level']:.5f} on {p['old_date']} • "
+            f"Wick-defined retest zone: {p['level']:.5f} • "
+            f"Earlier wick level: {p['old_level']:.5f} on {p['old_date']} • "
+            f"Second {p['level_source']} test: {p['retest_price']:.5f} on {p['retest_date']} • "
             f"Confirmation close: {p['confirmation_close']:.5f}"
         )
 
