@@ -1207,7 +1207,14 @@ def build_full_alignment(symbol):
 
 
 def save_trend_status(symbol, status):
+    """Save trend status and return the previous saved status."""
     with db_conn() as c:
+        row = c.execute(
+            "SELECT status FROM trend_status WHERE symbol=?",
+            (symbol,)
+        ).fetchone()
+        previous = row["status"] if row else None
+
         c.execute(
             """
             INSERT INTO trend_status(symbol,status,updated)
@@ -1219,6 +1226,8 @@ def save_trend_status(symbol, status):
             (symbol, status, datetime.utcnow().isoformat())
         )
         c.commit()
+
+    return previous
 
 
 def active_trend_monitor():
@@ -1247,7 +1256,18 @@ def active_trend_monitor():
                 if error:
                     print("active trend error", symbol, error)
                 else:
-                    save_trend_status(symbol, status)
+                    previous = save_trend_status(symbol, status)
+
+                    # Send one Pushover notification only when the pair ENTERS
+                    # a fully aligned bullish or bearish state. Repeated checks
+                    # in the same state do not send duplicate notifications.
+                    if status in ("FULL BULLISH", "FULL BEARISH") and status != previous:
+                        icon = "🟢" if status == "FULL BULLISH" else "🔴"
+                        direction = "bullish" if status == "FULL BULLISH" else "bearish"
+                        send_push(
+                            f"{icon} {symbol} — {status}",
+                            f"All 5 timeframes are {direction}: 1M, 1W, 1D, 4H, 1H."
+                        )
 
         except Exception as e:
             print("active trend monitor error", e)
