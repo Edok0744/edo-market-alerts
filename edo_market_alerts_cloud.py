@@ -531,8 +531,8 @@ a{text-decoration:none}
 </head>
 <body>
 <div class="wrap">
-    <h1>⚡ {{ symbol }} PATTERN SIGNAL</h1>
-    <div class="small">Price-action scan • 4H and higher • No EMA/RSI signal</div>
+    <h1>⚡ {{ symbol }} EDO SETUP SIGNAL</h1>
+    <div class="small">Your price-action method • 8H and higher • Manual trade decision</div>
 
     <div class="tfrow">
         {% for tf in timeframes %}
@@ -574,17 +574,17 @@ a{text-decoration:none}
             {% endfor %}
         {% else %}
             <div class="pattern">
-                <div class="pattern-title neutral">No clear price-action pattern yet</div>
+                <div class="pattern-title neutral">No matching setup yet</div>
                 <div class="pattern-detail">
-                    The selected timeframe does not currently show a clean double top/bottom,
-                    support/resistance rejection, or trendline break under the scanner rules.
+                    No recent candle sequence matches your bounce/retest or trend-pullback
+                    confirmation rules on this timeframe.
                 </div>
             </div>
         {% endif %}
 
         <div class="small" style="margin-top:12px">
-            Updated: {{ updated }}. Pattern signals are based only on candle price structure.
-            They are not guaranteed trade entries.
+            Updated: {{ updated }}. The scanner finds setups from your candle-close rules.
+            It does not place trades. You decide whether to pull the trigger.
         </div>
     {% endif %}
     </div>
@@ -698,15 +698,17 @@ def latest_price(symbol):
 PATTERN_SIGNAL_CACHE = {}
 PATTERN_SIGNAL_CACHE_SECONDS = 60
 
+# Edo's higher-timeframe setup scanner.
+# The scanner does NOT place trades. It only finds setups for manual review.
 PATTERN_TIMEFRAMES = [
-    {"label": "4H", "value": "4h"},
+    {"label": "8H", "value": "8h"},
     {"label": "1D", "value": "1day"},
     {"label": "1W", "value": "1week"},
     {"label": "1M", "value": "1month"},
 ]
 
 
-def get_ohlc(symbol, interval, outputsize=120):
+def get_ohlc(symbol, interval, outputsize=140):
     """Download OHLC candles from Twelve Data, oldest -> newest."""
     if not TWELVE_KEY:
         return None, "Twelve Data API key is not configured."
@@ -743,14 +745,14 @@ def get_ohlc(symbol, interval, outputsize=120):
             except (KeyError, TypeError, ValueError):
                 pass
 
-        if len(candles) < 35:
+        if len(candles) < 40:
             return None, f"Not enough {interval} candle history returned."
 
         return candles, None
 
     except Exception as e:
-        print("pattern data error", symbol, interval, e)
-        return None, "Could not download pattern data."
+        print("setup scanner data error", symbol, interval, e)
+        return None, "Could not download setup data."
 
 
 def swing_points(candles, kind="low", left=2, right=2):
@@ -773,275 +775,355 @@ def swing_points(candles, kind="low", left=2, right=2):
     return points
 
 
-def pct_diff(a, b):
-    mid = (abs(a) + abs(b)) / 2.0
-    if mid == 0:
-        return 0
-    return abs(a - b) / mid
+def candle_colour(c):
+    if c["close"] > c["open"]:
+        return "green"
+    if c["close"] < c["open"]:
+        return "red"
+    return "flat"
 
 
-def detect_double_bottom(candles):
-    lows = swing_points(candles, "low")
-    best = None
-
-    # Use recent 70 candles and require meaningful space between the two lows.
-    for x in range(len(lows)):
-        i1, p1 = lows[x]
-        if i1 < max(0, len(candles) - 75):
-            continue
-
-        for y in range(x + 1, len(lows)):
-            i2, p2 = lows[y]
-            gap = i2 - i1
-
-            if gap < 5 or gap > 35:
-                continue
-            if pct_diff(p1, p2) > 0.006:
-                continue
-
-            middle_high = max(c["high"] for c in candles[i1:i2+1])
-            base = (p1 + p2) / 2.0
-            bounce = (middle_high - base) / base
-
-            if bounce < 0.006:
-                continue
-
-            latest_close = candles[-1]["close"]
-            confirmed = latest_close > middle_high
-            recent_enough = i2 >= len(candles) - 18
-
-            if not recent_enough:
-                continue
-
-            quality = bounce - pct_diff(p1, p2)
-            candidate = {
-                "name": "Double Bottom",
-                "direction": "bullish",
-                "confirmed": confirmed,
-                "level": middle_high,
-                "p1": p1,
-                "p2": p2,
-                "date1": candles[i1].get("datetime", ""),
-                "date2": candles[i2].get("datetime", ""),
-                "gap": gap,
-                "quality": quality,
-            }
-
-            if best is None or candidate["quality"] > best["quality"]:
-                best = candidate
-
-    return best
+def avg_range(candles, end=None, length=20):
+    if end is None:
+        end = len(candles)
+    part = candles[max(0, end-length):end]
+    if not part:
+        return 0.0
+    return sum(max(0.0, c["high"] - c["low"]) for c in part) / len(part)
 
 
-def detect_double_top(candles):
-    highs = swing_points(candles, "high")
-    best = None
-
-    for x in range(len(highs)):
-        i1, p1 = highs[x]
-        if i1 < max(0, len(candles) - 75):
-            continue
-
-        for y in range(x + 1, len(highs)):
-            i2, p2 = highs[y]
-            gap = i2 - i1
-
-            if gap < 5 or gap > 35:
-                continue
-            if pct_diff(p1, p2) > 0.006:
-                continue
-
-            middle_low = min(c["low"] for c in candles[i1:i2+1])
-            top = (p1 + p2) / 2.0
-            drop = (top - middle_low) / top
-
-            if drop < 0.006:
-                continue
-
-            latest_close = candles[-1]["close"]
-            confirmed = latest_close < middle_low
-            recent_enough = i2 >= len(candles) - 18
-
-            if not recent_enough:
-                continue
-
-            quality = drop - pct_diff(p1, p2)
-            candidate = {
-                "name": "Double Top",
-                "direction": "bearish",
-                "confirmed": confirmed,
-                "level": middle_low,
-                "p1": p1,
-                "p2": p2,
-                "date1": candles[i1].get("datetime", ""),
-                "date2": candles[i2].get("datetime", ""),
-                "gap": gap,
-                "quality": quality,
-            }
-
-            if best is None or candidate["quality"] > best["quality"]:
-                best = candidate
-
-    return best
+def avg_body(candles, end=None, length=20):
+    if end is None:
+        end = len(candles)
+    part = candles[max(0, end-length):end]
+    if not part:
+        return 0.0
+    return sum(abs(c["close"] - c["open"]) for c in part) / len(part)
 
 
-def detect_rejection(candles):
-    """Detect a recent rejection from a repeatedly tested horizontal level."""
-    recent = candles[-45:]
-    latest = recent[-1]
-    avg_range = sum(c["high"] - c["low"] for c in recent[-20:]) / 20.0
-
-    if avg_range <= 0:
+def confirmation_at(candles, i):
+    """
+    Edo confirmation:
+      bullish = green candle closes >50% back through previous red body
+      bearish = red candle closes >50% back through previous green body
+    """
+    if i <= 0 or i >= len(candles):
         return None
 
-    # Support rejection: recent lows cluster near a level and latest candle rejects upward.
-    lows = sorted(c["low"] for c in recent[:-1])[:8]
-    support = sum(lows[:4]) / 4.0
-    support_touches = sum(1 for c in recent[:-1] if abs(c["low"] - support) <= avg_range * 0.35)
+    prev = candles[i-1]
+    curr = candles[i]
+    prev_colour = candle_colour(prev)
+    curr_colour = candle_colour(curr)
+    body = abs(prev["close"] - prev["open"])
 
-    lower_wick = min(latest["open"], latest["close"]) - latest["low"]
-    body = abs(latest["close"] - latest["open"])
+    if body <= 0:
+        return None
 
-    if (
-        support_touches >= 2
-        and abs(latest["low"] - support) <= avg_range * 0.45
-        and lower_wick >= max(body * 1.2, avg_range * 0.25)
-        and latest["close"] > latest["open"]
-    ):
-        return {
-            "name": "Support Rejection",
-            "direction": "bullish",
-            "confirmed": True,
-            "level": support,
-        }
+    midpoint = (prev["open"] + prev["close"]) / 2.0
 
-    # Resistance rejection.
-    highs = sorted((c["high"] for c in recent[:-1]), reverse=True)[:8]
-    resistance = sum(highs[:4]) / 4.0
-    resistance_touches = sum(1 for c in recent[:-1] if abs(c["high"] - resistance) <= avg_range * 0.35)
+    if prev_colour == "red" and curr_colour == "green" and curr["close"] > midpoint:
+        penetration = ((curr["close"] - prev["close"]) / body) * 100.0
+        if penetration >= 50.0:
+            return {
+                "direction": "bullish",
+                "index": i,
+                "penetration": penetration,
+                "date": curr.get("datetime", ""),
+                "close": curr["close"],
+                "previous_midpoint": midpoint,
+            }
 
-    upper_wick = latest["high"] - max(latest["open"], latest["close"])
-
-    if (
-        resistance_touches >= 2
-        and abs(latest["high"] - resistance) <= avg_range * 0.45
-        and upper_wick >= max(body * 1.2, avg_range * 0.25)
-        and latest["close"] < latest["open"]
-    ):
-        return {
-            "name": "Resistance Rejection",
-            "direction": "bearish",
-            "confirmed": True,
-            "level": resistance,
-        }
+    if prev_colour == "green" and curr_colour == "red" and curr["close"] < midpoint:
+        penetration = ((prev["close"] - curr["close"]) / body) * 100.0
+        if penetration >= 50.0:
+            return {
+                "direction": "bearish",
+                "index": i,
+                "penetration": penetration,
+                "date": curr.get("datetime", ""),
+                "close": curr["close"],
+                "previous_midpoint": midpoint,
+            }
 
     return None
 
 
-def line_value(p1, p2, x):
-    x1, y1 = p1
-    x2, y2 = p2
-    if x2 == x1:
-        return y2
-    slope = (y2 - y1) / (x2 - x1)
-    return y1 + slope * (x - x1)
+def recent_confirmations(candles, lookback=6):
+    found = []
+    first = max(1, len(candles) - lookback)
+
+    for i in range(first, len(candles)):
+        c = confirmation_at(candles, i)
+        if c:
+            found.append(c)
+
+    # Newest first.
+    return list(reversed(found))
 
 
-def detect_trendline_break(candles):
-    """Find a clean break of a recent descending/ascending swing trendline."""
-    highs = swing_points(candles, "high")
-    lows = swing_points(candles, "low")
+def local_structure_trend(candles, end_index):
+    """
+    Simple price-structure direction before a pullback.
+    Uses recent close progress plus swing structure. No EMA/RSI.
+    """
+    if end_index < 12:
+        return "mixed"
 
-    # Descending resistance trendline -> bullish break.
-    recent_highs = [p for p in highs if p[0] >= len(candles) - 60]
-    if len(recent_highs) >= 2:
-        p1, p2 = recent_highs[-2], recent_highs[-1]
+    start = max(0, end_index - 28)
+    part = candles[start:end_index]
+    if len(part) < 10:
+        return "mixed"
 
-        if p2[1] < p1[1] and p2[0] < len(candles) - 1:
-            line_prev = line_value(p1, p2, len(candles) - 2)
-            line_now = line_value(p1, p2, len(candles) - 1)
+    first_close = sum(c["close"] for c in part[:4]) / 4.0
+    last_close = sum(c["close"] for c in part[-4:]) / 4.0
+    move = (last_close - first_close) / first_close if first_close else 0.0
 
-            prev_close = candles[-2]["close"]
-            now_close = candles[-1]["close"]
+    highs = swing_points(part, "high")
+    lows = swing_points(part, "low")
 
-            if prev_close <= line_prev and now_close > line_now:
-                return {
-                    "name": "Descending Trendline Break",
-                    "direction": "bullish",
-                    "confirmed": True,
-                    "level": line_now,
-                }
+    hh = len(highs) >= 2 and highs[-1][1] > highs[-2][1]
+    hl = len(lows) >= 2 and lows[-1][1] > lows[-2][1]
+    lh = len(highs) >= 2 and highs[-1][1] < highs[-2][1]
+    ll = len(lows) >= 2 and lows[-1][1] < lows[-2][1]
 
-    # Ascending support trendline -> bearish break.
-    recent_lows = [p for p in lows if p[0] >= len(candles) - 60]
-    if len(recent_lows) >= 2:
-        p1, p2 = recent_lows[-2], recent_lows[-1]
+    if (hh and hl) or move > 0.004:
+        return "bullish"
+    if (lh and ll) or move < -0.004:
+        return "bearish"
+    return "mixed"
 
-        if p2[1] > p1[1] and p2[0] < len(candles) - 1:
-            line_prev = line_value(p1, p2, len(candles) - 2)
-            line_now = line_value(p1, p2, len(candles) - 1)
 
-            prev_close = candles[-2]["close"]
-            now_close = candles[-1]["close"]
+def previous_target(candles, direction, before_index, search_back=60):
+    """
+    BUY target = previous significant swing high.
+    SELL target = previous significant swing low.
+    """
+    start = max(0, before_index - search_back)
+    part = candles[start:before_index+1]
+    if len(part) < 5:
+        return None
 
-            if prev_close >= line_prev and now_close < line_now:
-                return {
-                    "name": "Ascending Trendline Break",
-                    "direction": "bearish",
-                    "confirmed": True,
-                    "level": line_now,
-                }
+    if direction == "bullish":
+        pts = swing_points(part, "high")
+        if pts:
+            candidates = [p[1] for p in pts]
+            above = [v for v in candidates if v > candles[before_index]["close"]]
+            if above:
+                return min(above)
+            return max(candidates)
+    else:
+        pts = swing_points(part, "low")
+        if pts:
+            candidates = [p[1] for p in pts]
+            below = [v for v in candidates if v < candles[before_index]["close"]]
+            if below:
+                return max(below)
+            return min(candidates)
 
     return None
 
 
-def describe_pattern(p):
-    if p["name"] == "Double Bottom":
-        status = "confirmed" if p["confirmed"] else "forming"
+def detect_bounce_retest(candles, conf):
+    """
+    Edo level/retest setup:
+      old structural high/low
+      meaningful candle separation
+      return to roughly the same zone
+      >50% candle-close confirmation
+    """
+    i = conf["index"]
+    direction = conf["direction"]
+    if i < 12:
+        return None
+
+    ar = avg_range(candles, i+1, 20)
+    if ar <= 0:
+        return None
+
+    # Include a few candles before confirmation because the actual zone touch can
+    # happen before the confirmation candle.
+    touch_start = max(2, i - 4)
+    touch_end = i + 1
+
+    if direction == "bullish":
+        retest_price = min(c["low"] for c in candles[touch_start:touch_end])
+        swings = swing_points(candles[:touch_start], "low")
+    else:
+        retest_price = max(c["high"] for c in candles[touch_start:touch_end])
+        swings = swing_points(candles[:touch_start], "high")
+
+    # Adaptive support/resistance zone. Keeps the rule useful across JPY and
+    # normal 1.x forex prices.
+    zone_tolerance = max(ar * 0.65, abs(retest_price) * 0.0025)
+
+    candidates = []
+    for old_i, old_price in swings:
+        separation = touch_start - old_i
+        if separation < 8 or separation > 90:
+            continue
+        if abs(old_price - retest_price) > zone_tolerance:
+            continue
+
+        between = candles[old_i+1:touch_start]
+        if not between:
+            continue
+
+        if direction == "bullish":
+            moved_away = max(c["high"] for c in between) - min(old_price, retest_price)
+        else:
+            moved_away = max(old_price, retest_price) - min(c["low"] for c in between)
+
+        # Price must have genuinely left the zone before returning.
+        if moved_away < ar * 2.0:
+            continue
+
+        closeness = 1.0 - min(1.0, abs(old_price - retest_price) / zone_tolerance)
+        candidates.append((old_i, old_price, separation, closeness, moved_away))
+
+    if not candidates:
+        return None
+
+    # Prefer a clean recent structural retest with good level similarity.
+    old_i, old_price, separation, closeness, moved_away = max(
+        candidates,
+        key=lambda x: (x[3], x[2])
+    )
+
+    body_reference = avg_body(candles, touch_start, 20)
+    recent_bodies = [
+        abs(c["close"] - c["open"])
+        for c in candles[max(old_i+1, i-4):i]
+    ]
+    weak_retest = (
+        body_reference > 0
+        and recent_bodies
+        and (sum(recent_bodies) / len(recent_bodies)) < body_reference * 0.85
+    )
+
+    target = previous_target(candles, direction, i)
+    score = 5.0 + min(3.0, separation / 12.0) + closeness * 2.0
+    score += min(2.0, max(0.0, conf["penetration"] - 50.0) / 25.0)
+    if weak_retest:
+        score += 1.0
+
+    return {
+        "name": "BOUNCE / RETEST SETUP",
+        "direction": direction,
+        "confirmed": True,
+        "score": score,
+        "confirmation_date": conf["date"],
+        "confirmation_close": conf["close"],
+        "penetration": conf["penetration"],
+        "level": (old_price + retest_price) / 2.0,
+        "old_level": old_price,
+        "retest_price": retest_price,
+        "old_date": candles[old_i].get("datetime", ""),
+        "separation": separation,
+        "weak_retest": weak_retest,
+        "target": target,
+    }
+
+
+def count_same_colour_before(candles, i, colour):
+    count = 0
+    j = i - 1
+
+    while j >= 0 and candle_colour(candles[j]) == colour:
+        count += 1
+        j -= 1
+
+    return count, j + 1
+
+
+def detect_trend_pullback(candles, conf):
+    """
+    Edo trend-pullback setup:
+      established bigger price direction
+      3+ same-colour candles pulling against it
+      opposite candle closes >50% through the previous candle
+    """
+    i = conf["index"]
+    direction = conf["direction"]
+
+    if direction == "bullish":
+        run_colour = "red"
+        required_trend = "bullish"
+    else:
+        run_colour = "green"
+        required_trend = "bearish"
+
+    run_count, run_start = count_same_colour_before(candles, i, run_colour)
+
+    if run_count < 3:
+        return None
+
+    trend = local_structure_trend(candles, run_start)
+    if trend != required_trend:
+        return None
+
+    target = previous_target(candles, direction, run_start)
+    score = 6.0 + min(3.0, (run_count - 3) * 0.75)
+    score += min(2.0, max(0.0, conf["penetration"] - 50.0) / 25.0)
+
+    return {
+        "name": "TREND PULLBACK SETUP",
+        "direction": direction,
+        "confirmed": True,
+        "score": score,
+        "confirmation_date": conf["date"],
+        "confirmation_close": conf["close"],
+        "penetration": conf["penetration"],
+        "run_count": run_count,
+        "run_colour": run_colour,
+        "trend": trend,
+        "target": target,
+    }
+
+
+def describe_setup(p):
+    bullish = p["direction"] == "bullish"
+    icon = "🟢" if bullish else "🔴"
+    css = "buy" if bullish else "sell"
+    direction_word = "Bullish" if bullish else "Bearish"
+
+    if p["name"] == "BOUNCE / RETEST SETUP":
+        weak_text = " Weakness was also detected in the retest candles." if p["weak_retest"] else ""
         detail = (
-            f"Low 1: {p['p1']:.5f} on {p.get('date1','?')} • "
-            f"Low 2: {p['p2']:.5f} on {p.get('date2','?')}. "
-            f"They are separated by {p['gap']} candles with a clear bounce between them. "
-            f"The pattern is {status}."
+            f"{direction_word} candle-close confirmation on {p['confirmation_date']}. "
+            f"The confirmation candle closed {p['penetration']:.0f}% back through the previous "
+            f"opposite-colour candle body. Price revisited a structural level after "
+            f"{p['separation']} candles.{weak_text}"
         )
-        level_text = f"Neckline / breakout level: {p['level']:.5f}"
 
-    elif p["name"] == "Double Top":
-        status = "confirmed" if p["confirmed"] else "forming"
-        detail = (
-            f"Top 1: {p['p1']:.5f} on {p.get('date1','?')} • "
-            f"Top 2: {p['p2']:.5f} on {p.get('date2','?')}. "
-            f"They are separated by {p['gap']} candles with a clear drop between them. "
-            f"The pattern is {status}."
+        level_text = (
+            f"Retest zone: {p['level']:.5f} • "
+            f"Earlier level: {p['old_level']:.5f} on {p['old_date']} • "
+            f"Confirmation close: {p['confirmation_close']:.5f}"
         )
-        level_text = f"Neckline / breakdown level: {p['level']:.5f}"
-
-    elif p["name"] == "Support Rejection":
-        detail = "Price tested a repeated support area and rejected upward on the latest candle."
-        level_text = f"Support area: {p['level']:.5f}"
-
-    elif p["name"] == "Resistance Rejection":
-        detail = "Price tested a repeated resistance area and rejected downward on the latest candle."
-        level_text = f"Resistance area: {p['level']:.5f}"
-
-    elif p["name"] == "Descending Trendline Break":
-        detail = "The latest candle closed above a descending swing-high trendline."
-        level_text = f"Trendline break level: {p['level']:.5f}"
 
     else:
-        detail = "The latest candle closed below an ascending swing-low trendline."
-        level_text = f"Trendline break level: {p['level']:.5f}"
+        detail = (
+            f"{direction_word} trend-pullback confirmation on {p['confirmation_date']}. "
+            f"{p['run_count']} {p['run_colour']} candles pulled against the larger "
+            f"{p['trend']} price structure, then the confirmation candle closed "
+            f"{p['penetration']:.0f}% back through the previous candle body."
+        )
 
-    bullish = p["direction"] == "bullish"
+        level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
+
+    if p.get("target") is not None:
+        target_word = "previous structural high" if bullish else "previous structural low"
+        level_text += f" • Review target ({target_word}): {p['target']:.5f}"
 
     return {
         "name": p["name"],
         "detail": detail,
         "level_text": level_text,
-        "icon": "🟢" if bullish else "🔴",
-        "css": "buy" if bullish else "sell",
+        "icon": icon,
+        "css": css,
         "direction": p["direction"],
-        "confirmed": p.get("confirmed", False),
+        "confirmed": True,
+        "score": p.get("score", 0),
     }
 
 
@@ -1053,7 +1135,7 @@ def build_pattern_signal(symbol, interval, force_refresh=False):
     if cached and not force_refresh and now - cached["saved_at"] < PATTERN_SIGNAL_CACHE_SECONDS:
         return cached["data"], None
 
-    candles, error = get_ohlc(symbol, interval, outputsize=120)
+    candles, error = get_ohlc(symbol, interval, outputsize=140)
 
     if error:
         if "credits" in error.lower() or "limit" in error.lower():
@@ -1061,49 +1143,76 @@ def build_pattern_signal(symbol, interval, force_refresh=False):
         return None, error
 
     found = []
+    confirmations = recent_confirmations(candles, lookback=7)
 
-    for detector in (
-        detect_double_bottom,
-        detect_double_top,
-        detect_rejection,
-        detect_trendline_break,
-    ):
-        p = detector(candles)
-        if p:
-            found.append(p)
+    for conf in confirmations:
+        retest = detect_bounce_retest(candles, conf)
+        if retest:
+            found.append(retest)
 
-    # Confirmed patterns are more important than forming patterns.
-    found.sort(key=lambda p: (p.get("confirmed", False), p.get("quality", 0)), reverse=True)
+        pullback = detect_trend_pullback(candles, conf)
+        if pullback:
+            found.append(pullback)
 
-    bullish_confirmed = sum(1 for p in found if p["direction"] == "bullish" and p.get("confirmed", False))
-    bearish_confirmed = sum(1 for p in found if p["direction"] == "bearish" and p.get("confirmed", False))
-    bullish_forming = sum(1 for p in found if p["direction"] == "bullish" and not p.get("confirmed", False))
-    bearish_forming = sum(1 for p in found if p["direction"] == "bearish" and not p.get("confirmed", False))
+    # Avoid duplicate descriptions of the same setup/direction/confirmation.
+    unique = {}
+    for p in found:
+        key = (p["name"], p["direction"], p["confirmation_date"])
+        if key not in unique or p.get("score", 0) > unique[key].get("score", 0):
+            unique[key] = p
 
-    if bullish_confirmed > bearish_confirmed and bullish_confirmed > 0:
-        signal = "BULLISH PATTERN SIGNAL"
+    found = list(unique.values())
+    found.sort(
+        key=lambda p: (
+            p.get("confirmation_date", ""),
+            p.get("score", 0)
+        ),
+        reverse=True
+    )
+
+    bullish = [p for p in found if p["direction"] == "bullish"]
+    bearish = [p for p in found if p["direction"] == "bearish"]
+
+    if bullish and not bearish:
+        signal = "BULLISH SETUP DETECTED"
         icon, css = "🟢", "buy"
-        summary = "At least one bullish price-action pattern is confirmed on this timeframe."
-    elif bearish_confirmed > bullish_confirmed and bearish_confirmed > 0:
-        signal = "BEARISH PATTERN SIGNAL"
+        summary = (
+            "Your candle-close rules found a bullish setup. Review the chart yourself "
+            "before deciding whether to trade."
+        )
+    elif bearish and not bullish:
+        signal = "BEARISH SETUP DETECTED"
         icon, css = "🔴", "sell"
-        summary = "At least one bearish price-action pattern is confirmed on this timeframe."
-    elif bullish_confirmed and bearish_confirmed:
-        signal = "MIXED PATTERNS"
-        icon, css = "🟡", "wait"
-        summary = "Bullish and bearish structures are both present. Better to wait for clearer direction."
-    elif bullish_forming > bearish_forming and bullish_forming > 0:
-        signal = "BULLISH SETUP FORMING"
-        icon, css = "🟡", "wait"
-        summary = "A bullish structure is forming but has not confirmed yet."
-    elif bearish_forming > bullish_forming and bearish_forming > 0:
-        signal = "BEARISH SETUP FORMING"
-        icon, css = "🟡", "wait"
-        summary = "A bearish structure is forming but has not confirmed yet."
+        summary = (
+            "Your candle-close rules found a bearish setup. Review the chart yourself "
+            "before deciding whether to trade."
+        )
+    elif bullish and bearish:
+        # If both exist, favour a clearly stronger/recent setup only when the score
+        # difference is meaningful; otherwise show mixed.
+        best_bull = max(bullish, key=lambda p: p.get("score", 0))
+        best_bear = max(bearish, key=lambda p: p.get("score", 0))
+        diff = best_bull.get("score", 0) - best_bear.get("score", 0)
+
+        if diff >= 2.0:
+            signal = "BULLISH SETUP DETECTED"
+            icon, css = "🟢", "buy"
+            summary = "Bullish evidence is stronger, but a bearish setup also exists. Review the chart."
+        elif diff <= -2.0:
+            signal = "BEARISH SETUP DETECTED"
+            icon, css = "🔴", "sell"
+            summary = "Bearish evidence is stronger, but a bullish setup also exists. Review the chart."
+        else:
+            signal = "MIXED SETUPS"
+            icon, css = "🟡", "wait"
+            summary = "Bullish and bearish setup evidence are both present. Review the chart and wait for clarity."
     else:
-        signal = "NO CLEAR SIGNAL"
+        signal = "NO EDO SETUP YET"
         icon, css = "⚪", "neutral"
-        summary = "No clean higher-timeframe price-action setup is confirmed right now."
+        summary = (
+            "No recent setup matches your retest or 3+ candle pullback confirmation rules "
+            "on this timeframe."
+        )
 
     data = {
         "price": candles[-1]["close"],
@@ -1111,13 +1220,12 @@ def build_pattern_signal(symbol, interval, force_refresh=False):
         "signal_icon": icon,
         "signal_css": css,
         "summary": summary,
-        "patterns": [describe_pattern(p) for p in found[:4]],
+        "patterns": [describe_setup(p) for p in found[:4]],
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
     PATTERN_SIGNAL_CACHE[cache_key] = {"saved_at": now, "data": data}
     return data, None
-
 
 
 def get_daily_candles_for_alignment(symbol, outputsize=1800):
@@ -1634,10 +1742,10 @@ def signal(i):
         return redirect('/')
 
     allowed = {x["value"]: x["label"] for x in PATTERN_TIMEFRAMES}
-    selected_tf = request.args.get("tf", "4h")
+    selected_tf = request.args.get("tf", "8h")
 
     if selected_tf not in allowed:
-        selected_tf = "4h"
+        selected_tf = "8h"
 
     force_refresh = request.args.get('refresh') == '1'
     data, error = build_pattern_signal(
