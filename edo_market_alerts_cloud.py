@@ -119,7 +119,11 @@ h1{font-size:27px;margin-bottom:3px}
 h2{font-size:18px}
 .price{font-variant-numeric:tabular-nums;font-weight:700}
 .status{font-size:12px;font-weight:800}
+.fulltrend{font-size:12px;font-weight:900;margin-top:4px}
+.fullbull{color:#35e28a}
+.fullbear{color:#ff6b7d}
 .trendbtn{background:#5dade2;color:#07111f}
+.livebtn{background:#f2c94c;color:#07111f}
 .trend-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px}
 .trend-box{background:#12263b;border-radius:12px;padding:10px;text-align:center}
 .trend-tf{font-size:12px;color:#8ca7bf;font-weight:800}
@@ -217,6 +221,12 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <button class="trendbtn">📊 TREND</button>
 </a>
 
+{% if f['grp'] == 'FOREX' %}
+<a href="/signal/{{f['id']}}">
+<button class="livebtn">⚡ SIGNAL</button>
+</a>
+{% endif %}
+
 <a href="/favorite/delete/{{f['id']}}">
 <button class="danger">Delete</button>
 </a>
@@ -274,6 +284,13 @@ Target {{m['direction']}} {{m['target']}}
 <div class="status">
 {{'✅ TRIGGERED' if m['triggered'] else '🟢 ARMED'}}
 </div>
+
+{% set ts = trend_statuses.get(m['symbol']) %}
+{% if ts == 'FULL BULLISH' %}
+<div class="fulltrend fullbull">🟢 FULL BULLISH</div>
+{% elif ts == 'FULL BEARISH' %}
+<div class="fulltrend fullbear">🔴 FULL BEARISH</div>
+{% endif %}
 
 <div>
 <a href="/reset/{{m['id']}}">
@@ -416,6 +433,147 @@ a{text-decoration:none}
 """
 
 
+
+SIGNAL_HTML = r"""
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ symbol }} Pattern Signal - Edo Market Alerts</title>
+<style>
+body{
+    font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
+    background:#07111f;
+    color:#eef6ff;
+    margin:0;
+}
+.wrap{max-width:760px;margin:auto;padding:18px}
+.card{
+    background:#0d1b2a;
+    border-radius:18px;
+    padding:16px;
+    margin:12px 0;
+}
+button{
+    font-size:15px;
+    border:0;
+    border-radius:12px;
+    padding:11px 13px;
+    background:#1fd1a5;
+    font-weight:800;
+    cursor:pointer;
+}
+a{text-decoration:none}
+.small{color:#8ca7bf;font-size:13px}
+.signal{font-size:28px;font-weight:900;margin-top:10px}
+.buy{color:#35e28a}
+.sell{color:#ff6b7d}
+.wait{color:#f2c94c}
+.neutral{color:#8ca7bf}
+.error{color:#ff8a96;font-weight:800}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.tfrow{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
+.tfbtn{background:#23394f;color:#eef6ff}
+.tfactive{background:#1fd1a5;color:#07111f}
+.pattern{
+    background:#12263b;
+    border-radius:14px;
+    padding:13px;
+    margin-top:10px;
+}
+.pattern-title{font-size:17px;font-weight:900}
+.pattern-detail{font-size:13px;color:#a9bfd2;margin-top:5px;line-height:1.4}
+.level{font-size:14px;font-weight:800;margin-top:7px}
+.pricebox{
+    display:flex;
+    justify-content:space-between;
+    gap:10px;
+    background:#12263b;
+    border-radius:14px;
+    padding:12px;
+    margin-top:10px;
+}
+.pricebig{font-size:22px;font-weight:900}
+.badge{
+    display:inline-block;
+    padding:5px 9px;
+    border-radius:999px;
+    background:#23394f;
+    font-size:12px;
+    font-weight:900;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <h1>⚡ {{ symbol }} PATTERN SIGNAL</h1>
+    <div class="small">Price-action scan • 4H and higher • No EMA/RSI signal</div>
+
+    <div class="tfrow">
+        {% for tf in timeframes %}
+        <a href="/signal/{{ fav_id }}?tf={{ tf['value'] }}">
+            <button class="{{ 'tfactive' if tf['value'] == selected_tf else 'tfbtn' }}">
+                {{ tf['label'] }}
+            </button>
+        </a>
+        {% endfor %}
+    </div>
+
+    <div class="card">
+    {% if error %}
+        <div class="error">{{ error }}</div>
+    {% else %}
+        <div class="pricebox">
+            <div>
+                <div class="small">Latest close</div>
+                <div class="pricebig">{{ price }}</div>
+            </div>
+            <div style="text-align:right">
+                <div class="small">Timeframe</div>
+                <div class="badge">{{ selected_label }}</div>
+            </div>
+        </div>
+
+        <div class="signal {{ signal_css }}">{{ signal_icon }} {{ signal }}</div>
+        <div class="small" style="margin-top:6px">{{ summary }}</div>
+
+        {% if patterns %}
+            {% for p in patterns %}
+            <div class="pattern">
+                <div class="pattern-title {{ p['css'] }}">{{ p['icon'] }} {{ p['name'] }}</div>
+                <div class="pattern-detail">{{ p['detail'] }}</div>
+                {% if p['level_text'] %}
+                <div class="level">{{ p['level_text'] }}</div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="pattern">
+                <div class="pattern-title neutral">No clear price-action pattern yet</div>
+                <div class="pattern-detail">
+                    The selected timeframe does not currently show a clean double top/bottom,
+                    support/resistance rejection, or trendline break under the scanner rules.
+                </div>
+            </div>
+        {% endif %}
+
+        <div class="small" style="margin-top:12px">
+            Updated: {{ updated }}. Pattern signals are based only on candle price structure.
+            They are not guaranteed trade entries.
+        </div>
+    {% endif %}
+    </div>
+
+    <div class="row">
+        <a href="/signal/{{ fav_id }}?tf={{ selected_tf }}&refresh=1"><button>↻ Scan Again</button></a>
+        <a href="/"><button>← Back to Market Alerts</button></a>
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
 def db_conn():
     c = sqlite3.connect(DB, check_same_thread=False)
     c.row_factory = sqlite3.Row
@@ -445,6 +603,14 @@ def init_db():
             symbol TEXT NOT NULL,
             grp TEXT NOT NULL,
             UNIQUE(symbol,grp)
+        )
+        ''')
+
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS trend_status(
+            symbol TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT '',
+            updated TEXT
         )
         ''')
         try:
@@ -501,6 +667,567 @@ def latest_price(symbol):
         print('price error', symbol, e)
         return None
 
+
+
+
+PATTERN_SIGNAL_CACHE = {}
+PATTERN_SIGNAL_CACHE_SECONDS = 60
+
+PATTERN_TIMEFRAMES = [
+    {"label": "4H", "value": "4h"},
+    {"label": "1D", "value": "1day"},
+    {"label": "1W", "value": "1week"},
+    {"label": "1M", "value": "1month"},
+]
+
+
+def get_ohlc(symbol, interval, outputsize=120):
+    """Download OHLC candles from Twelve Data, oldest -> newest."""
+    if not TWELVE_KEY:
+        return None, "Twelve Data API key is not configured."
+
+    try:
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": twelve_symbol(symbol),
+                "interval": interval,
+                "outputsize": outputsize,
+                "apikey": TWELVE_KEY,
+                "format": "JSON",
+            },
+            timeout=15
+        )
+        j = r.json()
+
+        if j.get("status") == "error":
+            return None, j.get("message", "Twelve Data returned an error.")
+
+        values = j.get("values") or []
+        candles = []
+
+        for row in reversed(values):
+            try:
+                candles.append({
+                    "datetime": row.get("datetime", ""),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                })
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        if len(candles) < 35:
+            return None, f"Not enough {interval} candle history returned."
+
+        return candles, None
+
+    except Exception as e:
+        print("pattern data error", symbol, interval, e)
+        return None, "Could not download pattern data."
+
+
+def swing_points(candles, kind="low", left=2, right=2):
+    """Return clear local swing highs/lows, excluding edge candles."""
+    points = []
+    key = "low" if kind == "low" else "high"
+
+    for i in range(left, len(candles) - right):
+        value = candles[i][key]
+        before = [candles[j][key] for j in range(i-left, i)]
+        after = [candles[j][key] for j in range(i+1, i+right+1)]
+
+        if kind == "low":
+            if value <= min(before) and value <= min(after):
+                points.append((i, value))
+        else:
+            if value >= max(before) and value >= max(after):
+                points.append((i, value))
+
+    return points
+
+
+def pct_diff(a, b):
+    mid = (abs(a) + abs(b)) / 2.0
+    if mid == 0:
+        return 0
+    return abs(a - b) / mid
+
+
+def detect_double_bottom(candles):
+    lows = swing_points(candles, "low")
+    best = None
+
+    # Use recent 70 candles and require meaningful space between the two lows.
+    for x in range(len(lows)):
+        i1, p1 = lows[x]
+        if i1 < max(0, len(candles) - 75):
+            continue
+
+        for y in range(x + 1, len(lows)):
+            i2, p2 = lows[y]
+            gap = i2 - i1
+
+            if gap < 5 or gap > 35:
+                continue
+            if pct_diff(p1, p2) > 0.006:
+                continue
+
+            middle_high = max(c["high"] for c in candles[i1:i2+1])
+            base = (p1 + p2) / 2.0
+            bounce = (middle_high - base) / base
+
+            if bounce < 0.006:
+                continue
+
+            latest_close = candles[-1]["close"]
+            confirmed = latest_close > middle_high
+            recent_enough = i2 >= len(candles) - 18
+
+            if not recent_enough:
+                continue
+
+            quality = bounce - pct_diff(p1, p2)
+            candidate = {
+                "name": "Double Bottom",
+                "direction": "bullish",
+                "confirmed": confirmed,
+                "level": middle_high,
+                "p1": p1,
+                "p2": p2,
+                "gap": gap,
+                "quality": quality,
+            }
+
+            if best is None or candidate["quality"] > best["quality"]:
+                best = candidate
+
+    return best
+
+
+def detect_double_top(candles):
+    highs = swing_points(candles, "high")
+    best = None
+
+    for x in range(len(highs)):
+        i1, p1 = highs[x]
+        if i1 < max(0, len(candles) - 75):
+            continue
+
+        for y in range(x + 1, len(highs)):
+            i2, p2 = highs[y]
+            gap = i2 - i1
+
+            if gap < 5 or gap > 35:
+                continue
+            if pct_diff(p1, p2) > 0.006:
+                continue
+
+            middle_low = min(c["low"] for c in candles[i1:i2+1])
+            top = (p1 + p2) / 2.0
+            drop = (top - middle_low) / top
+
+            if drop < 0.006:
+                continue
+
+            latest_close = candles[-1]["close"]
+            confirmed = latest_close < middle_low
+            recent_enough = i2 >= len(candles) - 18
+
+            if not recent_enough:
+                continue
+
+            quality = drop - pct_diff(p1, p2)
+            candidate = {
+                "name": "Double Top",
+                "direction": "bearish",
+                "confirmed": confirmed,
+                "level": middle_low,
+                "p1": p1,
+                "p2": p2,
+                "gap": gap,
+                "quality": quality,
+            }
+
+            if best is None or candidate["quality"] > best["quality"]:
+                best = candidate
+
+    return best
+
+
+def detect_rejection(candles):
+    """Detect a recent rejection from a repeatedly tested horizontal level."""
+    recent = candles[-45:]
+    latest = recent[-1]
+    avg_range = sum(c["high"] - c["low"] for c in recent[-20:]) / 20.0
+
+    if avg_range <= 0:
+        return None
+
+    # Support rejection: recent lows cluster near a level and latest candle rejects upward.
+    lows = sorted(c["low"] for c in recent[:-1])[:8]
+    support = sum(lows[:4]) / 4.0
+    support_touches = sum(1 for c in recent[:-1] if abs(c["low"] - support) <= avg_range * 0.35)
+
+    lower_wick = min(latest["open"], latest["close"]) - latest["low"]
+    body = abs(latest["close"] - latest["open"])
+
+    if (
+        support_touches >= 2
+        and abs(latest["low"] - support) <= avg_range * 0.45
+        and lower_wick >= max(body * 1.2, avg_range * 0.25)
+        and latest["close"] > latest["open"]
+    ):
+        return {
+            "name": "Support Rejection",
+            "direction": "bullish",
+            "confirmed": True,
+            "level": support,
+        }
+
+    # Resistance rejection.
+    highs = sorted((c["high"] for c in recent[:-1]), reverse=True)[:8]
+    resistance = sum(highs[:4]) / 4.0
+    resistance_touches = sum(1 for c in recent[:-1] if abs(c["high"] - resistance) <= avg_range * 0.35)
+
+    upper_wick = latest["high"] - max(latest["open"], latest["close"])
+
+    if (
+        resistance_touches >= 2
+        and abs(latest["high"] - resistance) <= avg_range * 0.45
+        and upper_wick >= max(body * 1.2, avg_range * 0.25)
+        and latest["close"] < latest["open"]
+    ):
+        return {
+            "name": "Resistance Rejection",
+            "direction": "bearish",
+            "confirmed": True,
+            "level": resistance,
+        }
+
+    return None
+
+
+def line_value(p1, p2, x):
+    x1, y1 = p1
+    x2, y2 = p2
+    if x2 == x1:
+        return y2
+    slope = (y2 - y1) / (x2 - x1)
+    return y1 + slope * (x - x1)
+
+
+def detect_trendline_break(candles):
+    """Find a clean break of a recent descending/ascending swing trendline."""
+    highs = swing_points(candles, "high")
+    lows = swing_points(candles, "low")
+
+    # Descending resistance trendline -> bullish break.
+    recent_highs = [p for p in highs if p[0] >= len(candles) - 60]
+    if len(recent_highs) >= 2:
+        p1, p2 = recent_highs[-2], recent_highs[-1]
+
+        if p2[1] < p1[1] and p2[0] < len(candles) - 1:
+            line_prev = line_value(p1, p2, len(candles) - 2)
+            line_now = line_value(p1, p2, len(candles) - 1)
+
+            prev_close = candles[-2]["close"]
+            now_close = candles[-1]["close"]
+
+            if prev_close <= line_prev and now_close > line_now:
+                return {
+                    "name": "Descending Trendline Break",
+                    "direction": "bullish",
+                    "confirmed": True,
+                    "level": line_now,
+                }
+
+    # Ascending support trendline -> bearish break.
+    recent_lows = [p for p in lows if p[0] >= len(candles) - 60]
+    if len(recent_lows) >= 2:
+        p1, p2 = recent_lows[-2], recent_lows[-1]
+
+        if p2[1] > p1[1] and p2[0] < len(candles) - 1:
+            line_prev = line_value(p1, p2, len(candles) - 2)
+            line_now = line_value(p1, p2, len(candles) - 1)
+
+            prev_close = candles[-2]["close"]
+            now_close = candles[-1]["close"]
+
+            if prev_close >= line_prev and now_close < line_now:
+                return {
+                    "name": "Ascending Trendline Break",
+                    "direction": "bearish",
+                    "confirmed": True,
+                    "level": line_now,
+                }
+
+    return None
+
+
+def describe_pattern(p):
+    if p["name"] == "Double Bottom":
+        status = "confirmed" if p["confirmed"] else "forming"
+        detail = (
+            f"Two similar lows are separated by {p['gap']} candles with a clear bounce between them. "
+            f"The pattern is {status}."
+        )
+        level_text = f"Neckline / breakout level: {p['level']:.5f}"
+
+    elif p["name"] == "Double Top":
+        status = "confirmed" if p["confirmed"] else "forming"
+        detail = (
+            f"Two similar highs are separated by {p['gap']} candles with a clear drop between them. "
+            f"The pattern is {status}."
+        )
+        level_text = f"Neckline / breakdown level: {p['level']:.5f}"
+
+    elif p["name"] == "Support Rejection":
+        detail = "Price tested a repeated support area and rejected upward on the latest candle."
+        level_text = f"Support area: {p['level']:.5f}"
+
+    elif p["name"] == "Resistance Rejection":
+        detail = "Price tested a repeated resistance area and rejected downward on the latest candle."
+        level_text = f"Resistance area: {p['level']:.5f}"
+
+    elif p["name"] == "Descending Trendline Break":
+        detail = "The latest candle closed above a descending swing-high trendline."
+        level_text = f"Trendline break level: {p['level']:.5f}"
+
+    else:
+        detail = "The latest candle closed below an ascending swing-low trendline."
+        level_text = f"Trendline break level: {p['level']:.5f}"
+
+    bullish = p["direction"] == "bullish"
+
+    return {
+        "name": p["name"],
+        "detail": detail,
+        "level_text": level_text,
+        "icon": "🟢" if bullish else "🔴",
+        "css": "buy" if bullish else "sell",
+        "direction": p["direction"],
+        "confirmed": p.get("confirmed", False),
+    }
+
+
+def build_pattern_signal(symbol, interval, force_refresh=False):
+    cache_key = f"{symbol}|{interval}"
+    now = time.time()
+    cached = PATTERN_SIGNAL_CACHE.get(cache_key)
+
+    if cached and not force_refresh and now - cached["saved_at"] < PATTERN_SIGNAL_CACHE_SECONDS:
+        return cached["data"], None
+
+    candles, error = get_ohlc(symbol, interval, outputsize=120)
+
+    if error:
+        if "credits" in error.lower() or "limit" in error.lower():
+            return None, "API busy. Wait about 60 seconds, then press Scan Again."
+        return None, error
+
+    found = []
+
+    for detector in (
+        detect_double_bottom,
+        detect_double_top,
+        detect_rejection,
+        detect_trendline_break,
+    ):
+        p = detector(candles)
+        if p:
+            found.append(p)
+
+    # Confirmed patterns are more important than forming patterns.
+    found.sort(key=lambda p: (p.get("confirmed", False), p.get("quality", 0)), reverse=True)
+
+    bullish_confirmed = sum(1 for p in found if p["direction"] == "bullish" and p.get("confirmed", False))
+    bearish_confirmed = sum(1 for p in found if p["direction"] == "bearish" and p.get("confirmed", False))
+    bullish_forming = sum(1 for p in found if p["direction"] == "bullish" and not p.get("confirmed", False))
+    bearish_forming = sum(1 for p in found if p["direction"] == "bearish" and not p.get("confirmed", False))
+
+    if bullish_confirmed > bearish_confirmed and bullish_confirmed > 0:
+        signal = "BULLISH PATTERN SIGNAL"
+        icon, css = "🟢", "buy"
+        summary = "At least one bullish price-action pattern is confirmed on this timeframe."
+    elif bearish_confirmed > bullish_confirmed and bearish_confirmed > 0:
+        signal = "BEARISH PATTERN SIGNAL"
+        icon, css = "🔴", "sell"
+        summary = "At least one bearish price-action pattern is confirmed on this timeframe."
+    elif bullish_confirmed and bearish_confirmed:
+        signal = "MIXED PATTERNS"
+        icon, css = "🟡", "wait"
+        summary = "Bullish and bearish structures are both present. Better to wait for clearer direction."
+    elif bullish_forming > bearish_forming and bullish_forming > 0:
+        signal = "BULLISH SETUP FORMING"
+        icon, css = "🟡", "wait"
+        summary = "A bullish structure is forming but has not confirmed yet."
+    elif bearish_forming > bullish_forming and bearish_forming > 0:
+        signal = "BEARISH SETUP FORMING"
+        icon, css = "🟡", "wait"
+        summary = "A bearish structure is forming but has not confirmed yet."
+    else:
+        signal = "NO CLEAR SIGNAL"
+        icon, css = "⚪", "neutral"
+        summary = "No clean higher-timeframe price-action setup is confirmed right now."
+
+    data = {
+        "price": candles[-1]["close"],
+        "signal": signal,
+        "signal_icon": icon,
+        "signal_css": css,
+        "summary": summary,
+        "patterns": [describe_pattern(p) for p in found[:4]],
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    PATTERN_SIGNAL_CACHE[cache_key] = {"saved_at": now, "data": data}
+    return data, None
+
+
+
+def get_daily_candles_for_alignment(symbol, outputsize=1800):
+    if not TWELVE_KEY:
+        return None, "Twelve Data API key is not configured."
+
+    try:
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": twelve_symbol(symbol),
+                "interval": "1day",
+                "outputsize": outputsize,
+                "apikey": TWELVE_KEY,
+                "format": "JSON",
+            },
+            timeout=20
+        )
+        j = r.json()
+
+        if j.get("status") == "error":
+            return None, j.get("message", "Twelve Data returned an error.")
+
+        values = j.get("values") or []
+        rows = []
+
+        for row in reversed(values):
+            try:
+                dt = datetime.fromisoformat(row["datetime"])
+                rows.append((dt, float(row["close"])))
+            except Exception:
+                pass
+
+        if len(rows) < 300:
+            return None, "Not enough daily history for higher-timeframe alignment."
+
+        return rows, None
+
+    except Exception as e:
+        print("daily alignment error", symbol, e)
+        return None, "Could not download daily alignment data."
+
+
+def resample_closes(rows, mode):
+    buckets = {}
+
+    for dt, close in rows:
+        if mode == "week":
+            year, week, _ = dt.isocalendar()
+            key = (year, week)
+        else:
+            key = (dt.year, dt.month)
+
+        buckets[key] = close
+
+    return list(buckets.values())
+
+
+def build_full_alignment(symbol):
+    # 1H + 4H + 1D API calls. 1W and 1M are derived locally from daily data.
+    h1, err = get_candles(symbol, "1h", outputsize=70)
+    if err:
+        return "", err
+
+    h4, err = get_candles(symbol, "4h", outputsize=70)
+    if err:
+        return "", err
+
+    daily_rows, err = get_daily_candles_for_alignment(symbol, outputsize=1800)
+    if err:
+        return "", err
+
+    d1 = [close for _, close in daily_rows]
+    w1 = resample_closes(daily_rows, "week")
+    m1 = resample_closes(daily_rows, "month")
+
+    if len(w1) < 50 or len(m1) < 50:
+        return "", "Not enough weekly/monthly history after resampling."
+
+    states = {
+        "1M": analyse_closes(m1),
+        "1W": analyse_closes(w1),
+        "1D": analyse_closes(d1),
+        "4H": analyse_closes(h4),
+        "1H": analyse_closes(h1),
+    }
+
+    if all(v == "Bullish" for v in states.values()):
+        return "FULL BULLISH", None
+
+    if all(v == "Bearish" for v in states.values()):
+        return "FULL BEARISH", None
+
+    return "", None
+
+
+def save_trend_status(symbol, status):
+    with db_conn() as c:
+        c.execute(
+            """
+            INSERT INTO trend_status(symbol,status,updated)
+            VALUES(?,?,?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                status=excluded.status,
+                updated=excluded.updated
+            """,
+            (symbol, status, datetime.utcnow().isoformat())
+        )
+        c.commit()
+
+
+def active_trend_monitor():
+    # Start two minutes after boot, then refresh one active symbol every five minutes.
+    time.sleep(120)
+    index = 0
+
+    while True:
+        try:
+            with db_conn() as c:
+                rows = c.execute(
+                    "SELECT DISTINCT symbol FROM alerts WHERE triggered=0 ORDER BY symbol"
+                ).fetchall()
+
+            symbols = [r["symbol"] for r in rows]
+
+            if symbols:
+                if index >= len(symbols):
+                    index = 0
+
+                symbol = symbols[index]
+                index = (index + 1) % len(symbols)
+
+                status, error = build_full_alignment(symbol)
+
+                if error:
+                    print("active trend error", symbol, error)
+                else:
+                    save_trend_status(symbol, status)
+
+        except Exception as e:
+            print("active trend monitor error", e)
+
+        time.sleep(300)
 
 
 TREND_INTERVALS = [
@@ -746,13 +1473,23 @@ def home():
             'SELECT * FROM favorites ORDER BY grp,symbol'
         ).fetchall()
 
+        trend_rows = c.execute(
+            'SELECT symbol,status FROM trend_status'
+        ).fetchall()
+
+        trend_statuses = {
+            r['symbol']: r['status']
+            for r in trend_rows
+        }
+
     return render_template_string(
         HTML,
         markets=markets,
         favorites=favorites,
         colors=COLORS,
         selected_symbol=selected_symbol,
-        selected_group=selected_group
+        selected_group=selected_group,
+        trend_statuses=trend_statuses
     )
 
 
@@ -828,6 +1565,68 @@ def favorite_use(i):
         requests.utils.quote(f['grp'])
     )
 
+
+
+
+@APP.route('/signal/<int:i>')
+def signal(i):
+
+    with db_conn() as c:
+        f = c.execute(
+            'SELECT * FROM favorites WHERE id=?',
+            (i,)
+        ).fetchone()
+
+    if not f or f['grp'] != 'FOREX':
+        return redirect('/')
+
+    allowed = {x["value"]: x["label"] for x in PATTERN_TIMEFRAMES}
+    selected_tf = request.args.get("tf", "4h")
+
+    if selected_tf not in allowed:
+        selected_tf = "4h"
+
+    force_refresh = request.args.get('refresh') == '1'
+    data, error = build_pattern_signal(
+        f['symbol'],
+        selected_tf,
+        force_refresh=force_refresh
+    )
+
+    if error:
+        return render_template_string(
+            SIGNAL_HTML,
+            symbol=f['symbol'],
+            fav_id=f['id'],
+            timeframes=PATTERN_TIMEFRAMES,
+            selected_tf=selected_tf,
+            selected_label=allowed[selected_tf],
+            price='—',
+            signal='',
+            signal_icon='',
+            signal_css='neutral',
+            summary='',
+            patterns=[],
+            updated='—',
+            error=error
+        )
+
+    return render_template_string(
+        SIGNAL_HTML,
+        symbol=f['symbol'],
+        fav_id=f['id'],
+        timeframes=PATTERN_TIMEFRAMES,
+        selected_tf=selected_tf,
+        selected_label=allowed[selected_tf],
+        price=f"{data['price']:.5f}",
+        signal=data['signal'],
+        signal_icon=data['signal_icon'],
+        signal_css=data['signal_css'],
+        summary=data['summary'],
+        patterns=data['patterns'],
+        updated=data['updated'],
+        error=''
+    )
 
 
 @APP.route('/trend/<int:i>')
@@ -934,6 +1733,11 @@ def health():
 init_db()
 threading.Thread(
     target=monitor,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=active_trend_monitor,
     daemon=True
 ).start()
 
