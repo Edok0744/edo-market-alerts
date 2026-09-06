@@ -821,6 +821,8 @@ def detect_double_bottom(candles):
                 "level": middle_high,
                 "p1": p1,
                 "p2": p2,
+                "date1": candles[i1].get("datetime", ""),
+                "date2": candles[i2].get("datetime", ""),
                 "gap": gap,
                 "quality": quality,
             }
@@ -871,6 +873,8 @@ def detect_double_top(candles):
                 "level": middle_low,
                 "p1": p1,
                 "p2": p2,
+                "date1": candles[i1].get("datetime", ""),
+                "date2": candles[i2].get("datetime", ""),
                 "gap": gap,
                 "quality": quality,
             }
@@ -995,7 +999,9 @@ def describe_pattern(p):
     if p["name"] == "Double Bottom":
         status = "confirmed" if p["confirmed"] else "forming"
         detail = (
-            f"Two similar lows are separated by {p['gap']} candles with a clear bounce between them. "
+            f"Low 1: {p['p1']:.5f} on {p.get('date1','?')} • "
+            f"Low 2: {p['p2']:.5f} on {p.get('date2','?')}. "
+            f"They are separated by {p['gap']} candles with a clear bounce between them. "
             f"The pattern is {status}."
         )
         level_text = f"Neckline / breakout level: {p['level']:.5f}"
@@ -1003,7 +1009,9 @@ def describe_pattern(p):
     elif p["name"] == "Double Top":
         status = "confirmed" if p["confirmed"] else "forming"
         detail = (
-            f"Two similar highs are separated by {p['gap']} candles with a clear drop between them. "
+            f"Top 1: {p['p1']:.5f} on {p.get('date1','?')} • "
+            f"Top 2: {p['p2']:.5f} on {p.get('date2','?')}. "
+            f"They are separated by {p['gap']} candles with a clear drop between them. "
             f"The pattern is {status}."
         )
         level_text = f"Neckline / breakdown level: {p['level']:.5f}"
