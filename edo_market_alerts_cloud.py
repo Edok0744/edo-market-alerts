@@ -1409,7 +1409,7 @@ def active_trend_monitor():
                         send_push(
                             f"{icon} {symbol} — {status}",
                             f"All 5 signal timeframes are {direction}: 1W, 1D, 8H, 4H, 1H. "
-                            f"Monthly is display-only."
+                            f"Monthly is display-only. CFD markets may use an ETF proxy for trend data."
                         )
 
         except Exception as e:
@@ -1442,9 +1442,9 @@ def twelve_symbol(symbol, grp=None):
         SOLUSD -> SOL/USD
 
     CFD / INDEX broker aliases:
-        US500 / SP500 -> SPX
-        NAS100 / US100 -> NDX
-        US30 / DJ30 -> DJI
+        US500 / SP500 -> SPY
+        NAS100 / US100 -> QQQ
+        US30 / DJ30 -> DIA
         GER40 / DE40 -> DAX
         UK100 -> FTSE
         FRA40 -> FCHI
@@ -1463,17 +1463,24 @@ def twelve_symbol(symbol, grp=None):
 
     # Common broker CFD/index aliases.
     cfd_aliases = {
-        "US500": "SPX",
-        "SP500": "SPX",
-        "S&P500": "SPX",
-        "SPX500": "SPX",
-        "NAS100": "NDX",
-        "NASDAQ100": "NDX",
-        "US100": "NDX",
-        "USTEC": "NDX",
-        "US30": "DJI",
-        "DJ30": "DJI",
-        "DOW30": "DJI",
+        # Use liquid US-listed ETF proxies for the US indices because
+        # they are much more reliable on Twelve Data Basic than direct CFD/index feeds.
+        "US500": "SPY",
+        "SP500": "SPY",
+        "S&P500": "SPY",
+        "SPX500": "SPY",
+
+        "US30": "DIA",
+        "DJ30": "DIA",
+        "DOW30": "DIA",
+
+        # Nasdaq-100 proxy.
+        "NAS100": "QQQ",
+        "NASDAQ100": "QQQ",
+        "US100": "QQQ",
+        "USTEC": "QQQ",
+
+        # Keep international aliases for later testing; availability may vary by plan.
         "GER40": "DAX",
         "DE40": "DAX",
         "GER30": "DAX",
