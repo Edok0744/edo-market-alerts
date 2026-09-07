@@ -149,7 +149,7 @@ h2{font-size:18px}
 .fullbear{color:#ff6b7d}
 .trendbtn{background:#5dade2;color:#07111f}
 .livebtn{background:#f2c94c;color:#07111f}
-.trend-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px}
+.trend-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-top:12px}
 .trend-box{background:#12263b;border-radius:12px;padding:10px;text-align:center}
 .trend-tf{font-size:12px;color:#8ca7bf;font-weight:800}
 .trend-state{margin-top:5px;font-weight:800}
@@ -394,7 +394,7 @@ a{text-decoration:none}
 .small{color:#8ca7bf;font-size:13px}
 .trend-grid{
     display:grid;
-    grid-template-columns:repeat(5,1fr);
+    grid-template-columns:repeat(6,1fr);
     gap:8px;
     margin-top:14px;
 }
@@ -446,7 +446,9 @@ a{text-decoration:none}
 
         <div class="small" style="margin-top:12px">
             Trend is calculated from recent candle closes, 20/50-period moving averages
-            and short-term momentum. It is an analysis aid, not a guarantee of future price movement.
+            and short-term momentum. Monthly is shown for your own reference but is excluded
+            from the FULL BULLISH / FULL BEARISH signal. It is an analysis aid, not a guarantee
+            of future price movement.
         </div>
     {% endif %}
     </div>
@@ -668,7 +670,7 @@ def send_push(title, msg):
         print('push error', e)
 
 
-def latest_price(symbol):
+def latest_price(symbol, grp=None):
 
     if not TWELVE_KEY:
         return None
@@ -678,7 +680,7 @@ def latest_price(symbol):
         r = requests.get(
             'https://api.twelvedata.com/price',
             params={
-                'symbol': symbol,
+                'symbol': twelve_symbol(symbol, grp),
                 'apikey': TWELVE_KEY
             },
             timeout=10
@@ -708,7 +710,7 @@ PATTERN_TIMEFRAMES = [
 ]
 
 
-def get_ohlc(symbol, interval, outputsize=140):
+def get_ohlc(symbol, interval, outputsize=140, grp=None):
     """Download OHLC candles from Twelve Data, oldest -> newest."""
     if not TWELVE_KEY:
         return None, "Twelve Data API key is not configured."
@@ -717,7 +719,7 @@ def get_ohlc(symbol, interval, outputsize=140):
         r = requests.get(
             "https://api.twelvedata.com/time_series",
             params={
-                "symbol": twelve_symbol(symbol),
+                "symbol": twelve_symbol(symbol, grp),
                 "interval": interval,
                 "outputsize": outputsize,
                 "apikey": TWELVE_KEY,
@@ -1241,7 +1243,7 @@ def build_pattern_signal(symbol, interval, force_refresh=False):
     return data, None
 
 
-def get_daily_candles_for_alignment(symbol, outputsize=1800):
+def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
     if not TWELVE_KEY:
         return None, "Twelve Data API key is not configured."
 
@@ -1249,7 +1251,7 @@ def get_daily_candles_for_alignment(symbol, outputsize=1800):
         r = requests.get(
             "https://api.twelvedata.com/time_series",
             params={
-                "symbol": twelve_symbol(symbol),
+                "symbol": twelve_symbol(symbol, grp),
                 "interval": "1day",
                 "outputsize": outputsize,
                 "apikey": TWELVE_KEY,
@@ -1297,39 +1299,50 @@ def resample_closes(rows, mode):
     return list(buckets.values())
 
 
-def build_full_alignment(symbol):
-    # 1H + 4H + 1D API calls. 1W and 1M are derived locally from daily data.
-    h1, err = get_candles(symbol, "1h", outputsize=70)
+def build_full_alignment(symbol, grp=None):
+    """
+    Edo alignment signal:
+      SIGNAL timeframes = 1W, 1D, 8H, 4H, 1H
+      DISPLAY ONLY      = 1M
+
+    Monthly is deliberately excluded from the notification trigger.
+    """
+    h1, err = get_candles(symbol, "1h", outputsize=70, grp=grp)
     if err:
         return "", err
 
-    h4, err = get_candles(symbol, "4h", outputsize=70)
+    h4, err = get_candles(symbol, "4h", outputsize=70, grp=grp)
     if err:
         return "", err
 
-    daily_rows, err = get_daily_candles_for_alignment(symbol, outputsize=1800)
+    h8, err = get_candles(symbol, "8h", outputsize=70, grp=grp)
+    if err:
+        return "", err
+
+    daily_rows, err = get_daily_candles_for_alignment(
+        symbol, outputsize=1800, grp=grp
+    )
     if err:
         return "", err
 
     d1 = [close for _, close in daily_rows]
     w1 = resample_closes(daily_rows, "week")
-    m1 = resample_closes(daily_rows, "month")
 
-    if len(w1) < 50 or len(m1) < 50:
-        return "", "Not enough weekly/monthly history after resampling."
+    if len(w1) < 50:
+        return "", "Not enough weekly history after resampling."
 
-    states = {
-        "1M": analyse_closes(m1),
+    signal_states = {
         "1W": analyse_closes(w1),
         "1D": analyse_closes(d1),
+        "8H": analyse_closes(h8),
         "4H": analyse_closes(h4),
         "1H": analyse_closes(h1),
     }
 
-    if all(v == "Bullish" for v in states.values()):
+    if all(v == "Bullish" for v in signal_states.values()):
         return "FULL BULLISH", None
 
-    if all(v == "Bearish" for v in states.values()):
+    if all(v == "Bearish" for v in signal_states.values()):
         return "FULL BEARISH", None
 
     return "", None
@@ -1368,19 +1381,19 @@ def active_trend_monitor():
         try:
             with db_conn() as c:
                 rows = c.execute(
-                    "SELECT DISTINCT symbol FROM alerts WHERE triggered=0 ORDER BY symbol"
+                    "SELECT DISTINCT symbol, grp FROM alerts WHERE triggered=0 ORDER BY symbol"
                 ).fetchall()
 
-            symbols = [r["symbol"] for r in rows]
+            markets = [(r["symbol"], r["grp"]) for r in rows]
 
-            if symbols:
-                if index >= len(symbols):
+            if markets:
+                if index >= len(markets):
                     index = 0
 
-                symbol = symbols[index]
-                index = (index + 1) % len(symbols)
+                symbol, grp = markets[index]
+                index = (index + 1) % len(markets)
 
-                status, error = build_full_alignment(symbol)
+                status, error = build_full_alignment(symbol, grp)
 
                 if error:
                     print("active trend error", symbol, error)
@@ -1395,7 +1408,8 @@ def active_trend_monitor():
                         direction = "bullish" if status == "FULL BULLISH" else "bearish"
                         send_push(
                             f"{icon} {symbol} — {status}",
-                            f"All 5 timeframes are {direction}: 1M, 1W, 1D, 4H, 1H."
+                            f"All 5 signal timeframes are {direction}: 1W, 1D, 8H, 4H, 1H. "
+                            f"Monthly is display-only."
                         )
 
         except Exception as e:
@@ -1405,27 +1419,102 @@ def active_trend_monitor():
 
 
 TREND_INTERVALS = [
-    ("1M", "1month"),
+    ("1M", "1month"),   # DISPLAY ONLY - excluded from alignment signal
     ("1W", "1week"),
     ("1D", "1day"),
+    ("8H", "8h"),
     ("4H", "4h"),
     ("1H", "1h"),
 ]
 
 
-def twelve_symbol(symbol):
-    """Normalise common compact crypto symbols for Twelve Data."""
-    s = symbol.upper().strip()
-    compact_crypto = {
-        "BTCUSDT": "BTC/USDT",
-        "ETHUSDT": "ETH/USDT",
-        "BTCUSD": "BTC/USD",
-        "ETHUSD": "ETH/USD",
+def twelve_symbol(symbol, grp=None):
+    """
+    Convert the symbols Edo normally types into Twelve Data format.
+
+    FOREX:
+        EURUSD  -> EUR/USD
+        EUR/USD -> EUR/USD
+
+    CRYPTO:
+        BTCUSDT -> BTC/USDT
+        SOLUSDT -> SOL/USDT
+        BTCUSD  -> BTC/USD
+
+    CFD / INDEX broker aliases:
+        US500 / SP500 -> SPX
+        NAS100 / US100 -> NDX
+        US30 / DJ30 -> DJI
+        GER40 / DE40 -> DAX
+        UK100 -> FTSE
+        FRA40 -> FCHI
+        JPN225 -> N225
+        EU50 -> STOXX50E
+
+    The CFD mapping converts common broker names to the underlying index
+    symbol used by market-data providers. Availability can still depend on
+    the user's Twelve Data plan.
+    """
+    s = symbol.upper().strip().replace(" ", "")
+
+    # Keep already formatted currency pairs unchanged.
+    if "/" in s:
+        return s
+
+    # Common broker CFD/index aliases.
+    cfd_aliases = {
+        "US500": "SPX",
+        "SP500": "SPX",
+        "S&P500": "SPX",
+        "SPX500": "SPX",
+        "NAS100": "NDX",
+        "NASDAQ100": "NDX",
+        "US100": "NDX",
+        "USTEC": "NDX",
+        "US30": "DJI",
+        "DJ30": "DJI",
+        "DOW30": "DJI",
+        "GER40": "DAX",
+        "DE40": "DAX",
+        "GER30": "DAX",
+        "UK100": "FTSE",
+        "FTSE100": "FTSE",
+        "FRA40": "FCHI",
+        "FR40": "FCHI",
+        "JPN225": "N225",
+        "JP225": "N225",
+        "EU50": "STOXX50E",
+        "EUSTX50": "STOXX50E",
     }
-    return compact_crypto.get(s, s)
+
+    if grp == "CFD" and s in cfd_aliases:
+        return cfd_aliases[s]
+
+    # If group is not supplied, still recognise the common CFD aliases.
+    if s in cfd_aliases:
+        return cfd_aliases[s]
+
+    # Compact crypto pairs. Longest quote currencies first.
+    crypto_quotes = ("USDT", "USDC", "BUSD", "AUD", "EUR", "GBP", "USD", "BTC", "ETH")
+    if grp == "CRYPTO":
+        for quote in crypto_quotes:
+            if s.endswith(quote) and len(s) > len(quote):
+                return s[:-len(quote)] + "/" + quote
+
+    # Compact six-letter forex pairs such as EURUSD or AUDJPY.
+    if grp == "FOREX" and len(s) == 6 and s.isalpha():
+        return s[:3] + "/" + s[3:]
+
+    # With no group supplied, safely recognise the most common compact crypto quotes.
+    if grp is None:
+        for quote in ("USDT", "USDC"):
+            if s.endswith(quote) and len(s) > len(quote):
+                return s[:-len(quote)] + "/" + quote
+
+    return s
 
 
-def get_candles(symbol, interval, outputsize=60):
+def get_candles(symbol, interval, outputsize=60, grp=None):
     if not TWELVE_KEY:
         return None, "Twelve Data API key is not configured."
 
@@ -1433,7 +1522,7 @@ def get_candles(symbol, interval, outputsize=60):
         r = requests.get(
             "https://api.twelvedata.com/time_series",
             params={
-                "symbol": twelve_symbol(symbol),
+                "symbol": twelve_symbol(symbol, grp),
                 "interval": interval,
                 "outputsize": outputsize,
                 "apikey": TWELVE_KEY,
@@ -1493,7 +1582,7 @@ def analyse_closes(closes):
     return "Mixed"
 
 
-def build_trend_scan(symbol):
+def build_trend_scan(symbol, grp=None):
     results = []
 
     state_info = {
@@ -1503,7 +1592,7 @@ def build_trend_scan(symbol):
     }
 
     for label, interval in TREND_INTERVALS:
-        closes, error = get_candles(symbol, interval)
+        closes, error = get_candles(symbol, interval, grp=grp)
 
         if error:
             return None, error
@@ -1519,49 +1608,56 @@ def build_trend_scan(symbol):
             "css": css,
         })
 
-    # Weight higher timeframes more heavily.
-    weights = {"1M": 5, "1W": 4, "1D": 3, "4H": 2, "1H": 1}
+    states = {item["label"]: item["state"] for item in results}
+
+    # IMPORTANT:
+    # 1M is shown on screen so Edo can inspect it manually,
+    # but it does NOT affect the signal or score.
+    signal_labels = ("1W", "1D", "8H", "4H", "1H")
+    weights = {"1W": 5, "1D": 4, "8H": 3, "4H": 2, "1H": 1}
     score = 0
-    states = {}
 
-    for item in results:
-        states[item["label"]] = item["state"]
-        if item["state"] == "Bullish":
-            score += weights[item["label"]]
-        elif item["state"] == "Bearish":
-            score -= weights[item["label"]]
+    for label in signal_labels:
+        if states[label] == "Bullish":
+            score += weights[label]
+        elif states[label] == "Bearish":
+            score -= weights[label]
 
-    higher_bull = all(states[x] == "Bullish" for x in ("1M", "1W", "1D"))
-    higher_bear = all(states[x] == "Bearish" for x in ("1M", "1W", "1D"))
+    full_bull = all(states[x] == "Bullish" for x in signal_labels)
+    full_bear = all(states[x] == "Bearish" for x in signal_labels)
 
-    if higher_bull and score >= 12:
-        summary = "STRONG BULLISH"
+    if full_bull:
+        summary = "FULL BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Major timeframes are aligned bullish."
-    elif higher_bear and score <= -12:
-        summary = "STRONG BEARISH"
+        detail = "Weekly, Daily, 8H, 4H and 1H are all bullish. Monthly is display-only."
+    elif full_bear:
+        summary = "FULL BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Major timeframes are aligned bearish."
-    elif higher_bull and any(states[x] == "Bearish" for x in ("4H", "1H")):
-        summary = "BULLISH — SHORT-TERM PULLBACK"
+        detail = "Weekly, Daily, 8H, 4H and 1H are all bearish. Monthly is display-only."
+    elif states["1W"] == "Bullish" and states["1D"] == "Bullish" and any(
+        states[x] == "Bearish" for x in ("8H", "4H", "1H")
+    ):
+        summary = "BULLISH — LOWER-TIMEFRAME PULLBACK"
         icon, css = "🟡", "mixed"
-        detail = "Monthly, weekly and daily are bullish, but a lower timeframe is pulling back."
-    elif higher_bear and any(states[x] == "Bullish" for x in ("4H", "1H")):
-        summary = "BEARISH — SHORT-TERM BOUNCE"
+        detail = "Weekly and Daily are bullish, but a lower timeframe is pulling back."
+    elif states["1W"] == "Bearish" and states["1D"] == "Bearish" and any(
+        states[x] == "Bullish" for x in ("8H", "4H", "1H")
+    ):
+        summary = "BEARISH — LOWER-TIMEFRAME BOUNCE"
         icon, css = "🟡", "mixed"
-        detail = "Monthly, weekly and daily are bearish, but a lower timeframe is bouncing."
-    elif score >= 6:
+        detail = "Weekly and Daily are bearish, but a lower timeframe is bouncing."
+    elif score >= 7:
         summary = "BULLISH"
         icon, css = "🟢", "bull"
-        detail = "The weighted multi-timeframe trend leans bullish."
-    elif score <= -6:
+        detail = "Weekly through 1H lean bullish. Monthly is not included in this score."
+    elif score <= -7:
         summary = "BEARISH"
         icon, css = "🔴", "bear"
-        detail = "The weighted multi-timeframe trend leans bearish."
+        detail = "Weekly through 1H lean bearish. Monthly is not included in this score."
     else:
         summary = "MIXED / WAIT"
         icon, css = "🟡", "mixed"
-        detail = "The timeframes are not aligned strongly enough."
+        detail = "Weekly through 1H are not aligned strongly enough."
 
     return {
         "results": results,
@@ -1588,7 +1684,7 @@ def monitor():
                 for a in rows:
 
                     if a['symbol'] not in price_cache:
-                        price_cache[a['symbol']] = latest_price(a['symbol'])
+                        price_cache[a['symbol']] = latest_price(a['symbol'], a['grp'])
                     p = price_cache[a['symbol']]
 
                     if p is None:
@@ -1815,7 +1911,7 @@ def trend(i):
     if not f:
         return redirect('/')
 
-    scan, error = build_trend_scan(f['symbol'])
+    scan, error = build_trend_scan(f['symbol'], f['grp'])
 
     if error:
         return render_template_string(
