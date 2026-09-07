@@ -237,7 +237,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <b>{{f['symbol']}}</b>
 </div>
 
-<div class="saved-actions {{ 'forex-actions' if f['grp']=='FOREX' else 'three-actions' }}">
+<div class="saved-actions forex-actions">
 <a href="/favorite/use/{{f['id']}}">
 <button>USE</button>
 </a>
@@ -246,11 +246,9 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <button class="trendbtn">📊 TREND</button>
 </a>
 
-{% if f['grp'] == 'FOREX' %}
 <a href="/signal/{{f['id']}}">
 <button class="livebtn">⚡ SIGNAL</button>
 </a>
-{% endif %}
 
 <a href="/favorite/delete/{{f['id']}}">
 <button class="danger">Delete</button>
@@ -534,7 +532,7 @@ a{text-decoration:none}
 <body>
 <div class="wrap">
     <h1>⚡ {{ symbol }} EDO SETUP SIGNAL</h1>
-    <div class="small">Your price-action method • 8H and higher • Wicks define levels, body closes confirm • Manual trade decision</div>
+    <div class="small">{{ group }} • Your price-action method • 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
 
     <div class="tfrow">
         {% for tf in timeframes %}
@@ -578,8 +576,8 @@ a{text-decoration:none}
             <div class="pattern">
                 <div class="pattern-title neutral">No matching setup yet</div>
                 <div class="pattern-detail">
-                    No recent candle sequence matches your bounce/retest or trend-pullback
-                    confirmation rules on this timeframe.
+                    No recent candle sequence matches your bounce/retest, 2+ candle trend-pullback,
+                    or range-reversal confirmation rules on this timeframe.
                 </div>
             </div>
         {% endif %}
@@ -737,6 +735,7 @@ TREND_BASELINED = set()
 PATTERN_BASELINE_CLOSED = {}
 
 # Edo's higher-timeframe setup scanner.
+# Supported saved-market groups: FOREX, CRYPTO, CFD.
 # The scanner does NOT place trades. It only finds setups for manual review.
 PATTERN_TIMEFRAMES = [
     {"label": "8H", "value": "8h"},
@@ -1212,15 +1211,15 @@ def describe_setup(p):
     }
 
 
-def build_pattern_signal(symbol, interval, force_refresh=False):
-    cache_key = f"{symbol}|{interval}"
+def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
+    cache_key = f"{grp}|{symbol}|{interval}"
     now = time.time()
     cached = PATTERN_SIGNAL_CACHE.get(cache_key)
 
     if cached and not force_refresh and now - cached["saved_at"] < PATTERN_SIGNAL_CACHE_SECONDS:
         return cached["data"], None
 
-    candles, error = get_ohlc(symbol, interval, outputsize=140)
+    candles, error = get_ohlc(symbol, interval, outputsize=140, grp=grp)
 
     if error:
         if "credits" in error.lower() or "limit" in error.lower():
@@ -1302,7 +1301,7 @@ def build_pattern_signal(symbol, interval, force_refresh=False):
         signal = "NO EDO SETUP YET"
         icon, css = "⚪", "neutral"
         summary = (
-            "No recent setup matches your retest or 3+ candle pullback confirmation rules "
+            "No recent setup matches your retest, 2+ candle trend-pullback, or range-reversal confirmation rules "
             "on this timeframe."
         )
 
@@ -1321,7 +1320,7 @@ def build_pattern_signal(symbol, interval, force_refresh=False):
 
 
 
-def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date):
+def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, grp="FOREX"):
     """
     Notify only for a setup confirmed on a NEW fully closed candle
     that appeared after this app start.
@@ -1331,7 +1330,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date):
     if not latest_closed_date:
         return
 
-    baseline_key = (symbol, interval)
+    baseline_key = (grp, symbol, interval)
     previous_closed = PATTERN_BASELINE_CLOSED.get(baseline_key)
 
     # First scan after boot: establish baseline and do not alert.
@@ -1389,7 +1388,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date):
         direction_word = "BULLISH" if bullish else "BEARISH"
 
         send_push(
-            f"{icon} {symbol} — {direction_word} EDO SETUP",
+            f"{icon} {symbol} [{grp}] — {direction_word} EDO SETUP",
             (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
                 f"({confirmation_date}). {direction_word} possibility. "
@@ -1436,7 +1435,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
 def pattern_signal_monitor():
     """
-    Background pattern scanner for saved FOREX pairs.
+    Background pattern scanner for all saved FOREX, CRYPTO, and CFD markets.
     Checks one symbol/timeframe combination every five minutes.
     """
     time.sleep(150)
@@ -1446,7 +1445,7 @@ def pattern_signal_monitor():
         try:
             with db_conn() as c:
                 rows = c.execute(
-                    "SELECT symbol, grp FROM favorites WHERE grp='FOREX' ORDER BY symbol"
+                    "SELECT symbol, grp FROM favorites WHERE grp IN ('FOREX','CRYPTO','CFD') ORDER BY grp,symbol"
                 ).fetchall()
 
             jobs = []
@@ -1472,7 +1471,8 @@ def pattern_signal_monitor():
                         symbol,
                         interval,
                         setups,
-                        latest_closed_date
+                        latest_closed_date,
+                        grp
                     )
 
         except Exception as e:
@@ -2125,7 +2125,7 @@ def signal(i):
             (i,)
         ).fetchone()
 
-    if not f or f['grp'] != 'FOREX':
+    if not f or f['grp'] not in ('FOREX', 'CRYPTO', 'CFD'):
         return redirect('/')
 
     allowed = {x["value"]: x["label"] for x in PATTERN_TIMEFRAMES}
@@ -2138,6 +2138,7 @@ def signal(i):
     data, error = build_pattern_signal(
         f['symbol'],
         selected_tf,
+        grp=f['grp'],
         force_refresh=force_refresh
     )
 
@@ -2154,7 +2155,8 @@ def signal(i):
                 f['symbol'],
                 selected_tf,
                 setups,
-                latest_closed_date
+                latest_closed_date,
+                f['grp']
             )
 
 
@@ -2162,6 +2164,7 @@ def signal(i):
         return render_template_string(
             SIGNAL_HTML,
             symbol=f['symbol'],
+            group=f['grp'],
             fav_id=f['id'],
             timeframes=PATTERN_TIMEFRAMES,
             selected_tf=selected_tf,
@@ -2179,6 +2182,7 @@ def signal(i):
     return render_template_string(
         SIGNAL_HTML,
         symbol=f['symbol'],
+        group=f['grp'],
         fav_id=f['id'],
         timeframes=PATTERN_TIMEFRAMES,
         selected_tf=selected_tf,
