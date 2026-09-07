@@ -445,7 +445,7 @@ a{text-decoration:none}
         {% endif %}
 
         <div class="small" style="margin-top:12px">
-            Trend is calculated from recent candle closes, 20/50-period moving averages
+            Trend is calculated directly from candlestick colour: green candle = bullish, red candle = bearish
             and short-term momentum. Monthly is shown for your own reference but is excluded
             from the FULL BULLISH / FULL BEARISH signal. It is an analysis aid, not a guarantee
             of future price movement.
@@ -1301,43 +1301,35 @@ def resample_closes(rows, mode):
 
 def build_full_alignment(symbol, grp=None):
     """
-    Edo alignment signal:
-      SIGNAL timeframes = 1W, 1D, 8H, 4H, 1H
-      DISPLAY ONLY      = 1M
+    Edo direct-candlestick alignment signal.
 
-    Monthly is deliberately excluded from the notification trigger.
+    Signal timeframes:
+      1W + 1D + 8H + 4H + 1H
+
+    Monthly is display-only and does not trigger a signal.
+
+    FULL BULLISH:
+      the latest candle on ALL five signal timeframes is green.
+
+    FULL BEARISH:
+      the latest candle on ALL five signal timeframes is red.
     """
-    h1, err = get_candles(symbol, "1h", outputsize=70, grp=grp)
-    if err:
-        return "", err
-
-    h4, err = get_candles(symbol, "4h", outputsize=70, grp=grp)
-    if err:
-        return "", err
-
-    h8, err = get_candles(symbol, "8h", outputsize=70, grp=grp)
-    if err:
-        return "", err
-
-    daily_rows, err = get_daily_candles_for_alignment(
-        symbol, outputsize=1800, grp=grp
-    )
-    if err:
-        return "", err
-
-    d1 = [close for _, close in daily_rows]
-    w1 = resample_closes(daily_rows, "week")
-
-    if len(w1) < 50:
-        return "", "Not enough weekly history after resampling."
-
-    signal_states = {
-        "1W": analyse_closes(w1),
-        "1D": analyse_closes(d1),
-        "8H": analyse_closes(h8),
-        "4H": analyse_closes(h4),
-        "1H": analyse_closes(h1),
+    intervals = {
+        "1W": "1week",
+        "1D": "1day",
+        "8H": "8h",
+        "4H": "4h",
+        "1H": "1h",
     }
+
+    signal_states = {}
+
+    for label, interval in intervals.items():
+        candles, err = get_candles(symbol, interval, outputsize=3, grp=grp)
+        if err:
+            return "", err
+
+        signal_states[label] = analyse_candle(candles[-1])
 
     if all(v == "Bullish" for v in signal_states.values()):
         return "FULL BULLISH", None
@@ -1346,7 +1338,6 @@ def build_full_alignment(symbol, grp=None):
         return "FULL BEARISH", None
 
     return "", None
-
 
 def save_trend_status(symbol, status):
     """Save trend status and return the previous saved status."""
@@ -1408,7 +1399,7 @@ def active_trend_monitor():
                         direction = "bullish" if status == "FULL BULLISH" else "bearish"
                         send_push(
                             f"{icon} {symbol} — {status}",
-                            f"All 5 signal timeframes are {direction}: 1W, 1D, 8H, 4H, 1H. "
+                            f"All 5 signal timeframe candles are {direction}: 1W, 1D, 8H, 4H, 1H. "
                             f"Monthly is display-only. CFD markets may use an ETF proxy for trend data."
                         )
 
@@ -1521,6 +1512,15 @@ def twelve_symbol(symbol, grp=None):
 
 
 def get_candles(symbol, interval, outputsize=60, grp=None):
+    """
+    Download OHLC candles from Twelve Data.
+
+    Candles are returned oldest -> newest.
+    For Edo's trend signal we use the colour of the latest candle:
+      close > open  = Bullish / green
+      close < open  = Bearish / red
+      close == open = Mixed / doji
+    """
     if not TWELVE_KEY:
         return None, "Twelve Data API key is not configured."
 
@@ -1542,51 +1542,53 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
             return None, j.get("message", "Twelve Data returned an error.")
 
         values = j.get("values") or []
-        closes = []
+        candles = []
 
-        # Twelve Data returns newest first. Reverse so closes are oldest -> newest.
+        # Twelve Data returns newest first. Reverse so candles are oldest -> newest.
         for row in reversed(values):
             try:
-                closes.append(float(row["close"]))
+                candles.append({
+                    "datetime": row.get("datetime", ""),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                })
             except (KeyError, TypeError, ValueError):
                 pass
 
-        if len(closes) < 50:
-            return None, f"Not enough {interval} candle history returned."
+        if not candles:
+            return None, f"No usable {interval} candles returned."
 
-        return closes, None
+        return candles, None
 
     except Exception as e:
         print("trend data error", symbol, interval, e)
         return None, "Could not download trend data."
 
-
-def sma(values, period):
-    return sum(values[-period:]) / period
-
-
-def analyse_closes(closes):
+def analyse_candle(candle):
     """
-    Bullish:
-      close > SMA20 > SMA50, SMA20 rising, and 3-bar momentum positive.
-    Bearish:
-      close < SMA20 < SMA50, SMA20 falling, and 3-bar momentum negative.
-    Everything else is Mixed.
+    Direct candlestick direction only.
+
+    Green candle: close > open  -> Bullish
+    Red candle:   close < open  -> Bearish
+    Doji/flat:    close == open -> Mixed
     """
-    close = closes[-1]
-    sma20 = sma(closes, 20)
-    sma50 = sma(closes, 50)
-
-    previous_sma20 = sum(closes[-21:-1]) / 20
-    slope = sma20 - previous_sma20
-    momentum = close - closes[-4]
-
-    if close > sma20 > sma50 and slope > 0 and momentum > 0:
+    if candle["close"] > candle["open"]:
         return "Bullish"
-    if close < sma20 < sma50 and slope < 0 and momentum < 0:
+    if candle["close"] < candle["open"]:
         return "Bearish"
     return "Mixed"
 
+
+def analyse_closes(candles):
+    """
+    Kept under the old function name so the rest of the app stays simple.
+    It now analyses ONLY the latest candlestick colour -- no SMA20/SMA50.
+    """
+    if not candles:
+        return "Mixed"
+    return analyse_candle(candles[-1])
 
 def build_trend_scan(symbol, grp=None):
     results = []
@@ -1598,12 +1600,12 @@ def build_trend_scan(symbol, grp=None):
     }
 
     for label, interval in TREND_INTERVALS:
-        closes, error = get_candles(symbol, interval, grp=grp)
+        candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
 
         if error:
             return None, error
 
-        state = analyse_closes(closes)
+        state = analyse_candle(candles[-1])
         icon, css = state_info[state]
 
         results.append({
@@ -1635,11 +1637,11 @@ def build_trend_scan(symbol, grp=None):
     if full_bull:
         summary = "FULL BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Weekly, Daily, 8H, 4H and 1H are all bullish. Monthly is display-only."
+        detail = "Weekly, Daily, 8H, 4H and 1H latest candles are all GREEN. Bullish possibility. Monthly is display-only."
     elif full_bear:
         summary = "FULL BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Weekly, Daily, 8H, 4H and 1H are all bearish. Monthly is display-only."
+        detail = "Weekly, Daily, 8H, 4H and 1H latest candles are all RED. Bearish possibility. Monthly is display-only."
     elif states["1W"] == "Bullish" and states["1D"] == "Bullish" and any(
         states[x] == "Bearish" for x in ("8H", "4H", "1H")
     ):
