@@ -532,7 +532,7 @@ a{text-decoration:none}
 <body>
 <div class="wrap">
     <h1>⚡ {{ symbol }} EDO SETUP SIGNAL</h1>
-    <div class="small">{{ group }} • Your price-action method • 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
+    <div class="small">{{ group }} • Your price-action method • Trend Pullback: 2H / 4H / 8H / 1D / 1W • Other patterns: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
 
     <div class="tfrow">
         {% for tf in timeframes %}
@@ -738,10 +738,15 @@ PATTERN_BASELINE_CLOSED = {}
 # Supported saved-market groups: FOREX, CRYPTO, CFD.
 # The scanner does NOT place trades. It only finds setups for manual review.
 PATTERN_TIMEFRAMES = [
+    {"label": "2H", "value": "2h"},
+    {"label": "4H", "value": "4h"},
     {"label": "8H", "value": "8h"},
     {"label": "1D", "value": "1day"},
     {"label": "1W", "value": "1week"},
 ]
+
+# Only Trend Pullback is active below 8H.
+CORE_PATTERN_INTERVALS = {"8h", "1day", "1week"}
 
 
 def get_ohlc(symbol, interval, outputsize=140, grp=None):
@@ -1253,6 +1258,15 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             unique[key] = p
 
     found = list(unique.values())
+
+    # Edo rule: on 2H and 4H, ONLY Trend Pullback is active.
+    # Bounce/Retest and Range Reversal stay 8H + 1D + 1W.
+    if interval not in CORE_PATTERN_INTERVALS:
+        found = [
+            p for p in found
+            if p.get("name") == "TREND PULLBACK SETUP"
+        ]
+
     found.sort(
         key=lambda p: (
             p.get("confirmation_date", ""),
@@ -1430,7 +1444,16 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         if key not in unique or p.get("score", 0) > unique[key].get("score", 0):
             unique[key] = p
 
-    return list(unique.values()), latest_closed_date, None
+    setups = list(unique.values())
+
+    # Edo rule: on 2H and 4H, ONLY Trend Pullback may notify.
+    if interval not in CORE_PATTERN_INTERVALS:
+        setups = [
+            p for p in setups
+            if p.get("name") == "TREND PULLBACK SETUP"
+        ]
+
+    return setups, latest_closed_date, None
 
 
 def pattern_signal_monitor():
