@@ -1085,10 +1085,19 @@ def count_same_colour_before(candles, i, colour):
 
 def detect_trend_pullback(candles, conf):
     """
-    Edo trend-pullback setup:
-      established bigger price direction
-      3+ same-colour candles pulling against it
-      opposite candle closes >50% through the previous candle
+    Edo pullback / range-reversal setup:
+
+      TREND PULLBACK
+        - established bullish/bearish price structure
+        - minimum 2 same-colour CLOSED candles pulling against that structure
+        - opposite confirmation candle closes >50% through previous candle body
+
+      RANGE REVERSAL
+        - local structure is mixed/range-bound
+        - minimum 2 same-colour CLOSED candles in one direction
+        - opposite confirmation candle closes >50% through previous candle body
+
+    No moving average, CCI, RSI, or forming candle is used.
     """
     i = conf["index"]
     direction = conf["direction"]
@@ -1102,19 +1111,34 @@ def detect_trend_pullback(candles, conf):
 
     run_count, run_start = count_same_colour_before(candles, i, run_colour)
 
-    if run_count < 3:
+    # Updated Edo rule: minimum TWO completed pullback candles.
+    if run_count < 2:
         return None
 
     trend = local_structure_trend(candles, run_start)
-    if trend != required_trend:
+
+    # With-trend setup.
+    if trend == required_trend:
+        setup_name = "TREND PULLBACK SETUP"
+        context = "trend"
+        score = 6.0 + min(3.0, (run_count - 2) * 0.75)
+
+    # Range-bound / mixed structure setup.
+    elif trend == "mixed":
+        setup_name = "RANGE REVERSAL SETUP"
+        context = "range"
+        score = 5.0 + min(2.5, (run_count - 2) * 0.65)
+
+    # Do not label a move against a clearly established opposite trend
+    # as a trend pullback or a range reversal.
+    else:
         return None
 
-    target = previous_target(candles, direction, run_start)
-    score = 6.0 + min(3.0, (run_count - 3) * 0.75)
     score += min(2.0, max(0.0, conf["penetration"] - 50.0) / 25.0)
+    target = previous_target(candles, direction, run_start)
 
     return {
-        "name": "TREND PULLBACK SETUP",
+        "name": setup_name,
         "direction": direction,
         "confirmed": True,
         "score": score,
@@ -1124,6 +1148,7 @@ def detect_trend_pullback(candles, conf):
         "run_count": run_count,
         "run_colour": run_colour,
         "trend": trend,
+        "context": context,
         "target": target,
     }
 
@@ -1151,12 +1176,22 @@ def describe_setup(p):
             f"Confirmation close: {p['confirmation_close']:.5f}"
         )
 
-    else:
+    elif p["name"] == "TREND PULLBACK SETUP":
         detail = (
             f"{direction_word} trend-pullback confirmation on {p['confirmation_date']}. "
-            f"{p['run_count']} {p['run_colour']} candles pulled against the larger "
+            f"{p['run_count']} {p['run_colour']} CLOSED candles pulled against the larger "
             f"{p['trend']} price structure, then the confirmation candle closed "
             f"{p['penetration']:.0f}% back through the previous candle body."
+        )
+
+        level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
+
+    else:
+        detail = (
+            f"{direction_word} range-reversal confirmation on {p['confirmation_date']}. "
+            f"{p['run_count']} {p['run_colour']} CLOSED candles moved in one direction "
+            f"while local structure was mixed/range-bound, then the confirmation candle "
+            f"closed {p['penetration']:.0f}% back through the previous candle body."
         )
 
         level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
@@ -1365,7 +1400,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date):
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     """
-    Collect raw Bounce/Retest and Trend Pullback setups from closed candles only.
+    Collect raw Bounce/Retest, Trend Pullback, and Range Reversal setups from closed candles only.
 
     Returns:
       setups, latest_closed_date, error
