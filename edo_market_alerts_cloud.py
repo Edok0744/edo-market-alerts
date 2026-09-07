@@ -659,6 +659,21 @@ def init_db():
         c.commit()
 
 
+def reset_old_signal_history():
+    """
+    Start a fresh EdoSignal signal-test period.
+
+    Clears only EdoSignal's stored trend/pattern notification history.
+    Saved pairs and normal price alerts are kept.
+    Existing notifications already inside the Pushover app cannot be deleted
+    by this script.
+    """
+    with db_conn() as c:
+        c.execute("DELETE FROM trend_status")
+        c.execute("DELETE FROM pattern_notifications")
+        c.commit()
+
+
 def send_push(title, msg):
 
     if not PUSHOVER_APP_TOKEN or not PUSHOVER_USER_KEY:
@@ -712,13 +727,21 @@ def latest_price(symbol, grp=None):
 PATTERN_SIGNAL_CACHE = {}
 PATTERN_SIGNAL_CACHE_SECONDS = 60
 
+# -------------------------------------------------
+# CLEAN START / FROM-NOW BASELINES
+# -------------------------------------------------
+# Every time the app restarts, the first observed CLOSED candle/state becomes
+# the starting baseline. EdoSignal will not send a Pushover for a setup/state
+# that already existed before the restart.
+TREND_BASELINED = set()
+PATTERN_BASELINE_CLOSED = {}
+
 # Edo's higher-timeframe setup scanner.
 # The scanner does NOT place trades. It only finds setups for manual review.
 PATTERN_TIMEFRAMES = [
     {"label": "8H", "value": "8h"},
     {"label": "1D", "value": "1day"},
     {"label": "1W", "value": "1week"},
-    {"label": "1M", "value": "1month"},
 ]
 
 
@@ -1263,8 +1286,31 @@ def build_pattern_signal(symbol, interval, force_refresh=False):
 
 
 
-def notify_new_pattern_setups(symbol, interval, patterns):
-    """Send one Pushover per unique confirmed setup and remember it in SQLite."""
+def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date):
+    """
+    Notify only for a setup confirmed on a NEW fully closed candle
+    that appeared after this app start.
+
+    First observation after restart = baseline only, no Pushover.
+    """
+    if not latest_closed_date:
+        return
+
+    baseline_key = (symbol, interval)
+    previous_closed = PATTERN_BASELINE_CLOSED.get(baseline_key)
+
+    # First scan after boot: establish baseline and do not alert.
+    if previous_closed is None:
+        PATTERN_BASELINE_CLOSED[baseline_key] = latest_closed_date
+        return
+
+    # Same completed candle as before: nothing new to notify.
+    if latest_closed_date == previous_closed:
+        return
+
+    # A new fully closed candle has appeared after startup.
+    PATTERN_BASELINE_CLOSED[baseline_key] = latest_closed_date
+
     if not patterns:
         return
 
@@ -1274,6 +1320,10 @@ def notify_new_pattern_setups(symbol, interval, patterns):
     for p in patterns:
         confirmation_date = p.get("confirmation_date", "")
         if not confirmation_date:
+            continue
+
+        # Only setups confirmed by THIS newest closed candle may notify.
+        if confirmation_date != latest_closed_date:
             continue
 
         try:
@@ -1306,7 +1356,7 @@ def notify_new_pattern_setups(symbol, interval, patterns):
         send_push(
             f"{icon} {symbol} — {direction_word} EDO SETUP",
             (
-                f"{p['name']} confirmed on the last CLOSED {tf_label} candle "
+                f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
                 f"({confirmation_date}). {direction_word} possibility. "
                 f"Review the chart before trading."
             )
@@ -1314,14 +1364,21 @@ def notify_new_pattern_setups(symbol, interval, patterns):
 
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
-    """Collect raw Bounce/Retest and Trend Pullback setups from closed candles only."""
+    """
+    Collect raw Bounce/Retest and Trend Pullback setups from closed candles only.
+
+    Returns:
+      setups, latest_closed_date, error
+    """
     candles, error = get_ohlc(symbol, interval, outputsize=140, grp=grp)
     if error:
-        return None, error
+        return None, None, error
     if not candles or len(candles) < 41:
-        return None, f"Not enough fully closed {interval} candle history returned."
+        return None, None, f"Not enough fully closed {interval} candle history returned."
 
+    # The newest API candle may still be forming, so exclude it.
     closed_candles = candles[:-1]
+    latest_closed_date = closed_candles[-1].get("datetime", "")
     found = []
 
     for conf in recent_confirmations(closed_candles, lookback=7):
@@ -1339,7 +1396,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         if key not in unique or p.get("score", 0) > unique[key].get("score", 0):
             unique[key] = p
 
-    return list(unique.values()), None
+    return list(unique.values()), latest_closed_date, None
 
 
 def pattern_signal_monitor():
@@ -1369,12 +1426,19 @@ def pattern_signal_monitor():
                 symbol, grp, interval = jobs[index]
                 index = (index + 1) % len(jobs)
 
-                setups, error = collect_closed_pattern_setups(symbol, interval, grp)
+                setups, latest_closed_date, error = collect_closed_pattern_setups(
+                    symbol, interval, grp
+                )
 
                 if error:
                     print("pattern monitor error", symbol, interval, error)
                 else:
-                    notify_new_pattern_setups(symbol, interval, setups)
+                    notify_new_pattern_setups(
+                        symbol,
+                        interval,
+                        setups,
+                        latest_closed_date
+                    )
 
         except Exception as e:
             print("pattern signal monitor error", e)
@@ -1532,18 +1596,23 @@ def active_trend_monitor():
                     print("active trend error", symbol, error)
                 else:
                     previous = save_trend_status(symbol, status)
+                    baseline_key = (symbol, grp)
 
-                    # Send one Pushover notification only when the pair ENTERS
-                    # a fully aligned bullish or bearish state. Repeated checks
-                    # in the same state do not send duplicate notifications.
-                    if status in ("FULL BULLISH", "FULL BEARISH") and status != previous:
-                        icon = "🟢" if status == "FULL BULLISH" else "🔴"
-                        direction = "bullish" if status == "FULL BULLISH" else "bearish"
-                        send_push(
-                            f"{icon} {symbol} — {status}",
-                            f"All 5 last CLOSED signal candles are {direction}: 1W, 1D, 8H, 4H, 1H. "
-                            f"Monthly is display-only. CFD markets may use an ETF proxy for trend data."
-                        )
+                    # First observation after restart becomes the clean baseline.
+                    # No Pushover is sent for an alignment that already existed.
+                    if baseline_key not in TREND_BASELINED:
+                        TREND_BASELINED.add(baseline_key)
+                    else:
+                        # Notify only when a NEW fully aligned state is entered
+                        # after the baseline was established.
+                        if status in ("FULL BULLISH", "FULL BEARISH") and status != previous:
+                            icon = "🟢" if status == "FULL BULLISH" else "🔴"
+                            direction = "bullish" if status == "FULL BULLISH" else "bearish"
+                            send_push(
+                                f"{icon} {symbol} — {status}",
+                                f"All 5 last CLOSED signal candles are {direction}: 1W, 1D, 8H, 4H, 1H. "
+                                f"Monthly is display-only. CFD markets may use an ETF proxy for trend data."
+                            )
 
         except Exception as e:
             print("active trend monitor error", e)
@@ -2038,7 +2107,7 @@ def signal(i):
     )
 
     if not error:
-        setups, setup_error = collect_closed_pattern_setups(
+        setups, latest_closed_date, setup_error = collect_closed_pattern_setups(
             f['symbol'],
             selected_tf,
             f['grp']
@@ -2046,7 +2115,12 @@ def signal(i):
         if setup_error:
             print("manual pattern notification error", f['symbol'], selected_tf, setup_error)
         else:
-            notify_new_pattern_setups(f['symbol'], selected_tf, setups)
+            notify_new_pattern_setups(
+                f['symbol'],
+                selected_tf,
+                setups,
+                latest_closed_date
+            )
 
 
     if error:
@@ -2187,6 +2261,7 @@ def health():
 
 
 init_db()
+reset_old_signal_history()
 threading.Thread(
     target=monitor,
     daemon=True
