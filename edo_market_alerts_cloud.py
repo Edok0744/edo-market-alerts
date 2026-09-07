@@ -640,6 +640,18 @@ def init_db():
             updated TEXT
         )
         ''')
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS pattern_notifications(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            pattern_name TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            confirmation_date TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            UNIQUE(symbol, interval, pattern_name, direction, confirmation_date)
+        )
+        ''')
         try:
             c.execute("ALTER TABLE alerts ADD COLUMN note TEXT")
         except sqlite3.OperationalError:
@@ -1157,15 +1169,22 @@ def build_pattern_signal(symbol, interval, force_refresh=False):
             return None, "API busy. Wait about 60 seconds, then press Scan Again."
         return None, error
 
+    # Ignore the newest API candle because it may still be forming.
+    # Pattern setups are confirmed from fully CLOSED candles only.
+    closed_candles = candles[:-1]
+
+    if len(closed_candles) < 40:
+        return None, f"Not enough fully closed {interval} candle history returned."
+
     found = []
-    confirmations = recent_confirmations(candles, lookback=7)
+    confirmations = recent_confirmations(closed_candles, lookback=7)
 
     for conf in confirmations:
-        retest = detect_bounce_retest(candles, conf)
+        retest = detect_bounce_retest(closed_candles, conf)
         if retest:
             found.append(retest)
 
-        pullback = detect_trend_pullback(candles, conf)
+        pullback = detect_trend_pullback(closed_candles, conf)
         if pullback:
             found.append(pullback)
 
@@ -1241,6 +1260,126 @@ def build_pattern_signal(symbol, interval, force_refresh=False):
 
     PATTERN_SIGNAL_CACHE[cache_key] = {"saved_at": now, "data": data}
     return data, None
+
+
+
+def notify_new_pattern_setups(symbol, interval, patterns):
+    """Send one Pushover per unique confirmed setup and remember it in SQLite."""
+    if not patterns:
+        return
+
+    tf_labels = {x["value"]: x["label"] for x in PATTERN_TIMEFRAMES}
+    tf_label = tf_labels.get(interval, interval)
+
+    for p in patterns:
+        confirmation_date = p.get("confirmation_date", "")
+        if not confirmation_date:
+            continue
+
+        try:
+            with db_conn() as c:
+                c.execute(
+                    """
+                    INSERT INTO pattern_notifications(
+                        symbol, interval, pattern_name, direction,
+                        confirmation_date, sent_at
+                    )
+                    VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        symbol,
+                        interval,
+                        p["name"],
+                        p["direction"],
+                        confirmation_date,
+                        datetime.utcnow().isoformat(),
+                    )
+                )
+                c.commit()
+        except sqlite3.IntegrityError:
+            continue
+
+        bullish = p["direction"] == "bullish"
+        icon = "🟢" if bullish else "🔴"
+        direction_word = "BULLISH" if bullish else "BEARISH"
+
+        send_push(
+            f"{icon} {symbol} — {direction_word} EDO SETUP",
+            (
+                f"{p['name']} confirmed on the last CLOSED {tf_label} candle "
+                f"({confirmation_date}). {direction_word} possibility. "
+                f"Review the chart before trading."
+            )
+        )
+
+
+def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
+    """Collect raw Bounce/Retest and Trend Pullback setups from closed candles only."""
+    candles, error = get_ohlc(symbol, interval, outputsize=140, grp=grp)
+    if error:
+        return None, error
+    if not candles or len(candles) < 41:
+        return None, f"Not enough fully closed {interval} candle history returned."
+
+    closed_candles = candles[:-1]
+    found = []
+
+    for conf in recent_confirmations(closed_candles, lookback=7):
+        retest = detect_bounce_retest(closed_candles, conf)
+        if retest:
+            found.append(retest)
+
+        pullback = detect_trend_pullback(closed_candles, conf)
+        if pullback:
+            found.append(pullback)
+
+    unique = {}
+    for p in found:
+        key = (p["name"], p["direction"], p["confirmation_date"])
+        if key not in unique or p.get("score", 0) > unique[key].get("score", 0):
+            unique[key] = p
+
+    return list(unique.values()), None
+
+
+def pattern_signal_monitor():
+    """
+    Background pattern scanner for saved FOREX pairs.
+    Checks one symbol/timeframe combination every five minutes.
+    """
+    time.sleep(150)
+    index = 0
+
+    while True:
+        try:
+            with db_conn() as c:
+                rows = c.execute(
+                    "SELECT symbol, grp FROM favorites WHERE grp='FOREX' ORDER BY symbol"
+                ).fetchall()
+
+            jobs = []
+            for row in rows:
+                for tf in PATTERN_TIMEFRAMES:
+                    jobs.append((row["symbol"], row["grp"], tf["value"]))
+
+            if jobs:
+                if index >= len(jobs):
+                    index = 0
+
+                symbol, grp, interval = jobs[index]
+                index = (index + 1) % len(jobs)
+
+                setups, error = collect_closed_pattern_setups(symbol, interval, grp)
+
+                if error:
+                    print("pattern monitor error", symbol, interval, error)
+                else:
+                    notify_new_pattern_setups(symbol, interval, setups)
+
+        except Exception as e:
+            print("pattern signal monitor error", e)
+
+        time.sleep(300)
 
 
 def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
@@ -1898,6 +2037,18 @@ def signal(i):
         force_refresh=force_refresh
     )
 
+    if not error:
+        setups, setup_error = collect_closed_pattern_setups(
+            f['symbol'],
+            selected_tf,
+            f['grp']
+        )
+        if setup_error:
+            print("manual pattern notification error", f['symbol'], selected_tf, setup_error)
+        else:
+            notify_new_pattern_setups(f['symbol'], selected_tf, setups)
+
+
     if error:
         return render_template_string(
             SIGNAL_HTML,
@@ -2043,6 +2194,11 @@ threading.Thread(
 
 threading.Thread(
     target=active_trend_monitor,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=pattern_signal_monitor,
     daemon=True
 ).start()
 
