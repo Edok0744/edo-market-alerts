@@ -179,7 +179,7 @@ a{text-decoration:none}
 <input
     id="symbol"
     name="symbol"
-    placeholder="USD/CAD or BTC/USD"
+    placeholder="USD/CAD or BTCUSD"
     value="{{ selected_symbol }}"
     required>
 
@@ -1437,9 +1437,9 @@ def twelve_symbol(symbol, grp=None):
         EUR/USD -> EUR/USD
 
     CRYPTO:
-        BTCUSDT -> BTC/USDT
-        SOLUSDT -> SOL/USDT
-        BTCUSD  -> BTC/USD
+        BTCUSD -> BTC/USD
+        ETHUSD -> ETH/USD
+        SOLUSD -> SOL/USD
 
     CFD / INDEX broker aliases:
         US500 / SP500 -> SPX
@@ -1494,10 +1494,11 @@ def twelve_symbol(symbol, grp=None):
     if s in cfd_aliases:
         return cfd_aliases[s]
 
-    # Compact crypto pairs. Longest quote currencies first.
-    crypto_quotes = ("USDT", "USDC", "BUSD", "AUD", "EUR", "GBP", "USD", "BTC", "ETH")
+    # Crypto:
+    # Keep the app simple: enter compact USD pairs such as BTCUSD, ETHUSD,
+    # SOLUSD, XRPUSD. The app converts them to Twelve Data slash format.
     if grp == "CRYPTO":
-        for quote in crypto_quotes:
+        for quote in ("AUD", "EUR", "GBP", "USD", "BTC", "ETH"):
             if s.endswith(quote) and len(s) > len(quote):
                 return s[:-len(quote)] + "/" + quote
 
@@ -1505,11 +1506,9 @@ def twelve_symbol(symbol, grp=None):
     if grp == "FOREX" and len(s) == 6 and s.isalpha():
         return s[:3] + "/" + s[3:]
 
-    # With no group supplied, safely recognise the most common compact crypto quotes.
-    if grp is None:
-        for quote in ("USDT", "USDC"):
-            if s.endswith(quote) and len(s) > len(quote):
-                return s[:-len(quote)] + "/" + quote
+    # Group-less fallback for common compact USD crypto symbols.
+    if grp is None and s.endswith("USD") and len(s) > 3:
+        return s[:-3] + "/USD"
 
     return s
 
