@@ -1309,10 +1309,10 @@ def build_full_alignment(symbol, grp=None):
     Monthly is display-only and does not trigger a signal.
 
     FULL BULLISH:
-      the latest candle on ALL five signal timeframes is green.
+      the last FULLY CLOSED candle on ALL five signal timeframes is green.
 
     FULL BEARISH:
-      the latest candle on ALL five signal timeframes is red.
+      the last FULLY CLOSED candle on ALL five signal timeframes is red.
     """
     intervals = {
         "1W": "1week",
@@ -1329,7 +1329,10 @@ def build_full_alignment(symbol, grp=None):
         if err:
             return "", err
 
-        signal_states[label] = analyse_candle(candles[-1])
+        closed = last_closed_candle(candles)
+        if closed is None:
+            return "", f"Not enough completed {label} candle data."
+        signal_states[label] = analyse_candle(closed)
 
     if all(v == "Bullish" for v in signal_states.values()):
         return "FULL BULLISH", None
@@ -1399,7 +1402,7 @@ def active_trend_monitor():
                         direction = "bullish" if status == "FULL BULLISH" else "bearish"
                         send_push(
                             f"{icon} {symbol} — {status}",
-                            f"All 5 signal timeframe candles are {direction}: 1W, 1D, 8H, 4H, 1H. "
+                            f"All 5 last CLOSED signal candles are {direction}: 1W, 1D, 8H, 4H, 1H. "
                             f"Monthly is display-only. CFD markets may use an ETF proxy for trend data."
                         )
 
@@ -1516,7 +1519,13 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
     Download OHLC candles from Twelve Data.
 
     Candles are returned oldest -> newest.
-    For Edo's trend signal we use the colour of the latest candle:
+
+    IMPORTANT:
+    The newest candle returned by the API may still be forming.
+    EdoSignal therefore NEVER uses that live candle for a signal.
+
+    The signal uses the previous candle, which is treated as the last
+    fully closed/completed candle:
       close > open  = Bullish / green
       close < open  = Bearish / red
       close == open = Mixed / doji
@@ -1566,6 +1575,19 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
         print("trend data error", symbol, interval, e)
         return None, "Could not download trend data."
 
+def last_closed_candle(candles):
+    """
+    Return the last fully completed candle.
+
+    Twelve Data can include the currently forming candle as the newest item.
+    Because candles are stored oldest -> newest, candles[-1] may still move.
+    We deliberately use candles[-2] so EdoSignal cannot trigger from a live candle.
+    """
+    if not candles or len(candles) < 2:
+        return None
+    return candles[-2]
+
+
 def analyse_candle(candle):
     """
     Direct candlestick direction only.
@@ -1584,11 +1606,12 @@ def analyse_candle(candle):
 def analyse_closes(candles):
     """
     Kept under the old function name so the rest of the app stays simple.
-    It now analyses ONLY the latest candlestick colour -- no SMA20/SMA50.
+    It now analyses ONLY the last fully closed candlestick colour -- no SMA20/SMA50.
     """
-    if not candles:
+    closed = last_closed_candle(candles)
+    if closed is None:
         return "Mixed"
-    return analyse_candle(candles[-1])
+    return analyse_candle(closed)
 
 def build_trend_scan(symbol, grp=None):
     results = []
@@ -1605,7 +1628,11 @@ def build_trend_scan(symbol, grp=None):
         if error:
             return None, error
 
-        state = analyse_candle(candles[-1])
+        closed = last_closed_candle(candles)
+        if closed is None:
+            return None, f"Not enough completed {label} candle data."
+
+        state = analyse_candle(closed)
         icon, css = state_info[state]
 
         results.append({
@@ -1637,11 +1664,11 @@ def build_trend_scan(symbol, grp=None):
     if full_bull:
         summary = "FULL BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Weekly, Daily, 8H, 4H and 1H latest candles are all GREEN. Bullish possibility. Monthly is display-only."
+        detail = "Last CLOSED candles on Weekly, Daily, 8H, 4H and 1H are all GREEN. Bullish possibility. Monthly is display-only."
     elif full_bear:
         summary = "FULL BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Weekly, Daily, 8H, 4H and 1H latest candles are all RED. Bearish possibility. Monthly is display-only."
+        detail = "Last CLOSED candles on Weekly, Daily, 8H, 4H and 1H are all RED. Bearish possibility. Monthly is display-only."
     elif states["1W"] == "Bullish" and states["1D"] == "Bullish" and any(
         states[x] == "Bearish" for x in ("8H", "4H", "1H")
     ):
