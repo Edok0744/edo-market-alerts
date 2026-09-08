@@ -15,8 +15,9 @@ CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 # TWELVE DATA API PROTECTION
 # -------------------------------------------------
 # Twelve Data account limit seen by Edo: 8 credits/minute.
-# EdoSignal deliberately stays below that with a conservative maximum
-# of 5 REAL Twelve Data calls in any rolling 60-second window.
+# Grow 55 allows 55 API credits/minute.
+# EdoSignal deliberately keeps a safety margin with a maximum
+# of 45 REAL Twelve Data calls in any rolling 60-second window.
 #
 # IMPORTANT:
 # The API limiter no longer uses SQLite. On Railway, Gunicorn workers
@@ -24,7 +25,7 @@ CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 # to kill a worker. The limiter now uses a tiny file + Linux file lock.
 # This keeps the API protection shared between workers on the same service
 # without holding the main EdoSignal database open.
-TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '5'))
+TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '45'))
 TWELVE_CALL_WINDOW = 60.0
 
 _API_LIMIT_FILE = os.environ.get(
@@ -96,7 +97,7 @@ class TwelveDataCoolingDown(Exception):
 
 def wait_for_twelve_credit(max_wait=2.0):
     """
-    Shared rolling Twelve Data limiter.
+    Shared rolling Twelve Data limiter for the Grow 55 plan.
 
     The important change is that EdoSignal will NOT sit inside a Gunicorn
     web request waiting 30-60 seconds for the next API slot. If the next
@@ -1858,7 +1859,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 def pattern_signal_monitor():
     """
     Background pattern scanner for all saved FOREX, CRYPTO, and CFD markets.
-    Checks one symbol/timeframe combination every five minutes.
+    Checks one symbol/timeframe combination every 30 minutes.
     """
     time.sleep(150)
     index = 0
@@ -1866,7 +1867,7 @@ def pattern_signal_monitor():
     while True:
         try:
             if manual_api_priority_active():
-                time.sleep(15)
+                time.sleep(1800)
                 continue
 
             with db_conn() as c:
@@ -1904,7 +1905,7 @@ def pattern_signal_monitor():
         except Exception as e:
             print("pattern signal monitor error", e)
 
-        time.sleep(300)
+        time.sleep(15)
 
 
 def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
@@ -2070,8 +2071,8 @@ def save_trend_status(symbol, status):
 
 
 def active_trend_monitor():
-    # Start two minutes after boot, then refresh one active symbol every five minutes.
-    time.sleep(120)
+    # Start one minute after boot, then refresh one active symbol every minute.
+    time.sleep(60)
     index = 0
 
     while True:
@@ -2115,7 +2116,7 @@ def active_trend_monitor():
         except Exception as e:
             print("active trend monitor error", e)
 
-        time.sleep(300)
+        time.sleep(60)
 
 
 TREND_INTERVALS = [
