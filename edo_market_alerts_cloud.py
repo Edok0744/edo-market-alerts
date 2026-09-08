@@ -744,6 +744,28 @@ a{text-decoration:none}
 .pattern-title{font-size:17px;font-weight:900}
 .pattern-detail{font-size:13px;color:#a9bfd2;margin-top:5px;line-height:1.4}
 .level{font-size:14px;font-weight:800;margin-top:7px}
+.section-title{
+    font-size:16px;
+    font-weight:900;
+    letter-spacing:.3px;
+    margin-top:16px;
+}
+.newest-title{color:#f2c94c}
+.previous-title{color:#8ca7bf}
+.newest-pattern{
+    border:2px solid #f2c94c;
+    box-shadow:0 0 0 1px rgba(242,201,76,.08) inset;
+}
+.newest-badge{
+    display:inline-block;
+    background:#f2c94c;
+    color:#07111f;
+    padding:5px 9px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:900;
+    margin-bottom:8px;
+}
 .pricebox{
     display:flex;
     justify-content:space-between;
@@ -798,15 +820,33 @@ a{text-decoration:none}
         <div class="small" style="margin-top:6px">{{ summary }}</div>
 
         {% if patterns %}
-            {% for p in patterns %}
-            <div class="pattern">
-                <div class="pattern-title {{ p['css'] }}">{{ p['icon'] }} {{ p['name'] }}</div>
-                <div class="pattern-detail">{{ p['detail'] }}</div>
-                {% if p['level_text'] %}
-                <div class="level">{{ p['level_text'] }}</div>
+            <div class="section-title newest-title">⚡ NEWEST TRIGGER</div>
+
+            {% set newest = patterns[0] %}
+            <div class="pattern newest-pattern">
+                <div class="newest-badge">MOST RECENT VALID PATTERN</div>
+                <div class="pattern-title {{ newest['css'] }}">
+                    {{ newest['icon'] }} {{ newest['name'] }}
+                </div>
+                <div class="pattern-detail">{{ newest['detail'] }}</div>
+                {% if newest['level_text'] %}
+                <div class="level">{{ newest['level_text'] }}</div>
                 {% endif %}
             </div>
-            {% endfor %}
+
+            {% if patterns|length > 1 %}
+                <div class="section-title previous-title">📚 PREVIOUS SETUPS</div>
+
+                {% for p in patterns[1:] %}
+                <div class="pattern">
+                    <div class="pattern-title {{ p['css'] }}">{{ p['icon'] }} {{ p['name'] }}</div>
+                    <div class="pattern-detail">{{ p['detail'] }}</div>
+                    {% if p['level_text'] %}
+                    <div class="level">{{ p['level_text'] }}</div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+            {% endif %}
         {% else %}
             <div class="pattern">
                 <div class="pattern-title neutral">No matching setup yet</div>
@@ -818,8 +858,9 @@ a{text-decoration:none}
         {% endif %}
 
         <div class="small" style="margin-top:12px">
-            Updated: {{ updated }}. The scanner finds setups from your candle-close rules.
-            It does not place trades. You decide whether to pull the trigger.
+            Updated: {{ updated }}. “Newest Trigger” means the most recent valid completed
+            pattern found on this selected timeframe. Older matches are kept below as
+            Previous Setups. The scanner uses closed candles only and does not place trades.
         </div>
     {% endif %}
     </div>
