@@ -126,7 +126,6 @@ def ohlc_cache_seconds(interval):
         "2h": 180,
         "4h": 240,
         "8h": 300,
-        "12h": 360,
         "1day": 600,
         "1week": 900,
         "1month": 1800,
@@ -1821,6 +1820,72 @@ def resample_closes(rows, mode):
     return list(buckets.values())
 
 
+
+def get_last_closed_12h_candle(symbol, grp=None):
+    """
+    Build the most recent FULLY CLOSED 12H candle from Twelve Data 4H candles.
+
+    Twelve Data reliably supplies 4H data on this setup. We combine:
+      00:00 + 04:00 + 08:00  -> first 12H candle
+      12:00 + 16:00 + 20:00  -> second 12H candle
+
+    The newest 4H API candle is excluded first because it may still be forming.
+    Only a bucket containing all three completed 4H candles is accepted.
+    """
+    candles, error = get_candles(symbol, "4h", outputsize=12, grp=grp)
+    if error:
+        return None, error
+
+    if not candles or len(candles) < 4:
+        return None, "Not enough 4H data to build a completed 12H candle."
+
+    # Never use the current/forming 4H candle.
+    closed_4h = candles[:-1]
+
+    buckets = {}
+
+    for c in closed_4h:
+        try:
+            dt = datetime.fromisoformat(c["datetime"])
+        except Exception:
+            continue
+
+        half = 0 if dt.hour < 12 else 12
+        key = (dt.date().isoformat(), half)
+
+        buckets.setdefault(key, []).append((dt, c))
+
+    completed = []
+
+    for key, items in buckets.items():
+        items.sort(key=lambda x: x[0])
+
+        # Need the full set of 3 completed 4H candles for a true 12H candle.
+        if len(items) != 3:
+            continue
+
+        hours = [x[0].hour for x in items]
+        expected = [0, 4, 8] if key[1] == 0 else [12, 16, 20]
+
+        if hours != expected:
+            continue
+
+        cs = [x[1] for x in items]
+
+        completed.append({
+            "datetime": items[0][0].isoformat(sep=" "),
+            "open": cs[0]["open"],
+            "high": max(x["high"] for x in cs),
+            "low": min(x["low"] for x in cs),
+            "close": cs[-1]["close"],
+        })
+
+    if not completed:
+        return None, "Could not build a fully completed 12H candle from 4H data."
+
+    return completed[-1], None
+
+
 def build_full_alignment(symbol, grp=None):
     """
     Edo direct-candlestick alignment signal.
@@ -1828,22 +1893,26 @@ def build_full_alignment(symbol, grp=None):
     Signal timeframes:
       12H + 8H + 4H + 1H
 
-    Monthly is display-only and does not trigger a signal.
-
     FULL BULLISH:
-      the last FULLY CLOSED candle on ALL five signal timeframes is green.
+      the last FULLY CLOSED candle on all four signal timeframes is green.
 
     FULL BEARISH:
-      the last FULLY CLOSED candle on ALL five signal timeframes is red.
+      the last FULLY CLOSED candle on all four signal timeframes is red.
+
+    12H is built locally from three completed 4H candles.
     """
+    signal_states = {}
+
+    closed_12h, err = get_last_closed_12h_candle(symbol, grp)
+    if err:
+        return "", err
+    signal_states["12H"] = analyse_candle(closed_12h)
+
     intervals = {
-        "12H": "12h",
         "8H": "8h",
         "4H": "4h",
         "1H": "1h",
     }
-
-    signal_states = {}
 
     for label, interval in intervals.items():
         candles, err = get_candles(symbol, interval, outputsize=3, grp=grp)
@@ -1853,6 +1922,7 @@ def build_full_alignment(symbol, grp=None):
         closed = last_closed_candle(candles)
         if closed is None:
             return "", f"Not enough completed {label} candle data."
+
         signal_states[label] = analyse_candle(closed)
 
     if all(v == "Bullish" for v in signal_states.values()):
@@ -1862,6 +1932,7 @@ def build_full_alignment(symbol, grp=None):
         return "FULL BEARISH", None
 
     return "", None
+
 
 def save_trend_status(symbol, status):
     """Save trend status and return the previous saved status."""
@@ -2099,20 +2170,32 @@ def build_trend_scan(symbol, grp=None):
         "Mixed": ("🟡", "mixed"),
     }
 
-    # These FOUR timeframes are the complete Full Trend indication.
-    # Manual Trend page uses at most 4 Twelve Data requests.
-    signal_intervals = [
-        ("12H", "12h"),
+    states = {}
+
+    # 12H is derived from completed 4H candles.
+    closed_12h, error = get_last_closed_12h_candle(symbol, grp)
+    if error:
+        return None, error
+
+    state_12h = analyse_candle(closed_12h)
+    states["12H"] = state_12h
+    icon, css = state_info[state_12h]
+
+    results.append({
+        "label": "12H",
+        "interval": "derived from 4H",
+        "state": state_12h,
+        "icon": icon,
+        "css": css,
+    })
+
+    # These three are requested directly.
+    for label, interval in [
         ("8H", "8h"),
         ("4H", "4h"),
         ("1H", "1h"),
-    ]
-
-    states = {}
-
-    for label, interval in signal_intervals:
+    ]:
         candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
-
         if error:
             return None, error
 
