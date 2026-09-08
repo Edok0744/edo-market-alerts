@@ -587,7 +587,7 @@ a{text-decoration:none}
             <div class="trend-box">
                 <div class="trend-tf">{{ item['label'] }}</div>
                 <div class="trend-state {{ item['css'] }}">
-                    {{ item['icon'] }} {{ item['state'] }}
+                    {% if not item.get('reference_only') %}{{ item['icon'] }} {% endif %}{{ item['state'] }}
                 </div>
             </div>
         {% endfor %}
@@ -2210,8 +2210,13 @@ def build_trend_scan(symbol, grp=None):
         "Mixed": ("🟡", "mixed"),
     }
 
-    # These FOUR timeframes are the complete Full Trend indication.
-    # 12H is built from 4H, so the Trend page needs only 3 native Twelve Data intervals.
+    # Weekly is DISPLAY ONLY for reference.
+    # It does NOT affect FULL BULLISH / FULL BEARISH or Pushover triggering.
+    reference_intervals = [
+        ("Weekly", "1week"),
+    ]
+
+    # These FOUR timeframes alone control the Full Trend signal.
     signal_intervals = [
         ("12H", "12h"),
         ("8H", "8h"),
@@ -2221,6 +2226,30 @@ def build_trend_scan(symbol, grp=None):
 
     states = {}
 
+    # Weekly first: coloured text only, no red/green dot.
+    for label, interval in reference_intervals:
+        candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
+
+        if error:
+            return None, error
+
+        closed = last_closed_candle(candles)
+        if closed is None:
+            return None, f"Not enough completed {label} candle data."
+
+        state = analyse_candle(closed)
+        _, css = state_info[state]
+
+        results.append({
+            "label": label,
+            "interval": interval,
+            "state": state,
+            "icon": "",
+            "css": css,
+            "reference_only": True,
+        })
+
+    # Existing signal rows stay unchanged.
     for label, interval in signal_intervals:
         candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
 
@@ -2241,6 +2270,7 @@ def build_trend_scan(symbol, grp=None):
             "state": state,
             "icon": icon,
             "css": css,
+            "reference_only": False,
         })
 
     signal_labels = ("12H", "8H", "4H", "1H")
