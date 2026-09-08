@@ -88,26 +88,27 @@ def _save_api_timestamps(values):
     os.replace(temp_file, _API_LIMIT_FILE)
 
 
-def wait_for_twelve_credit():
-    """
-    Rolling Twelve Data limiter that does NOT use SQLite.
 
-    Railway/Gunicorn workers coordinate through a very short file lock.
-    The lock is held only while reading/updating a tiny timestamp file,
-    then released immediately. If the 5-call allowance is already used,
-    the request sleeps OUTSIDE the lock.
+class TwelveDataCoolingDown(Exception):
+    """Raised when EdoSignal should not wait inside a web worker for API credit."""
+    pass
 
-    This prevents the old:
-        database is locked
-        Gunicorn worker timeout / SystemExit
-    problem.
+
+def wait_for_twelve_credit(max_wait=2.0):
     """
+    Shared rolling Twelve Data limiter.
+
+    The important change is that EdoSignal will NOT sit inside a Gunicorn
+    web request waiting 30-60 seconds for the next API slot. If the next
+    slot is too far away it fails quickly, so Railway can keep serving
+    the app instead of showing Server Error / 502.
+    """
+    started = time.time()
+
     while True:
         now = time.time()
-        wait_seconds = 0.5
+        wait_seconds = 0.25
 
-        # On Railway/Linux, flock coordinates all Gunicorn workers that
-        # share this filesystem. The threading lock is a local fallback.
         with _LOCAL_API_LIMIT_LOCK:
             lock_handle = None
             try:
@@ -122,18 +123,17 @@ def wait_for_twelve_credit():
 
                 timestamps = _load_api_timestamps()
                 cutoff = now - TWELVE_CALL_WINDOW
-                timestamps = [ts for ts in timestamps if ts >= cutoff]
-                timestamps.sort()
+                timestamps = sorted(ts for ts in timestamps if ts >= cutoff)
 
                 if len(timestamps) < TWELVE_CALL_LIMIT:
                     timestamps.append(now)
                     _save_api_timestamps(timestamps)
-                    return
+                    return True
 
                 oldest = timestamps[0]
                 wait_seconds = max(
-                    0.5,
-                    TWELVE_CALL_WINDOW - (now - oldest) + 0.35
+                    0.25,
+                    TWELVE_CALL_WINDOW - (now - oldest) + 0.25
                 )
 
             finally:
@@ -144,13 +144,20 @@ def wait_for_twelve_credit():
                     finally:
                         lock_handle.close()
 
-        # Never sleep while holding the file lock.
-        time.sleep(wait_seconds)
+        elapsed = time.time() - started
+        remaining = float(max_wait) - elapsed
+
+        if remaining <= 0 or wait_seconds > remaining:
+            raise TwelveDataCoolingDown(
+                "Twelve Data limit is cooling down. Please try again shortly."
+            )
+
+        time.sleep(min(wait_seconds, remaining))
 
 
 def twelve_get_json(endpoint, params, timeout=15):
-    """All Twelve Data requests pass through the shared file-based limiter."""
-    wait_for_twelve_credit()
+    """All Twelve Data requests pass through the shared fail-fast limiter."""
+    wait_for_twelve_credit(max_wait=2.0)
     r = requests.get(endpoint, params=params, timeout=timeout)
     return r.json()
 
@@ -168,6 +175,16 @@ def ohlc_cache_seconds(interval):
         "1week": 900,
         "1month": 1800,
     }.get(interval, 180)
+
+
+_HOME_PAGE_CACHE = {
+    "saved_at": 0.0,
+    "markets": [],
+    "favorites": [],
+    "trend_statuses": {},
+    "trend_snapshots": {},
+}
+_HOME_PAGE_CACHE_LOCK = threading.Lock()
 
 
 COLORS = {
@@ -818,13 +835,26 @@ a{text-decoration:none}
 
 
 def db_conn():
-    c = sqlite3.connect(DB, check_same_thread=False)
+    c = sqlite3.connect(
+        DB,
+        timeout=5,
+        check_same_thread=False
+    )
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=3000")
     return c
 
 
 def init_db():
     with db_conn() as c:
+        # WAL allows the home page to READ saved data while background
+        # threads perform short WRITES. This greatly reduces lock errors.
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.OperationalError as e:
+            print("SQLite WAL setup warning:", e)
+
 
         c.execute('''
         CREATE TABLE IF NOT EXISTS alerts(
@@ -969,6 +999,8 @@ def latest_price(symbol, grp=None):
             _PRICE_CACHE[cache_key] = {"saved_at": now, "price": price}
         return price
 
+    except TwelveDataCoolingDown:
+        return None
     except Exception as e:
         print('price error', symbol, e)
         return None
@@ -1055,6 +1087,8 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
 
         return candles, None
 
+    except TwelveDataCoolingDown:
+        return None, "API cooling down — please try again in a few seconds."
     except Exception as e:
         print("setup scanner data error", symbol, interval, e)
         return None, "Could not download setup data."
@@ -2503,44 +2537,65 @@ def monitor():
 
 @APP.route('/')
 def home():
-
+    """
+    Fast home screen:
+    - database/cache only
+    - no Twelve Data request
+    - no waiting for API credit
+    """
     selected_symbol = request.args.get('symbol', '')
     selected_group = request.args.get('group', 'FOREX')
 
-    with db_conn() as c:
+    try:
+        with db_conn() as c:
+            markets = c.execute(
+                'SELECT * FROM alerts ORDER BY grp,symbol'
+            ).fetchall()
 
-        markets = c.execute(
-            'SELECT * FROM alerts ORDER BY grp,symbol'
-        ).fetchall()
+            favorites = c.execute(
+                'SELECT * FROM favorites ORDER BY grp,symbol'
+            ).fetchall()
 
-        favorites = c.execute(
-            'SELECT * FROM favorites ORDER BY grp,symbol'
-        ).fetchall()
+            trend_rows = c.execute(
+                'SELECT symbol,status FROM trend_status'
+            ).fetchall()
 
-        trend_rows = c.execute(
-            'SELECT symbol,status FROM trend_status'
-        ).fetchall()
-
-        trend_statuses = {
-            r['symbol']: r['status']
-            for r in trend_rows
-        }
-
-        snapshot_rows = c.execute(
-            'SELECT symbol,weekly,h12,h8,h4,h1,updated FROM trend_snapshot'
-        ).fetchall()
-
-        trend_snapshots = {
-            r['symbol']: {
-                'Weekly': r['weekly'] or '',
-                '12H': r['h12'] or '',
-                '8H': r['h8'] or '',
-                '4H': r['h4'] or '',
-                '1H': r['h1'] or '',
-                'updated': r['updated'] or ''
+            trend_statuses = {
+                r['symbol']: r['status']
+                for r in trend_rows
             }
-            for r in snapshot_rows
-        }
+
+            snapshot_rows = c.execute(
+                'SELECT symbol,weekly,h12,h8,h4,h1,updated FROM trend_snapshot'
+            ).fetchall()
+
+            trend_snapshots = {
+                r['symbol']: {
+                    'Weekly': r['weekly'] or '',
+                    '12H': r['h12'] or '',
+                    '8H': r['h8'] or '',
+                    '4H': r['h4'] or '',
+                    '1H': r['h1'] or '',
+                    'updated': r['updated'] or ''
+                }
+                for r in snapshot_rows
+            }
+
+        with _HOME_PAGE_CACHE_LOCK:
+            _HOME_PAGE_CACHE["saved_at"] = time.time()
+            _HOME_PAGE_CACHE["markets"] = markets
+            _HOME_PAGE_CACHE["favorites"] = favorites
+            _HOME_PAGE_CACHE["trend_statuses"] = trend_statuses
+            _HOME_PAGE_CACHE["trend_snapshots"] = trend_snapshots
+
+    except sqlite3.OperationalError as e:
+        print("home SQLite busy; serving cached screen:", e)
+
+        with _HOME_PAGE_CACHE_LOCK:
+            markets = _HOME_PAGE_CACHE["markets"]
+            favorites = _HOME_PAGE_CACHE["favorites"]
+            trend_statuses = dict(_HOME_PAGE_CACHE["trend_statuses"])
+            trend_snapshots = dict(_HOME_PAGE_CACHE["trend_snapshots"])
 
     return render_template_string(
         HTML,
