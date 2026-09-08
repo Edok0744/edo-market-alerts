@@ -304,6 +304,44 @@ h2{font-size:18px}
 .price{font-variant-numeric:tabular-nums;font-weight:700}
 .status{font-size:12px;font-weight:800}
 .fulltrend{font-size:12px;font-weight:900;margin-top:4px}
+
+.alerttrend{
+    margin-top:10px;
+    padding:9px 10px;
+    border:1px solid #294761;
+    border-radius:12px;
+    background:#0d2134;
+}
+.alerttrend-title{
+    font-size:10px;
+    color:#8ca7bf;
+    font-weight:800;
+    margin-bottom:7px;
+}
+.alerttrend-grid{
+    display:grid;
+    grid-template-columns:repeat(5,1fr);
+    gap:6px;
+    text-align:center;
+}
+.alerttrend-tf{
+    font-size:10px;
+    color:#b5c7d8;
+    font-weight:800;
+}
+.alerttrend-state{
+    font-size:10px;
+    font-weight:900;
+    margin-top:2px;
+}
+.alerttrend-bull{color:#35e28a}
+.alerttrend-bear{color:#ff5f73}
+.alerttrend-mixed{color:#f2c94c}
+@media(max-width:700px){
+    .alerttrend-grid{grid-template-columns:repeat(5,1fr);gap:3px}
+    .alerttrend{padding:8px 6px}
+    .alerttrend-tf,.alerttrend-state{font-size:9px}
+}
 .fullbull{color:#35e28a}
 .fullbear{color:#ff6b7d}
 .trendbtn{background:#5dade2;color:#07111f}
@@ -453,6 +491,27 @@ Target {{m['direction']}} {{m['target']}}
 {% if m['note'] %}
 <div class="small">
 📝 {{m['note']}}
+</div>
+{% endif %}
+
+{% set snap = trend_snapshots.get(m['symbol']) %}
+{% if snap %}
+<div class="alerttrend">
+    <div class="alerttrend-title">TREND • Weekly reference only</div>
+    <div class="alerttrend-grid">
+        {% for tf in ['Weekly','12H','8H','4H','1H'] %}
+        {% set st = snap.get(tf, '') %}
+        <div>
+            <div class="alerttrend-tf">{{ 'W' if tf == 'Weekly' else tf }}</div>
+            <div class="alerttrend-state
+                {{ 'alerttrend-bull' if st == 'Bullish'
+                   else 'alerttrend-bear' if st == 'Bearish'
+                   else 'alerttrend-mixed' }}">
+                {{ st if st else '—' }}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
 </div>
 {% endif %}
 </div>
@@ -794,6 +853,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS trend_status(
             symbol TEXT PRIMARY KEY,
             status TEXT NOT NULL DEFAULT '',
+            updated TEXT
+        )
+        ''')
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS trend_snapshot(
+            symbol TEXT PRIMARY KEY,
+            weekly TEXT,
+            h12 TEXT,
+            h8 TEXT,
+            h4 TEXT,
+            h1 TEXT,
             updated TEXT
         )
         ''')
@@ -1858,20 +1928,45 @@ def resample_closes(rows, mode):
     return list(buckets.values())
 
 
+def save_trend_snapshot(symbol, states):
+    """Persist latest closed-candle states for Active Alerts display."""
+    with db_conn() as c:
+        c.execute(
+            """
+            INSERT INTO trend_snapshot(symbol,weekly,h12,h8,h4,h1,updated)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                weekly=excluded.weekly,
+                h12=excluded.h12,
+                h8=excluded.h8,
+                h4=excluded.h4,
+                h1=excluded.h1,
+                updated=excluded.updated
+            """,
+            (
+                symbol,
+                states.get("Weekly", ""),
+                states.get("12H", ""),
+                states.get("8H", ""),
+                states.get("4H", ""),
+                states.get("1H", ""),
+                datetime.utcnow().isoformat(),
+            )
+        )
+        c.commit()
+
+
 def build_full_alignment(symbol, grp=None):
     """
     Edo direct-candlestick alignment signal.
 
-    Signal timeframes:
+    TRIGGER timeframes:
       12H + 8H + 4H + 1H
 
-    Monthly is display-only and does not trigger a signal.
+    Weekly:
+      display/reference only. It NEVER affects FULL BULLISH / FULL BEARISH.
 
-    FULL BULLISH:
-      the last FULLY CLOSED candle on ALL five signal timeframes is green.
-
-    FULL BEARISH:
-      the last FULLY CLOSED candle on ALL five signal timeframes is red.
+    All decisions use the last fully CLOSED candle.
     """
     intervals = {
         "12H": "12h",
@@ -1890,7 +1985,22 @@ def build_full_alignment(symbol, grp=None):
         closed = last_closed_candle(candles)
         if closed is None:
             return "", f"Not enough completed {label} candle data."
+
         signal_states[label] = analyse_candle(closed)
+
+    # Weekly is reference-only. If Weekly data fails, the real trigger
+    # still works from 12H + 8H + 4H + 1H.
+    weekly_state = ""
+    weekly_candles, weekly_err = get_candles(symbol, "1week", outputsize=3, grp=grp)
+    if not weekly_err:
+        weekly_closed = last_closed_candle(weekly_candles)
+        if weekly_closed is not None:
+            weekly_state = analyse_candle(weekly_closed)
+
+    save_trend_snapshot(
+        symbol,
+        {"Weekly": weekly_state, **signal_states}
+    )
 
     if all(v == "Bullish" for v in signal_states.values()):
         return "FULL BULLISH", None
@@ -1899,6 +2009,7 @@ def build_full_alignment(symbol, grp=None):
         return "FULL BEARISH", None
 
     return "", None
+
 
 def save_trend_status(symbol, status):
     """Save trend status and return the previous saved status."""
@@ -1964,7 +2075,7 @@ def active_trend_monitor():
                         send_push(
                             f"{icon} {symbol} — {status}",
                             f"All 4 last CLOSED signal candles are {direction}: 12H, 8H, 4H, 1H. "
-                            f"Daily and Monthly are display-only. CFD markets may use an ETF proxy for trend data."
+                            f"Weekly is display-only. CFD markets may use an ETF proxy for trend data."
                         )
 
         except Exception as e:
@@ -2415,6 +2526,22 @@ def home():
             for r in trend_rows
         }
 
+        snapshot_rows = c.execute(
+            'SELECT symbol,weekly,h12,h8,h4,h1,updated FROM trend_snapshot'
+        ).fetchall()
+
+        trend_snapshots = {
+            r['symbol']: {
+                'Weekly': r['weekly'] or '',
+                '12H': r['h12'] or '',
+                '8H': r['h8'] or '',
+                '4H': r['h4'] or '',
+                '1H': r['h1'] or '',
+                'updated': r['updated'] or ''
+            }
+            for r in snapshot_rows
+        }
+
     return render_template_string(
         HTML,
         markets=markets,
@@ -2422,7 +2549,8 @@ def home():
         colors=COLORS,
         selected_symbol=selected_symbol,
         selected_group=selected_group,
-        trend_statuses=trend_statuses
+        trend_statuses=trend_statuses,
+        trend_snapshots=trend_snapshots
     )
 
 
