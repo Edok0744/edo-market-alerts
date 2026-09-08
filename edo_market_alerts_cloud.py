@@ -11,6 +11,79 @@ PUSHOVER_APP_TOKEN = os.environ.get('PUSHOVER_APP_TOKEN', '')
 PUSHOVER_USER_KEY = os.environ.get('PUSHOVER_USER_KEY', '')
 CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 
+# -------------------------------------------------
+# TWELVE DATA API PROTECTION
+# -------------------------------------------------
+# Your current Twelve Data allowance is 8 API credits/minute.
+# EdoSignal deliberately uses at most 7 real Twelve Data calls in any
+# rolling 60-second window, leaving one credit of safety headroom.
+TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '7'))
+TWELVE_CALL_WINDOW = 60.0
+
+_TWELVE_RATE_LOCK = threading.Lock()
+_TWELVE_CALL_TIMES = []
+
+# Shared caches mean Trend, Signal and background monitors can reuse the
+# same market data instead of downloading it again.
+_OHLC_CACHE = {}
+_PRICE_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+
+# When you manually open TREND or SIGNAL, background scanners pause briefly
+# so your screen gets priority.
+_MANUAL_PRIORITY_UNTIL = 0.0
+_MANUAL_PRIORITY_LOCK = threading.Lock()
+
+
+def give_manual_api_priority(seconds=90):
+    global _MANUAL_PRIORITY_UNTIL
+    with _MANUAL_PRIORITY_LOCK:
+        _MANUAL_PRIORITY_UNTIL = max(_MANUAL_PRIORITY_UNTIL, time.time() + float(seconds))
+
+
+def manual_api_priority_active():
+    with _MANUAL_PRIORITY_LOCK:
+        return time.time() < _MANUAL_PRIORITY_UNTIL
+
+
+def wait_for_twelve_credit():
+    """Block before a real Twelve Data request so we stay below the limit."""
+    while True:
+        with _TWELVE_RATE_LOCK:
+            now = time.time()
+            while _TWELVE_CALL_TIMES and now - _TWELVE_CALL_TIMES[0] >= TWELVE_CALL_WINDOW:
+                _TWELVE_CALL_TIMES.pop(0)
+
+            if len(_TWELVE_CALL_TIMES) < TWELVE_CALL_LIMIT:
+                _TWELVE_CALL_TIMES.append(now)
+                return
+
+            wait_seconds = TWELVE_CALL_WINDOW - (now - _TWELVE_CALL_TIMES[0]) + 0.15
+
+        time.sleep(max(0.20, wait_seconds))
+
+
+def twelve_get_json(endpoint, params, timeout=15):
+    """All Twelve Data HTTP calls go through this protected helper."""
+    wait_for_twelve_credit()
+    r = requests.get(endpoint, params=params, timeout=timeout)
+    return r.json()
+
+
+def ohlc_cache_seconds(interval):
+    # Signals use fully CLOSED candles only, so short caching is safe and
+    # prevents repeated downloads of the same completed candles.
+    return {
+        '1h': 60,
+        '2h': 90,
+        '4h': 120,
+        '8h': 180,
+        '1day': 300,
+        '1week': 600,
+        '1month': 900,
+    }.get(interval, 90)
+
+
 COLORS = {
     'FOREX': '#2980ff',
     'CRYPTO': '#9b59ff',
@@ -696,29 +769,42 @@ def send_push(title, msg):
 
 
 def latest_price(symbol, grp=None):
-
     if not TWELVE_KEY:
         return None
 
-    try:
+    cache_key = (grp or "", symbol.upper().strip())
+    now = time.time()
 
-        r = requests.get(
+    with _CACHE_LOCK:
+        cached = _PRICE_CACHE.get(cache_key)
+        if cached and now - cached["saved_at"] < 30:
+            return cached["price"]
+
+    try:
+        j = twelve_get_json(
             'https://api.twelvedata.com/price',
-            params={
+            {
                 'symbol': twelve_symbol(symbol, grp),
                 'apikey': TWELVE_KEY
             },
             timeout=10
         )
 
-        j = r.json()
+        if j.get("status") == "error":
+            print("price API error", symbol, j.get("message", "Unknown error"))
+            return None
 
-        return float(j['price']) if 'price' in j else None
+        if 'price' not in j:
+            return None
+
+        price = float(j['price'])
+        with _CACHE_LOCK:
+            _PRICE_CACHE[cache_key] = {"saved_at": now, "price": price}
+        return price
 
     except Exception as e:
         print('price error', symbol, e)
         return None
-
 
 
 
@@ -750,14 +836,23 @@ CORE_PATTERN_INTERVALS = {"8h", "1day", "1week"}
 
 
 def get_ohlc(symbol, interval, outputsize=140, grp=None):
-    """Download OHLC candles from Twelve Data, oldest -> newest."""
+    """Download OHLC candles from Twelve Data, oldest -> newest, with shared caching."""
     if not TWELVE_KEY:
         return None, "Twelve Data API key is not configured."
 
+    cache_key = (grp or "", symbol.upper().strip(), interval)
+    now = time.time()
+    ttl = ohlc_cache_seconds(interval)
+
+    with _CACHE_LOCK:
+        cached = _OHLC_CACHE.get(cache_key)
+        if cached and now - cached["saved_at"] < ttl and len(cached["candles"]) >= outputsize:
+            return cached["candles"][-outputsize:], None
+
     try:
-        r = requests.get(
+        j = twelve_get_json(
             "https://api.twelvedata.com/time_series",
-            params={
+            {
                 "symbol": twelve_symbol(symbol, grp),
                 "interval": interval,
                 "outputsize": outputsize,
@@ -766,14 +861,12 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
             },
             timeout=15
         )
-        j = r.json()
 
         if j.get("status") == "error":
             return None, j.get("message", "Twelve Data returned an error.")
 
         values = j.get("values") or []
         candles = []
-
         for row in reversed(values):
             try:
                 candles.append({
@@ -788,6 +881,11 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
 
         if len(candles) < 40:
             return None, f"Not enough {interval} candle history returned."
+
+        with _CACHE_LOCK:
+            old = _OHLC_CACHE.get(cache_key)
+            if not old or len(candles) >= len(old["candles"]):
+                _OHLC_CACHE[cache_key] = {"saved_at": now, "candles": candles}
 
         return candles, None
 
@@ -1270,7 +1368,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     if error:
         if "credits" in error.lower() or "limit" in error.lower():
-            return None, "API busy. Wait about 60 seconds, then press Scan Again."
+            return None, "Twelve Data is temporarily busy. EdoSignal is protecting your API limit. Wait a moment and press Scan Again."
         return None, error
 
     # Ignore the newest API candle because it may still be forming.
@@ -1508,6 +1606,10 @@ def pattern_signal_monitor():
 
     while True:
         try:
+            if manual_api_priority_active():
+                time.sleep(15)
+                continue
+
             with db_conn() as c:
                 rows = c.execute(
                     "SELECT symbol, grp FROM favorites WHERE grp IN ('FOREX','CRYPTO','CFD') ORDER BY grp,symbol"
@@ -1551,9 +1653,9 @@ def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
         return None, "Twelve Data API key is not configured."
 
     try:
-        r = requests.get(
+        j = twelve_get_json(
             "https://api.twelvedata.com/time_series",
-            params={
+            {
                 "symbol": twelve_symbol(symbol, grp),
                 "interval": "1day",
                 "outputsize": outputsize,
@@ -1562,7 +1664,6 @@ def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
             },
             timeout=20
         )
-        j = r.json()
 
         if j.get("status") == "error":
             return None, j.get("message", "Twelve Data returned an error.")
@@ -1676,6 +1777,10 @@ def active_trend_monitor():
 
     while True:
         try:
+            if manual_api_priority_active():
+                time.sleep(15)
+                continue
+
             with db_conn() as c:
                 rows = c.execute(
                     "SELECT DISTINCT symbol, grp FROM alerts WHERE triggered=0 ORDER BY symbol"
@@ -1824,64 +1929,17 @@ def twelve_symbol(symbol, grp=None):
 
 def get_candles(symbol, interval, outputsize=60, grp=None):
     """
-    Download OHLC candles from Twelve Data.
+    Return OHLC candles oldest -> newest using the same protected shared cache
+    as the setup scanner.
 
-    Candles are returned oldest -> newest.
-
-    IMPORTANT:
-    The newest candle returned by the API may still be forming.
-    EdoSignal therefore NEVER uses that live candle for a signal.
-
-    The signal uses the previous candle, which is treated as the last
-    fully closed/completed candle:
-      close > open  = Bullish / green
-      close < open  = Bearish / red
-      close == open = Mixed / doji
+    The newest API candle may still be forming. Signal logic still uses
+    last_closed_candle(), so live candles never trigger a signal.
     """
-    if not TWELVE_KEY:
-        return None, "Twelve Data API key is not configured."
+    candles, error = get_ohlc(symbol, interval, outputsize=max(40, outputsize), grp=grp)
+    if error:
+        return None, error
+    return candles[-outputsize:], None
 
-    try:
-        r = requests.get(
-            "https://api.twelvedata.com/time_series",
-            params={
-                "symbol": twelve_symbol(symbol, grp),
-                "interval": interval,
-                "outputsize": outputsize,
-                "apikey": TWELVE_KEY,
-                "format": "JSON",
-            },
-            timeout=15
-        )
-        j = r.json()
-
-        if j.get("status") == "error":
-            return None, j.get("message", "Twelve Data returned an error.")
-
-        values = j.get("values") or []
-        candles = []
-
-        # Twelve Data returns newest first. Reverse so candles are oldest -> newest.
-        for row in reversed(values):
-            try:
-                candles.append({
-                    "datetime": row.get("datetime", ""),
-                    "open": float(row["open"]),
-                    "high": float(row["high"]),
-                    "low": float(row["low"]),
-                    "close": float(row["close"]),
-                })
-            except (KeyError, TypeError, ValueError):
-                pass
-
-        if not candles:
-            return None, f"No usable {interval} candles returned."
-
-        return candles, None
-
-    except Exception as e:
-        print("trend data error", symbol, interval, e)
-        return None, "Could not download trend data."
 
 def last_closed_candle(candles):
     """
@@ -2017,6 +2075,9 @@ def monitor():
     while True:
 
         try:
+            if manual_api_priority_active():
+                time.sleep(15)
+                continue
 
             with db_conn() as c:
 
@@ -2183,6 +2244,8 @@ def favorite_use(i):
 
 @APP.route('/signal/<int:i>')
 def signal(i):
+    # Manual screen request gets priority over background API scans.
+    give_manual_api_priority(90)
 
     with db_conn() as c:
         f = c.execute(
@@ -2265,6 +2328,8 @@ def signal(i):
 
 @APP.route('/trend/<int:i>')
 def trend(i):
+    # Manual screen request gets priority over background API scans.
+    give_manual_api_priority(90)
 
     with db_conn() as c:
         f = c.execute(
