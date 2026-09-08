@@ -1064,95 +1064,139 @@ def previous_target(candles, direction, before_index, search_back=60):
 
 def detect_bounce_retest(candles, conf):
     """
-    Edo level/retest setup:
-      wick LOW/HIGH is a valid structural support/resistance point
-      meaningful candle separation
-      return to roughly the same wick-defined zone
-      >50% candle BODY-close confirmation
+    Edo Bounce / Retest Zone rule.
+
+    A valid setup needs an ESTABLISHED support/resistance area first:
+
+      RESISTANCE / possible SELL
+        1) Price previously reacts from a wick-defined resistance area.
+        2) Price moves clearly away from that area.
+        3) Later, price returns and RETESTS the same resistance zone.
+        4) A bearish/red candle must then FULLY CLOSE back away from/below the zone.
+        5) The confirmation candle must also satisfy Edo's existing >=50%
+           previous-candle BODY close confirmation rule.
+
+      SUPPORT / possible BUY
+        1) Price previously reacts from a wick-defined support area.
+        2) Price moves clearly away from that area.
+        3) Later, price returns and RETESTS the same support zone.
+        4) A bullish/green candle must then FULLY CLOSE back away from/above the zone.
+        5) The confirmation candle must also satisfy Edo's existing >=50%
+           previous-candle BODY close confirmation rule.
+
+    A colour change in the middle of nowhere is NOT a Bounce / Retest setup.
+    The previously established level, move-away, return/retest and closed
+    confirmation are all required.
     """
     i = conf["index"]
     direction = conf["direction"]
-    if i < 12:
+
+    # Need enough history to establish a genuine earlier level.
+    if i < 16:
         return None
 
-    ar = avg_range(candles, i+1, 20)
+    ar = avg_range(candles, i + 1, 20)
     if ar <= 0:
         return None
 
-    # The support/resistance point is allowed to come from the WICK.
-    # The second bounce/retest may occur a few candles before the confirmation.
-    touch_start = max(2, i - 4)
+    # Recent retest area must be immediately before/around the confirmation.
+    touch_start = max(3, i - 4)
     touch_end = i + 1
     touch_slice = candles[touch_start:touch_end]
+    if not touch_slice:
+        return None
 
     if direction == "bullish":
-        # Lowest lower-wick in the recent retest area = second support test.
+        # Support retest: recent lowest wick defines second touch.
         rel_touch_i = min(range(len(touch_slice)), key=lambda k: touch_slice[k]["low"])
         retest_price = touch_slice[rel_touch_i]["low"]
         retest_index = touch_start + rel_touch_i
         swings = swing_points(candles[:touch_start], "low")
         level_source = "lower wick"
+
+        # Confirmation must close back ABOVE the support-zone centre.
+        confirm_close = candles[i]["close"]
+
     else:
-        # Highest upper-wick in the recent retest area = second resistance test.
+        # Resistance retest: recent highest wick defines second touch.
         rel_touch_i = max(range(len(touch_slice)), key=lambda k: touch_slice[k]["high"])
         retest_price = touch_slice[rel_touch_i]["high"]
         retest_index = touch_start + rel_touch_i
         swings = swing_points(candles[:touch_start], "high")
         level_source = "upper wick"
 
-    # Adaptive support/resistance zone. Keeps the rule useful across JPY and
-    # normal 1.x forex prices.
-    zone_tolerance = max(ar * 0.65, abs(retest_price) * 0.0025)
+        # Confirmation must close back BELOW the resistance-zone centre.
+        confirm_close = candles[i]["close"]
+
+    # Yellow-area concept: use an adaptive zone rather than one exact price.
+    # The zone is tight enough to represent the same level but wide enough
+    # to allow normal wick variation.
+    zone_tolerance = max(ar * 0.55, abs(retest_price) * 0.0020)
 
     candidates = []
+
     for old_i, old_price in swings:
         separation = touch_start - old_i
-        if separation < 8 or separation > 90:
+
+        # Must be a genuine later retest, not just adjacent noise.
+        if separation < 8 or separation > 120:
             continue
+
+        # First touch and second touch must be inside the same zone.
         if abs(old_price - retest_price) > zone_tolerance:
             continue
 
-        between = candles[old_i+1:touch_start]
+        between = candles[old_i + 1:touch_start]
         if not between:
             continue
 
         if direction == "bullish":
-            moved_away = max(c["high"] for c in between) - min(old_price, retest_price)
+            # After first support touch, price must have moved materially UP
+            # before later returning to retest that support area.
+            moved_away = max(c["high"] for c in between) - max(old_price, retest_price)
         else:
-            moved_away = max(old_price, retest_price) - min(c["low"] for c in between)
+            # After first resistance touch, price must have moved materially DOWN
+            # before later returning to retest that resistance area.
+            moved_away = min(old_price, retest_price) - min(c["low"] for c in between)
 
-        # Price must have genuinely left the zone before returning.
+        # Require a real departure from the level before the retest.
         if moved_away < ar * 2.0:
             continue
 
-        closeness = 1.0 - min(1.0, abs(old_price - retest_price) / zone_tolerance)
-        candidates.append((old_i, old_price, separation, closeness, moved_away))
+        zone_centre = (old_price + retest_price) / 2.0
+
+        # The confirmation close must be AWAY from the zone in the expected direction.
+        if direction == "bullish":
+            if confirm_close <= zone_centre:
+                continue
+        else:
+            if confirm_close >= zone_centre:
+                continue
+
+        closeness = 1.0 - min(
+            1.0,
+            abs(old_price - retest_price) / zone_tolerance
+        )
+
+        candidates.append(
+            (old_i, old_price, separation, closeness, moved_away, zone_centre)
+        )
 
     if not candidates:
         return None
 
-    # Prefer a clean recent structural retest with good level similarity.
-    old_i, old_price, separation, closeness, moved_away = max(
+    # Prefer the cleanest matching established zone.
+    old_i, old_price, separation, closeness, moved_away, zone_centre = max(
         candidates,
         key=lambda x: (x[3], x[2])
     )
 
-    body_reference = avg_body(candles, touch_start, 20)
-    recent_bodies = [
-        abs(c["close"] - c["open"])
-        for c in candles[max(old_i+1, i-4):i]
-    ]
-    weak_retest = (
-        body_reference > 0
-        and recent_bodies
-        and (sum(recent_bodies) / len(recent_bodies)) < body_reference * 0.85
-    )
-
     target = previous_target(candles, direction, i)
-    score = 5.0 + min(3.0, separation / 12.0) + closeness * 2.0
+
+    score = 6.0
+    score += min(3.0, separation / 15.0)
+    score += closeness * 2.0
     score += min(2.0, max(0.0, conf["penetration"] - 50.0) / 25.0)
-    if weak_retest:
-        score += 1.0
 
     return {
         "name": "BOUNCE / RETEST SETUP",
@@ -1162,14 +1206,14 @@ def detect_bounce_retest(candles, conf):
         "confirmation_date": conf["date"],
         "confirmation_close": conf["close"],
         "penetration": conf["penetration"],
-        "level": (old_price + retest_price) / 2.0,
+        "level": zone_centre,
         "old_level": old_price,
         "retest_price": retest_price,
         "retest_date": candles[retest_index].get("datetime", ""),
         "level_source": level_source,
         "old_date": candles[old_i].get("datetime", ""),
         "separation": separation,
-        "weak_retest": weak_retest,
+        "weak_retest": False,
         "target": target,
     }
 
@@ -1305,15 +1349,15 @@ def describe_setup(p):
     if p["name"] == "BOUNCE / RETEST SETUP":
         weak_text = " Weakness was also detected in the retest candles." if p["weak_retest"] else ""
         detail = (
-            f"{direction_word} candle-close confirmation on {p['confirmation_date']}. "
-            f"The confirmation candle closed {p['penetration']:.0f}% back through the previous "
-            f"opposite-colour candle BODY. The structural support/resistance is allowed to be "
-            f"formed by the candle WICK. Price revisited that area after "
-            f"{p['separation']} candles.{weak_text}"
+            f"{direction_word} Bounce/Retest confirmation on {p['confirmation_date']}. "
+            f"Price first established a wick-defined support/resistance zone, moved clearly away, "
+            f"then returned to RETEST the same zone after {p['separation']} candles. "
+            f"The opposite-colour confirmation candle fully closed away from the zone and "
+            f"{p['penetration']:.0f}% through the previous candle BODY."
         )
 
         level_text = (
-            f"Wick-defined retest zone: {p['level']:.5f} • "
+            f"Established retest zone: {p['level']:.5f} • "
             f"Earlier wick level: {p['old_level']:.5f} on {p['old_date']} • "
             f"Second {p['level_source']} test: {p['retest_price']:.5f} on {p['retest_date']} • "
             f"Confirmation close: {p['confirmation_close']:.5f}"
@@ -1708,7 +1752,7 @@ def build_full_alignment(symbol, grp=None):
     Edo direct-candlestick alignment signal.
 
     Signal timeframes:
-      1W + 1D + 8H + 4H + 1H
+      1W + 8H + 4H + 1H
 
     Monthly is display-only and does not trigger a signal.
 
@@ -1720,7 +1764,6 @@ def build_full_alignment(symbol, grp=None):
     """
     intervals = {
         "1W": "1week",
-        "1D": "1day",
         "8H": "8h",
         "4H": "4h",
         "1H": "1h",
@@ -1815,8 +1858,8 @@ def active_trend_monitor():
                             direction = "bullish" if status == "FULL BULLISH" else "bearish"
                             send_push(
                                 f"{icon} {symbol} — {status}",
-                                f"All 5 last CLOSED signal candles are {direction}: 1W, 1D, 8H, 4H, 1H. "
-                                f"Monthly is display-only. CFD markets may use an ETF proxy for trend data."
+                                f"All 4 last CLOSED signal candles are {direction}: 1W, 8H, 4H, 1H. "
+                                f"Daily and Monthly are display-only. CFD markets may use an ETF proxy for trend data."
                             )
 
         except Exception as e:
@@ -2014,8 +2057,8 @@ def build_trend_scan(symbol, grp=None):
     # IMPORTANT:
     # 1M is shown on screen so Edo can inspect it manually,
     # but it does NOT affect the signal or score.
-    signal_labels = ("1W", "1D", "8H", "4H", "1H")
-    weights = {"1W": 5, "1D": 4, "8H": 3, "4H": 2, "1H": 1}
+    signal_labels = ("1W", "8H", "4H", "1H")
+    weights = {"1W": 4, "8H": 3, "4H": 2, "1H": 1}
     score = 0
 
     for label in signal_labels:
@@ -2030,35 +2073,35 @@ def build_trend_scan(symbol, grp=None):
     if full_bull:
         summary = "FULL BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Last CLOSED candles on Weekly, Daily, 8H, 4H and 1H are all GREEN. Bullish possibility. Monthly is display-only."
+        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all GREEN. Bullish possibility. Daily and Monthly are display-only."
     elif full_bear:
         summary = "FULL BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Last CLOSED candles on Weekly, Daily, 8H, 4H and 1H are all RED. Bearish possibility. Monthly is display-only."
-    elif states["1W"] == "Bullish" and states["1D"] == "Bullish" and any(
+        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all RED. Bearish possibility. Daily and Monthly are display-only."
+    elif states["1W"] == "Bullish" and any(
         states[x] == "Bearish" for x in ("8H", "4H", "1H")
     ):
         summary = "BULLISH — LOWER-TIMEFRAME PULLBACK"
         icon, css = "🟡", "mixed"
-        detail = "Weekly and Daily are bullish, but a lower timeframe is pulling back."
-    elif states["1W"] == "Bearish" and states["1D"] == "Bearish" and any(
+        detail = "Weekly is bullish, but one or more lower signal timeframes are pulling back."
+    elif states["1W"] == "Bearish" and any(
         states[x] == "Bullish" for x in ("8H", "4H", "1H")
     ):
         summary = "BEARISH — LOWER-TIMEFRAME BOUNCE"
         icon, css = "🟡", "mixed"
-        detail = "Weekly and Daily are bearish, but a lower timeframe is bouncing."
-    elif score >= 7:
+        detail = "Weekly is bearish, but one or more lower signal timeframes are bouncing."
+    elif score >= 6:
         summary = "BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Weekly through 1H lean bullish. Monthly is not included in this score."
-    elif score <= -7:
+        detail = "Weekly, 8H, 4H and 1H lean bullish. Daily and Monthly are not included in this score."
+    elif score <= -6:
         summary = "BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Weekly through 1H lean bearish. Monthly is not included in this score."
+        detail = "Weekly, 8H, 4H and 1H lean bearish. Daily and Monthly are not included in this score."
     else:
         summary = "MIXED / WAIT"
         icon, css = "🟡", "mixed"
-        detail = "Weekly through 1H are not aligned strongly enough."
+        detail = "Weekly, 8H, 4H and 1H are not aligned strongly enough."
 
     return {
         "results": results,
