@@ -1825,7 +1825,7 @@ def build_full_alignment(symbol, grp=None):
     Edo direct-candlestick alignment signal.
 
     Signal timeframes:
-      1D + 8H + 4H + 1H
+      1W + 8H + 4H + 1H
 
     Monthly is display-only and does not trigger a signal.
 
@@ -1836,7 +1836,7 @@ def build_full_alignment(symbol, grp=None):
       the last FULLY CLOSED candle on ALL five signal timeframes is red.
     """
     intervals = {
-        "1D": "1day",
+        "1W": "1week",
         "8H": "8h",
         "4H": "4h",
         "1H": "1h",
@@ -1925,7 +1925,7 @@ def active_trend_monitor():
                         direction = "bullish" if status == "FULL BULLISH" else "bearish"
                         send_push(
                             f"{icon} {symbol} — {status}",
-                            f"All 4 last CLOSED signal candles are {direction}: 1D, 8H, 4H, 1H. "
+                            f"All 4 last CLOSED signal candles are {direction}: 1W, 8H, 4H, 1H. "
                             f"Daily and Monthly are display-only. CFD markets may use an ETF proxy for trend data."
                         )
 
@@ -2101,7 +2101,7 @@ def build_trend_scan(symbol, grp=None):
     # These FOUR timeframes are the complete Full Trend indication.
     # Manual Trend page uses at most 4 Twelve Data requests.
     signal_intervals = [
-        ("1D", "1day"),
+        ("1W", "1week"),
         ("8H", "8h"),
         ("4H", "4h"),
         ("1H", "1h"),
@@ -2131,8 +2131,8 @@ def build_trend_scan(symbol, grp=None):
             "css": css,
         })
 
-    signal_labels = ("1D", "8H", "4H", "1H")
-    weights = {"1D": 4, "8H": 3, "4H": 2, "1H": 1}
+    signal_labels = ("1W", "8H", "4H", "1H")
+    weights = {"1W": 4, "8H": 3, "4H": 2, "1H": 1}
     score = 0
 
     for label in signal_labels:
@@ -2147,35 +2147,35 @@ def build_trend_scan(symbol, grp=None):
     if full_bull:
         summary = "FULL BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Last CLOSED candles on Daily, 8H, 4H and 1H are all GREEN. Bullish possibility."
+        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all GREEN. Bullish possibility."
     elif full_bear:
         summary = "FULL BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Last CLOSED candles on Daily, 8H, 4H and 1H are all RED. Bearish possibility."
-    elif states["1D"] == "Bullish" and any(
+        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all RED. Bearish possibility."
+    elif states["1W"] == "Bullish" and any(
         states[x] == "Bearish" for x in ("8H", "4H", "1H")
     ):
         summary = "BULLISH — LOWER-TIMEFRAME PULLBACK"
         icon, css = "🟡", "mixed"
-        detail = "Daily is bullish, but one or more lower signal timeframes are pulling back."
-    elif states["1D"] == "Bearish" and any(
+        detail = "Weekly is bullish, but one or more lower signal timeframes are pulling back."
+    elif states["1W"] == "Bearish" and any(
         states[x] == "Bullish" for x in ("8H", "4H", "1H")
     ):
         summary = "BEARISH — LOWER-TIMEFRAME BOUNCE"
         icon, css = "🟡", "mixed"
-        detail = "Daily is bearish, but one or more lower signal timeframes are bouncing."
+        detail = "Weekly is bearish, but one or more lower signal timeframes are bouncing."
     elif score >= 6:
         summary = "BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Daily, 8H, 4H and 1H lean bullish."
+        detail = "Weekly, 8H, 4H and 1H lean bullish."
     elif score <= -6:
         summary = "BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Daily, 8H, 4H and 1H lean bearish."
+        detail = "Weekly, 8H, 4H and 1H lean bearish."
     else:
         summary = "MIXED / WAIT"
         icon, css = "🟡", "mixed"
-        detail = "Daily, 8H, 4H and 1H are not aligned strongly enough."
+        detail = "Weekly, 8H, 4H and 1H are not aligned strongly enough."
 
     return {
         "results": results,
