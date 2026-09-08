@@ -46,54 +46,70 @@ def manual_api_priority_active():
 
 
 def ensure_api_limit_table():
-    with db_conn() as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS twelve_api_calls(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL NOT NULL
-            )
-        """)
-        c.commit()
-
+    try:
+        c = sqlite3.connect(DB, check_same_thread=False, timeout=15)
+        try:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS twelve_api_calls(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL
+                )
+            """)
+            c.commit()
+        finally:
+            c.close()
+    except sqlite3.OperationalError as e:
+        print("Could not initialise API limiter table yet:", e)
 
 def wait_for_twelve_credit():
     """
-    Persistent rolling-window limiter.
+    Persistent rolling-window limiter with SQLite lock protection.
 
-    This uses SQLite rather than only Python memory, so separate worker
-    processes still share the same Twelve Data allowance.
+    If SQLite is temporarily busy, EdoSignal waits and retries instead of
+    letting the Trend/Signal web page crash with Internal Server Error.
     """
     ensure_api_limit_table()
 
     while True:
         now = time.time()
 
-        with db_conn() as c:
-            # SQLite write lock ensures only one process can reserve a credit
-            # at a time.
-            c.execute("BEGIN IMMEDIATE")
+        try:
+            # Longer SQLite timeout helps on hosted systems.
+            c = sqlite3.connect(DB, check_same_thread=False, timeout=15)
+            c.row_factory = sqlite3.Row
 
-            cutoff = now - TWELVE_CALL_WINDOW
-            c.execute("DELETE FROM twelve_api_calls WHERE ts < ?", (cutoff,))
+            try:
+                c.execute("BEGIN IMMEDIATE")
 
-            rows = c.execute(
-                "SELECT ts FROM twelve_api_calls ORDER BY ts"
-            ).fetchall()
+                cutoff = now - TWELVE_CALL_WINDOW
+                c.execute("DELETE FROM twelve_api_calls WHERE ts < ?", (cutoff,))
 
-            if len(rows) < TWELVE_CALL_LIMIT:
-                c.execute(
-                    "INSERT INTO twelve_api_calls(ts) VALUES(?)",
-                    (now,)
-                )
+                rows = c.execute(
+                    "SELECT ts FROM twelve_api_calls ORDER BY ts"
+                ).fetchall()
+
+                if len(rows) < TWELVE_CALL_LIMIT:
+                    c.execute(
+                        "INSERT INTO twelve_api_calls(ts) VALUES(?)",
+                        (now,)
+                    )
+                    c.commit()
+                    return
+
+                oldest = float(rows[0]["ts"])
                 c.commit()
-                return
 
-            oldest = float(rows[0]["ts"])
-            c.commit()
+            finally:
+                c.close()
 
-        wait_seconds = TWELVE_CALL_WINDOW - (now - oldest) + 0.5
-        time.sleep(max(0.5, wait_seconds))
+            wait_seconds = TWELVE_CALL_WINDOW - (now - oldest) + 0.5
+            time.sleep(max(0.5, wait_seconds))
 
+        except sqlite3.OperationalError as e:
+            # Hosted SQLite may be briefly locked by another worker.
+            # Retry instead of throwing HTTP 500.
+            print("API limiter SQLite busy:", e)
+            time.sleep(1.0)
 
 def twelve_get_json(endpoint, params, timeout=15):
     """All Twelve Data requests pass through the persistent limiter."""
@@ -2082,68 +2098,26 @@ def build_trend_scan(symbol, grp=None):
         "Mixed": ("🟡", "mixed"),
     }
 
-    # Priority order: the four timeframes that actually control FULL TREND.
-    priority_intervals = [
+    # These FOUR timeframes are the complete Full Trend indication.
+    # Manual Trend page uses at most 4 Twelve Data requests.
+    signal_intervals = [
         ("1W", "1week"),
         ("8H", "8h"),
         ("4H", "4h"),
         ("1H", "1h"),
     ]
 
-    # Reference-only timeframes are loaded after the four signal timeframes.
-    reference_intervals = [
-        ("1D", "1day"),
-        ("1M", "1month"),
-    ]
-
     states = {}
 
-    for label, interval in priority_intervals:
+    for label, interval in signal_intervals:
         candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
+
         if error:
             return None, error
 
         closed = last_closed_candle(candles)
         if closed is None:
             return None, f"Not enough completed {label} candle data."
-
-        state = analyse_candle(closed)
-        states[label] = state
-        icon, css = state_info[state]
-
-        results.append({
-            "label": label,
-            "interval": interval,
-            "state": state,
-            "icon": icon,
-            "css": css,
-        })
-
-    # Daily and Monthly are DISPLAY ONLY. If Twelve Data is busy, do not fail
-    # the whole Trend page; simply show them as unavailable for that moment.
-    for label, interval in reference_intervals:
-        candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
-
-        if error:
-            results.append({
-                "label": label,
-                "interval": interval,
-                "state": "Unavailable",
-                "icon": "⚪",
-                "css": "mixed",
-            })
-            continue
-
-        closed = last_closed_candle(candles)
-        if closed is None:
-            results.append({
-                "label": label,
-                "interval": interval,
-                "state": "Unavailable",
-                "icon": "⚪",
-                "css": "mixed",
-            })
-            continue
 
         state = analyse_candle(closed)
         states[label] = state
@@ -2173,11 +2147,11 @@ def build_trend_scan(symbol, grp=None):
     if full_bull:
         summary = "FULL BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all GREEN. Bullish possibility. Daily and Monthly are display-only."
+        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all GREEN. Bullish possibility."
     elif full_bear:
         summary = "FULL BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all RED. Bearish possibility. Daily and Monthly are display-only."
+        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all RED. Bearish possibility."
     elif states["1W"] == "Bullish" and any(
         states[x] == "Bearish" for x in ("8H", "4H", "1H")
     ):
@@ -2193,11 +2167,11 @@ def build_trend_scan(symbol, grp=None):
     elif score >= 6:
         summary = "BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Weekly, 8H, 4H and 1H lean bullish. Daily and Monthly are not included in this score."
+        detail = "Weekly, 8H, 4H and 1H lean bullish."
     elif score <= -6:
         summary = "BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Weekly, 8H, 4H and 1H lean bearish. Daily and Monthly are not included in this score."
+        detail = "Weekly, 8H, 4H and 1H lean bearish."
     else:
         summary = "MIXED / WAIT"
         icon, css = "🟡", "mixed"
@@ -2565,6 +2539,33 @@ def test():
     )
 
     return redirect('/')
+
+
+
+@APP.errorhandler(500)
+def internal_error(error):
+    print("HTTP 500:", error)
+    return """
+    <!doctype html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>EdoSignal temporary error</title>
+      <style>
+        body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#07111f;color:#eef6ff;margin:0}
+        .wrap{max-width:700px;margin:auto;padding:24px}
+        .card{background:#0d1b2a;border-radius:18px;padding:20px;margin-top:30px}
+        .err{color:#ff8a96;font-weight:800}
+        a{color:#1fd1a5}
+      </style>
+    </head>
+    <body><div class="wrap"><div class="card">
+      <h2>⚠️ EdoSignal temporary server error</h2>
+      <div class="err">The request could not complete just now.</div>
+      <p>Please wait a few seconds and try again. The app will no longer show a blank Internal Server Error page.</p>
+      <a href="/">← Back to Market Alerts</a>
+    </div></div></body></html>
+    """, 500
 
 
 @APP.route('/health')
