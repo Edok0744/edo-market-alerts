@@ -15,9 +15,8 @@ CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 # TWELVE DATA API PROTECTION
 # -------------------------------------------------
 # Twelve Data account limit seen by Edo: 8 credits/minute.
-# Grow 55 allows 55 API credits/minute.
-# EdoSignal deliberately keeps a safety margin with a maximum
-# of 45 REAL Twelve Data calls in any rolling 60-second window.
+# EdoSignal deliberately stays below that with a conservative maximum
+# of 5 REAL Twelve Data calls in any rolling 60-second window.
 #
 # IMPORTANT:
 # The API limiter no longer uses SQLite. On Railway, Gunicorn workers
@@ -97,7 +96,7 @@ class TwelveDataCoolingDown(Exception):
 
 def wait_for_twelve_credit(max_wait=2.0):
     """
-    Shared rolling Twelve Data limiter for the Grow 55 plan.
+    Shared rolling Twelve Data limiter.
 
     The important change is that EdoSignal will NOT sit inside a Gunicorn
     web request waiting 30-60 seconds for the next API slot. If the next
@@ -513,7 +512,7 @@ Target {{m['direction']}} {{m['target']}}
 {% endif %}
 
 {% set snap = trend_snapshots.get(m['symbol']) %}
-{% if snap %}
+{% if m['triggered'] and snap %}
 <div class="alerttrend">
     <div class="alerttrend-title">TREND • Weekly reference only</div>
     <div class="alerttrend-grid">
@@ -545,9 +544,9 @@ Target {{m['direction']}} {{m['target']}}
 </div>
 
 {% set ts = trend_statuses.get(m['symbol']) %}
-{% if ts == 'FULL BULLISH' %}
+{% if m['triggered'] and ts == 'FULL BULLISH' %}
 <div class="fulltrend fullbull">🟢 FULL BULLISH</div>
-{% elif ts == 'FULL BEARISH' %}
+{% elif m['triggered'] and ts == 'FULL BEARISH' %}
 <div class="fulltrend fullbear">🔴 FULL BEARISH</div>
 {% endif %}
 
@@ -1859,7 +1858,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 def pattern_signal_monitor():
     """
     Background pattern scanner for all saved FOREX, CRYPTO, and CFD markets.
-    Checks one symbol/timeframe combination every 30 minutes.
+    Checks one symbol/timeframe combination every five minutes.
     """
     time.sleep(150)
     index = 0
@@ -1867,7 +1866,7 @@ def pattern_signal_monitor():
     while True:
         try:
             if manual_api_priority_active():
-                time.sleep(1800)
+                time.sleep(15)
                 continue
 
             with db_conn() as c:
@@ -1905,7 +1904,7 @@ def pattern_signal_monitor():
         except Exception as e:
             print("pattern signal monitor error", e)
 
-        time.sleep(15)
+        time.sleep(300)
 
 
 def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
@@ -2071,8 +2070,8 @@ def save_trend_status(symbol, status):
 
 
 def active_trend_monitor():
-    # Start one minute after boot, then refresh one active symbol every minute.
-    time.sleep(60)
+    # Start two minutes after boot, then keep TRIGGERED alert trend data fresh.
+    time.sleep(120)
     index = 0
 
     while True:
@@ -2083,7 +2082,7 @@ def active_trend_monitor():
 
             with db_conn() as c:
                 rows = c.execute(
-                    "SELECT DISTINCT symbol, grp FROM alerts WHERE triggered=0 ORDER BY symbol"
+                    "SELECT DISTINCT symbol, grp FROM alerts WHERE triggered=1 ORDER BY symbol"
                 ).fetchall()
 
             markets = [(r["symbol"], r["grp"]) for r in rows]
@@ -2116,7 +2115,7 @@ def active_trend_monitor():
         except Exception as e:
             print("active trend monitor error", e)
 
-        time.sleep(60)
+        time.sleep(300)
 
 
 TREND_INTERVALS = [
@@ -2520,11 +2519,46 @@ def monitor():
                                 'UPDATE alerts SET triggered=1 WHERE id=?',
                                 (a['id'],)
                             )
+                            c.commit()
+
+                            # PRE-ENTRY TREND CHECK:
+                            # Refresh immediately when the price alert triggers.
+                            # build_full_alignment() uses only fully CLOSED candles.
+                            fresh_status = ""
+                            trend_error = None
+
+                            try:
+                                fresh_status, trend_error = build_full_alignment(
+                                    a['symbol'], a['grp']
+                                )
+
+                                if not trend_error:
+                                    save_trend_status(a['symbol'], fresh_status)
+
+                            except Exception as trend_exc:
+                                trend_error = str(trend_exc)
+                                print(
+                                    "trigger-time trend refresh error",
+                                    a['symbol'],
+                                    trend_exc
+                                )
+
+                            if fresh_status == "FULL BULLISH":
+                                trend_line = "Trend now: 🟢 FULL BULLISH"
+                            elif fresh_status == "FULL BEARISH":
+                                trend_line = "Trend now: 🔴 FULL BEARISH"
+                            elif trend_error:
+                                trend_line = "Trend now: refresh temporarily unavailable"
+                            else:
+                                trend_line = "Trend now: 🟡 MIXED"
 
                             send_push(
                                 f"🚨 {a['symbol']} PRICE ALERT",
                                 f"{a['symbol']} is {p}\n"
                                 f"Target: {a['direction']} {a['target']}\n"
+                                f"{trend_line}\n"
+                                f"12H + 8H + 4H + 1H use CLOSED candles only.\n"
+                                f"Weekly is reference only.\n"
                                 f"Note: {a['note'] or '-'}"
                             )
 
