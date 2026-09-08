@@ -1820,99 +1820,29 @@ def resample_closes(rows, mode):
     return list(buckets.values())
 
 
-
-def get_last_closed_12h_candle(symbol, grp=None):
-    """
-    Build the most recent FULLY CLOSED 12H candle from Twelve Data 4H candles.
-
-    Twelve Data reliably supplies 4H data on this setup. We combine:
-      00:00 + 04:00 + 08:00  -> first 12H candle
-      12:00 + 16:00 + 20:00  -> second 12H candle
-
-    The newest 4H API candle is excluded first because it may still be forming.
-    Only a bucket containing all three completed 4H candles is accepted.
-    """
-    candles, error = get_candles(symbol, "4h", outputsize=12, grp=grp)
-    if error:
-        return None, error
-
-    if not candles or len(candles) < 4:
-        return None, "Not enough 4H data to build a completed 12H candle."
-
-    # Never use the current/forming 4H candle.
-    closed_4h = candles[:-1]
-
-    buckets = {}
-
-    for c in closed_4h:
-        try:
-            dt = datetime.fromisoformat(c["datetime"])
-        except Exception:
-            continue
-
-        half = 0 if dt.hour < 12 else 12
-        key = (dt.date().isoformat(), half)
-
-        buckets.setdefault(key, []).append((dt, c))
-
-    completed = []
-
-    for key, items in buckets.items():
-        items.sort(key=lambda x: x[0])
-
-        # Need the full set of 3 completed 4H candles for a true 12H candle.
-        if len(items) != 3:
-            continue
-
-        hours = [x[0].hour for x in items]
-        expected = [0, 4, 8] if key[1] == 0 else [12, 16, 20]
-
-        if hours != expected:
-            continue
-
-        cs = [x[1] for x in items]
-
-        completed.append({
-            "datetime": items[0][0].isoformat(sep=" "),
-            "open": cs[0]["open"],
-            "high": max(x["high"] for x in cs),
-            "low": min(x["low"] for x in cs),
-            "close": cs[-1]["close"],
-        })
-
-    if not completed:
-        return None, "Could not build a fully completed 12H candle from 4H data."
-
-    return completed[-1], None
-
-
 def build_full_alignment(symbol, grp=None):
     """
     Edo direct-candlestick alignment signal.
 
     Signal timeframes:
-      12H + 8H + 4H + 1H
+      1D + 8H + 4H + 1H
+
+    Monthly is display-only and does not trigger a signal.
 
     FULL BULLISH:
-      the last FULLY CLOSED candle on all four signal timeframes is green.
+      the last FULLY CLOSED candle on ALL five signal timeframes is green.
 
     FULL BEARISH:
-      the last FULLY CLOSED candle on all four signal timeframes is red.
-
-    12H is built locally from three completed 4H candles.
+      the last FULLY CLOSED candle on ALL five signal timeframes is red.
     """
-    signal_states = {}
-
-    closed_12h, err = get_last_closed_12h_candle(symbol, grp)
-    if err:
-        return "", err
-    signal_states["12H"] = analyse_candle(closed_12h)
-
     intervals = {
+        "1D": "1day",
         "8H": "8h",
         "4H": "4h",
         "1H": "1h",
     }
+
+    signal_states = {}
 
     for label, interval in intervals.items():
         candles, err = get_candles(symbol, interval, outputsize=3, grp=grp)
@@ -1922,7 +1852,6 @@ def build_full_alignment(symbol, grp=None):
         closed = last_closed_candle(candles)
         if closed is None:
             return "", f"Not enough completed {label} candle data."
-
         signal_states[label] = analyse_candle(closed)
 
     if all(v == "Bullish" for v in signal_states.values()):
@@ -1932,7 +1861,6 @@ def build_full_alignment(symbol, grp=None):
         return "FULL BEARISH", None
 
     return "", None
-
 
 def save_trend_status(symbol, status):
     """Save trend status and return the previous saved status."""
@@ -1997,7 +1925,7 @@ def active_trend_monitor():
                         direction = "bullish" if status == "FULL BULLISH" else "bearish"
                         send_push(
                             f"{icon} {symbol} — {status}",
-                            f"All 4 last CLOSED signal candles are {direction}: 12H, 8H, 4H, 1H. "
+                            f"All 4 last CLOSED signal candles are {direction}: 1D, 8H, 4H, 1H. "
                             f"Daily and Monthly are display-only. CFD markets may use an ETF proxy for trend data."
                         )
 
@@ -2170,32 +2098,20 @@ def build_trend_scan(symbol, grp=None):
         "Mixed": ("🟡", "mixed"),
     }
 
-    states = {}
-
-    # 12H is derived from completed 4H candles.
-    closed_12h, error = get_last_closed_12h_candle(symbol, grp)
-    if error:
-        return None, error
-
-    state_12h = analyse_candle(closed_12h)
-    states["12H"] = state_12h
-    icon, css = state_info[state_12h]
-
-    results.append({
-        "label": "12H",
-        "interval": "derived from 4H",
-        "state": state_12h,
-        "icon": icon,
-        "css": css,
-    })
-
-    # These three are requested directly.
-    for label, interval in [
+    # These FOUR timeframes are the complete Full Trend indication.
+    # Manual Trend page uses at most 4 Twelve Data requests.
+    signal_intervals = [
+        ("1D", "1day"),
         ("8H", "8h"),
         ("4H", "4h"),
         ("1H", "1h"),
-    ]:
+    ]
+
+    states = {}
+
+    for label, interval in signal_intervals:
         candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
+
         if error:
             return None, error
 
@@ -2215,8 +2131,8 @@ def build_trend_scan(symbol, grp=None):
             "css": css,
         })
 
-    signal_labels = ("12H", "8H", "4H", "1H")
-    weights = {"12H": 4, "8H": 3, "4H": 2, "1H": 1}
+    signal_labels = ("1D", "8H", "4H", "1H")
+    weights = {"1D": 4, "8H": 3, "4H": 2, "1H": 1}
     score = 0
 
     for label in signal_labels:
@@ -2231,35 +2147,35 @@ def build_trend_scan(symbol, grp=None):
     if full_bull:
         summary = "FULL BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Last CLOSED candles on 12H, 8H, 4H and 1H are all GREEN. Bullish possibility."
+        detail = "Last CLOSED candles on Daily, 8H, 4H and 1H are all GREEN. Bullish possibility."
     elif full_bear:
         summary = "FULL BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Last CLOSED candles on 12H, 8H, 4H and 1H are all RED. Bearish possibility."
-    elif states["12H"] == "Bullish" and any(
+        detail = "Last CLOSED candles on Daily, 8H, 4H and 1H are all RED. Bearish possibility."
+    elif states["1D"] == "Bullish" and any(
         states[x] == "Bearish" for x in ("8H", "4H", "1H")
     ):
         summary = "BULLISH — LOWER-TIMEFRAME PULLBACK"
         icon, css = "🟡", "mixed"
-        detail = "12H is bullish, but one or more lower signal timeframes are pulling back."
-    elif states["12H"] == "Bearish" and any(
+        detail = "Daily is bullish, but one or more lower signal timeframes are pulling back."
+    elif states["1D"] == "Bearish" and any(
         states[x] == "Bullish" for x in ("8H", "4H", "1H")
     ):
         summary = "BEARISH — LOWER-TIMEFRAME BOUNCE"
         icon, css = "🟡", "mixed"
-        detail = "12H is bearish, but one or more lower signal timeframes are bouncing."
+        detail = "Daily is bearish, but one or more lower signal timeframes are bouncing."
     elif score >= 6:
         summary = "BULLISH"
         icon, css = "🟢", "bull"
-        detail = "12H, 8H, 4H and 1H lean bullish."
+        detail = "Daily, 8H, 4H and 1H lean bullish."
     elif score <= -6:
         summary = "BEARISH"
         icon, css = "🔴", "bear"
-        detail = "12H, 8H, 4H and 1H lean bearish."
+        detail = "Daily, 8H, 4H and 1H lean bearish."
     else:
         summary = "MIXED / WAIT"
         icon, css = "🟡", "mixed"
-        detail = "12H, 8H, 4H and 1H are not aligned strongly enough."
+        detail = "Daily, 8H, 4H and 1H are not aligned strongly enough."
 
     return {
         "results": results,
