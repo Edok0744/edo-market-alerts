@@ -14,31 +14,30 @@ CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 # -------------------------------------------------
 # TWELVE DATA API PROTECTION
 # -------------------------------------------------
-# Your current Twelve Data allowance is 8 API credits/minute.
-# EdoSignal deliberately uses at most 7 real Twelve Data calls in any
-# rolling 60-second window, leaving one credit of safety headroom.
-TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '7'))
+# Twelve Data limit shown by the account: 8 credits/minute.
+# EdoSignal now uses a conservative maximum of 5 REAL API calls in any
+# rolling 60-second window. The limiter is stored in SQLite so it also works
+# if the hosting platform runs multiple Python workers/processes.
+TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '5'))
 TWELVE_CALL_WINDOW = 60.0
 
-_TWELVE_RATE_LOCK = threading.Lock()
-_TWELVE_CALL_TIMES = []
-
-# Shared caches mean Trend, Signal and background monitors can reuse the
-# same market data instead of downloading it again.
+# Shared in-process caches.
 _OHLC_CACHE = {}
 _PRICE_CACHE = {}
 _CACHE_LOCK = threading.Lock()
 
-# When you manually open TREND or SIGNAL, background scanners pause briefly
-# so your screen gets priority.
+# Manual Trend/Signal screens get priority over background scans.
 _MANUAL_PRIORITY_UNTIL = 0.0
 _MANUAL_PRIORITY_LOCK = threading.Lock()
 
 
-def give_manual_api_priority(seconds=90):
+def give_manual_api_priority(seconds=120):
     global _MANUAL_PRIORITY_UNTIL
     with _MANUAL_PRIORITY_LOCK:
-        _MANUAL_PRIORITY_UNTIL = max(_MANUAL_PRIORITY_UNTIL, time.time() + float(seconds))
+        _MANUAL_PRIORITY_UNTIL = max(
+            _MANUAL_PRIORITY_UNTIL,
+            time.time() + float(seconds)
+        )
 
 
 def manual_api_priority_active():
@@ -46,42 +45,75 @@ def manual_api_priority_active():
         return time.time() < _MANUAL_PRIORITY_UNTIL
 
 
-def wait_for_twelve_credit():
-    """Block before a real Twelve Data request so we stay below the limit."""
-    while True:
-        with _TWELVE_RATE_LOCK:
-            now = time.time()
-            while _TWELVE_CALL_TIMES and now - _TWELVE_CALL_TIMES[0] >= TWELVE_CALL_WINDOW:
-                _TWELVE_CALL_TIMES.pop(0)
+def ensure_api_limit_table():
+    with db_conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS twelve_api_calls(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL
+            )
+        """)
+        c.commit()
 
-            if len(_TWELVE_CALL_TIMES) < TWELVE_CALL_LIMIT:
-                _TWELVE_CALL_TIMES.append(now)
+
+def wait_for_twelve_credit():
+    """
+    Persistent rolling-window limiter.
+
+    This uses SQLite rather than only Python memory, so separate worker
+    processes still share the same Twelve Data allowance.
+    """
+    ensure_api_limit_table()
+
+    while True:
+        now = time.time()
+
+        with db_conn() as c:
+            # SQLite write lock ensures only one process can reserve a credit
+            # at a time.
+            c.execute("BEGIN IMMEDIATE")
+
+            cutoff = now - TWELVE_CALL_WINDOW
+            c.execute("DELETE FROM twelve_api_calls WHERE ts < ?", (cutoff,))
+
+            rows = c.execute(
+                "SELECT ts FROM twelve_api_calls ORDER BY ts"
+            ).fetchall()
+
+            if len(rows) < TWELVE_CALL_LIMIT:
+                c.execute(
+                    "INSERT INTO twelve_api_calls(ts) VALUES(?)",
+                    (now,)
+                )
+                c.commit()
                 return
 
-            wait_seconds = TWELVE_CALL_WINDOW - (now - _TWELVE_CALL_TIMES[0]) + 0.15
+            oldest = float(rows[0]["ts"])
+            c.commit()
 
-        time.sleep(max(0.20, wait_seconds))
+        wait_seconds = TWELVE_CALL_WINDOW - (now - oldest) + 0.5
+        time.sleep(max(0.5, wait_seconds))
 
 
 def twelve_get_json(endpoint, params, timeout=15):
-    """All Twelve Data HTTP calls go through this protected helper."""
+    """All Twelve Data requests pass through the persistent limiter."""
     wait_for_twelve_credit()
     r = requests.get(endpoint, params=params, timeout=timeout)
     return r.json()
 
 
 def ohlc_cache_seconds(interval):
-    # Signals use fully CLOSED candles only, so short caching is safe and
-    # prevents repeated downloads of the same completed candles.
+    # Signals use fully CLOSED candles, so these cache periods are safe and
+    # prevent repeat downloads when the same page is opened several times.
     return {
-        '1h': 60,
-        '2h': 90,
-        '4h': 120,
-        '8h': 180,
-        '1day': 300,
-        '1week': 600,
-        '1month': 900,
-    }.get(interval, 90)
+        "1h": 120,
+        "2h": 180,
+        "4h": 240,
+        "8h": 300,
+        "1day": 600,
+        "1week": 900,
+        "1month": 1800,
+    }.get(interval, 180)
 
 
 COLORS = {
@@ -723,6 +755,17 @@ def init_db():
             UNIQUE(symbol, interval, pattern_name, direction, confirmation_date)
         )
         ''')
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS pattern_monitor_state(
+            grp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            last_closed_date TEXT NOT NULL DEFAULT '',
+            updated TEXT,
+            PRIMARY KEY(grp, symbol, interval)
+        )
+        """)
+
         try:
             c.execute("ALTER TABLE alerts ADD COLUMN note TEXT")
         except sqlite3.OperationalError:
@@ -814,9 +857,8 @@ PATTERN_SIGNAL_CACHE_SECONDS = 60
 # -------------------------------------------------
 # CLEAN START / FROM-NOW BASELINES
 # -------------------------------------------------
-# Every time the app restarts, the first observed CLOSED candle/state becomes
-# the starting baseline. EdoSignal will not send a Pushover for a setup/state
-# that already existed before the restart.
+# Legacy in-memory baseline containers retained for compatibility.
+# Persistent notification state is now stored in SQLite.
 TREND_BASELINED = set()
 PATTERN_BASELINE_CLOSED = {}
 
@@ -1520,28 +1562,52 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
 def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, grp="FOREX"):
     """
-    Notify only for a setup confirmed on a NEW fully closed candle
-    that appeared after this app start.
-
-    First observation after restart = baseline only, no Pushover.
+    Persist the last processed CLOSED candle in SQLite so restarts/redeploys
+    do not suppress the next genuine signal. Historical candles are not replayed.
     """
     if not latest_closed_date:
         return
 
-    baseline_key = (grp, symbol, interval)
-    previous_closed = PATTERN_BASELINE_CLOSED.get(baseline_key)
+    with db_conn() as c:
+        row = c.execute(
+            """
+            SELECT last_closed_date
+            FROM pattern_monitor_state
+            WHERE grp=? AND symbol=? AND interval=?
+            """,
+            (grp, symbol, interval)
+        ).fetchone()
 
-    # First scan after boot: establish baseline and do not alert.
-    if previous_closed is None:
-        PATTERN_BASELINE_CLOSED[baseline_key] = latest_closed_date
-        return
+        previous_closed = row["last_closed_date"] if row else None
 
-    # Same completed candle as before: nothing new to notify.
-    if latest_closed_date == previous_closed:
-        return
+        # First-ever observation after installing this version: create one
+        # persistent baseline so historical setups are not replayed.
+        if previous_closed is None:
+            c.execute(
+                """
+                INSERT INTO pattern_monitor_state(
+                    grp, symbol, interval, last_closed_date, updated
+                ) VALUES(?,?,?,?,?)
+                """,
+                (grp, symbol, interval, latest_closed_date, datetime.utcnow().isoformat())
+            )
+            c.commit()
+            return
 
-    # A new fully closed candle has appeared after startup.
-    PATTERN_BASELINE_CLOSED[baseline_key] = latest_closed_date
+        if latest_closed_date == previous_closed:
+            return
+
+        # A genuinely new fully closed candle has appeared. Save the state
+        # before sending so a restart cannot cause the same candle to replay.
+        c.execute(
+            """
+            UPDATE pattern_monitor_state
+            SET last_closed_date=?, updated=?
+            WHERE grp=? AND symbol=? AND interval=?
+            """,
+            (latest_closed_date, datetime.utcnow().isoformat(), grp, symbol, interval)
+        )
+        c.commit()
 
     if not patterns:
         return
@@ -1551,11 +1617,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
     for p in patterns:
         confirmation_date = p.get("confirmation_date", "")
-        if not confirmation_date:
-            continue
-
-        # Only setups confirmed by THIS newest closed candle may notify.
-        if confirmation_date != latest_closed_date:
+        if not confirmation_date or confirmation_date != latest_closed_date:
             continue
 
         try:
@@ -1565,16 +1627,11 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                     INSERT INTO pattern_notifications(
                         symbol, interval, pattern_name, direction,
                         confirmation_date, sent_at
-                    )
-                    VALUES(?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?)
                     """,
                     (
-                        symbol,
-                        interval,
-                        p["name"],
-                        p["direction"],
-                        confirmation_date,
-                        datetime.utcnow().isoformat(),
+                        symbol, interval, p["name"], p["direction"],
+                        confirmation_date, datetime.utcnow().isoformat()
                     )
                 )
                 c.commit()
@@ -1843,24 +1900,18 @@ def active_trend_monitor():
                 if error:
                     print("active trend error", symbol, error)
                 else:
+                    # trend_status is persistent in SQLite, so restart/redeploy
+                    # does not erase the previously processed trend state.
                     previous = save_trend_status(symbol, status)
-                    baseline_key = (symbol, grp)
 
-                    # First observation after restart becomes the clean baseline.
-                    # No Pushover is sent for an alignment that already existed.
-                    if baseline_key not in TREND_BASELINED:
-                        TREND_BASELINED.add(baseline_key)
-                    else:
-                        # Notify only when a NEW fully aligned state is entered
-                        # after the baseline was established.
-                        if status in ("FULL BULLISH", "FULL BEARISH") and status != previous:
-                            icon = "🟢" if status == "FULL BULLISH" else "🔴"
-                            direction = "bullish" if status == "FULL BULLISH" else "bearish"
-                            send_push(
-                                f"{icon} {symbol} — {status}",
-                                f"All 4 last CLOSED signal candles are {direction}: 1W, 8H, 4H, 1H. "
-                                f"Daily and Monthly are display-only. CFD markets may use an ETF proxy for trend data."
-                            )
+                    if status in ("FULL BULLISH", "FULL BEARISH") and status != previous:
+                        icon = "🟢" if status == "FULL BULLISH" else "🔴"
+                        direction = "bullish" if status == "FULL BULLISH" else "bearish"
+                        send_push(
+                            f"{icon} {symbol} — {status}",
+                            f"All 4 last CLOSED signal candles are {direction}: 1W, 8H, 4H, 1H. "
+                            f"Daily and Monthly are display-only. CFD markets may use an ETF proxy for trend data."
+                        )
 
         except Exception as e:
             print("active trend monitor error", e)
@@ -2031,9 +2082,24 @@ def build_trend_scan(symbol, grp=None):
         "Mixed": ("🟡", "mixed"),
     }
 
-    for label, interval in TREND_INTERVALS:
-        candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
+    # Priority order: the four timeframes that actually control FULL TREND.
+    priority_intervals = [
+        ("1W", "1week"),
+        ("8H", "8h"),
+        ("4H", "4h"),
+        ("1H", "1h"),
+    ]
 
+    # Reference-only timeframes are loaded after the four signal timeframes.
+    reference_intervals = [
+        ("1D", "1day"),
+        ("1M", "1month"),
+    ]
+
+    states = {}
+
+    for label, interval in priority_intervals:
+        candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
         if error:
             return None, error
 
@@ -2042,6 +2108,7 @@ def build_trend_scan(symbol, grp=None):
             return None, f"Not enough completed {label} candle data."
 
         state = analyse_candle(closed)
+        states[label] = state
         icon, css = state_info[state]
 
         results.append({
@@ -2052,11 +2119,44 @@ def build_trend_scan(symbol, grp=None):
             "css": css,
         })
 
-    states = {item["label"]: item["state"] for item in results}
+    # Daily and Monthly are DISPLAY ONLY. If Twelve Data is busy, do not fail
+    # the whole Trend page; simply show them as unavailable for that moment.
+    for label, interval in reference_intervals:
+        candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
 
-    # IMPORTANT:
-    # 1M is shown on screen so Edo can inspect it manually,
-    # but it does NOT affect the signal or score.
+        if error:
+            results.append({
+                "label": label,
+                "interval": interval,
+                "state": "Unavailable",
+                "icon": "⚪",
+                "css": "mixed",
+            })
+            continue
+
+        closed = last_closed_candle(candles)
+        if closed is None:
+            results.append({
+                "label": label,
+                "interval": interval,
+                "state": "Unavailable",
+                "icon": "⚪",
+                "css": "mixed",
+            })
+            continue
+
+        state = analyse_candle(closed)
+        states[label] = state
+        icon, css = state_info[state]
+
+        results.append({
+            "label": label,
+            "interval": interval,
+            "state": state,
+            "icon": icon,
+            "css": css,
+        })
+
     signal_labels = ("1W", "8H", "4H", "1H")
     weights = {"1W": 4, "8H": 3, "4H": 2, "1H": 1}
     score = 0
@@ -2473,7 +2573,8 @@ def health():
 
 
 init_db()
-reset_old_signal_history()
+ensure_api_limit_table()
+# Keep trend/pattern processing state across restart so new valid signals are not missed.
 threading.Thread(
     target=monitor,
     daemon=True
