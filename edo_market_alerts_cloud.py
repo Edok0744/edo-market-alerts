@@ -2612,7 +2612,6 @@ def health():
 
 
 init_db()
-ensure_api_limit_table()
 # Keep trend/pattern processing state across restart so new valid signals are not missed.
 threading.Thread(
     target=monitor,
