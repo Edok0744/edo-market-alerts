@@ -2075,14 +2075,88 @@ def twelve_symbol(symbol, grp=None):
     return s
 
 
+def _aggregate_4h_to_12h(candles_4h):
+    """
+    Build synthetic 12H candles from Twelve Data 4H candles.
+
+    Twelve Data does not provide a native 12h interval on this plan.
+    We combine 3 consecutive 4H candles into one 12H candle, aligned to
+    00:00-12:00 and 12:00-24:00 using the timestamps returned by Twelve Data.
+
+    The newest synthetic 12H candle may still be forming, which is fine because
+    last_closed_candle() always ignores the newest candle for signal decisions.
+    """
+    buckets = {}
+
+    for c in candles_4h:
+        dt_text = c.get("datetime", "")
+        try:
+            dt = datetime.strptime(dt_text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+
+        bucket_hour = 0 if dt.hour < 12 else 12
+        bucket_key = dt.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
+
+        if bucket_key not in buckets:
+            buckets[bucket_key] = []
+        buckets[bucket_key].append(c)
+
+    synthetic = []
+
+    for bucket_key in sorted(buckets):
+        group = sorted(buckets[bucket_key], key=lambda x: x["datetime"])
+
+        # A complete 12H candle contains exactly three 4H candles.
+        # Keep an incomplete newest bucket too, so last_closed_candle()
+        # can safely skip it if it is still forming.
+        if len(group) < 1:
+            continue
+
+        synthetic.append({
+            "datetime": bucket_key.strftime("%Y-%m-%d %H:%M:%S"),
+            "open": group[0]["open"],
+            "high": max(x["high"] for x in group),
+            "low": min(x["low"] for x in group),
+            "close": group[-1]["close"],
+            "_parts": len(group),
+        })
+
+    return synthetic
+
+
 def get_candles(symbol, interval, outputsize=60, grp=None):
     """
     Return OHLC candles oldest -> newest using the same protected shared cache
     as the setup scanner.
 
-    The newest API candle may still be forming. Signal logic still uses
+    12H is synthetic because Twelve Data does not support a native 12h interval:
+    it is built from 3 x 4H candles.
+
+    The newest API/synthetic candle may still be forming. Signal logic still uses
     last_closed_candle(), so live candles never trigger a signal.
     """
+    if interval == "12h":
+        # Fetch enough 4H candles to construct the requested 12H history.
+        source_size = max(60, outputsize * 3 + 9)
+        candles_4h, error = get_ohlc(
+            symbol,
+            "4h",
+            outputsize=source_size,
+            grp=grp
+        )
+        if error:
+            return None, error
+
+        candles_12h = _aggregate_4h_to_12h(candles_4h)
+
+        # We need at least two synthetic candles because last_closed_candle()
+        # deliberately ignores the newest one.
+        if len(candles_12h) < 2:
+            return None, "Not enough 4H candle history to build completed 12H candles."
+
+        return candles_12h[-outputsize:], None
+
     candles, error = get_ohlc(symbol, interval, outputsize=max(40, outputsize), grp=grp)
     if error:
         return None, error
@@ -2137,7 +2211,7 @@ def build_trend_scan(symbol, grp=None):
     }
 
     # These FOUR timeframes are the complete Full Trend indication.
-    # Manual Trend page uses at most 4 Twelve Data requests.
+    # 12H is built from 4H, so the Trend page needs only 3 native Twelve Data intervals.
     signal_intervals = [
         ("12H", "12h"),
         ("8H", "8h"),
