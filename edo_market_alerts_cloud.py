@@ -767,7 +767,7 @@ a{text-decoration:none}
 <body>
 <div class="wrap">
     <h1>⚡ {{ symbol }} EDO SETUP SIGNAL</h1>
-    <div class="small">{{ group }} • Your price-action method • Trend Pullback: 2H / 4H / 8H / 1D / 1W • Other patterns: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
+    <div class="small">{{ group }} • Your price-action method • Trend Pullback: 4H / 8H / 1D / 1W • Other patterns: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
 
     <div class="tfrow">
         {% for tf in timeframes %}
@@ -1022,7 +1022,6 @@ PATTERN_BASELINE_CLOSED = {}
 # Supported saved-market groups: FOREX, CRYPTO, CFD.
 # The scanner does NOT place trades. It only finds setups for manual review.
 PATTERN_TIMEFRAMES = [
-    {"label": "2H", "value": "2h"},
     {"label": "4H", "value": "4h"},
     {"label": "8H", "value": "8h"},
     {"label": "1D", "value": "1day"},
@@ -1643,7 +1642,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = list(unique.values())
 
-    # Edo rule: on 2H and 4H, ONLY Trend Pullback is active.
+    # Edo rule: on 4H, ONLY Trend Pullback is active.
     # Bounce/Retest and Range Reversal stay 8H + 1D + 1W.
     if interval not in CORE_PATTERN_INTERVALS:
         found = [
@@ -1845,7 +1844,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     setups = list(unique.values())
 
-    # Edo rule: on 2H and 4H, ONLY Trend Pullback may notify.
+    # Edo rule: on 4H, ONLY Trend Pullback may notify.
     if interval not in CORE_PATTERN_INTERVALS:
         setups = [
             p for p in setups
