@@ -21,6 +21,9 @@ CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '5'))
 TWELVE_CALL_WINDOW = 60.0
 
+class TwelveApiBusy(Exception):
+    pass
+
 # Shared in-process caches.
 _OHLC_CACHE = {}
 _PRICE_CACHE = {}
@@ -61,21 +64,33 @@ def ensure_api_limit_table():
     except sqlite3.OperationalError as e:
         print("Could not initialise API limiter table yet:", e)
 
-def wait_for_twelve_credit():
+def wait_for_twelve_credit(max_wait=None):
     """
-    Persistent rolling-window limiter with SQLite lock protection.
+    Persistent rolling-window limiter.
 
-    If SQLite is temporarily busy, EdoSignal waits and retries instead of
-    letting the Trend/Signal web page crash with Internal Server Error.
+    IMPORTANT:
+    A manual Trend/Signal page must never sit here for 30-60 seconds because
+    hosted web workers can time out and show "Internal Server Error".
+
+    Manual requests wait at most 6 seconds. Background scanners may wait longer.
     """
     ensure_api_limit_table()
+
+    if max_wait is None:
+        max_wait = 6.0 if manual_api_priority_active() else 90.0
+
+    started = time.time()
 
     while True:
         now = time.time()
 
+        if now - started >= max_wait:
+            raise TwelveApiBusy(
+                "Twelve Data allowance is busy. Cached data will be used if available."
+            )
+
         try:
-            # Longer SQLite timeout helps on hosted systems.
-            c = sqlite3.connect(DB, check_same_thread=False, timeout=15)
+            c = sqlite3.connect(DB, check_same_thread=False, timeout=5)
             c.row_factory = sqlite3.Row
 
             try:
@@ -103,13 +118,19 @@ def wait_for_twelve_credit():
                 c.close()
 
             wait_seconds = TWELVE_CALL_WINDOW - (now - oldest) + 0.5
-            time.sleep(max(0.5, wait_seconds))
+            remaining = max_wait - (time.time() - started)
+
+            if remaining <= 0:
+                raise TwelveApiBusy(
+                    "Twelve Data allowance is busy. Cached data will be used if available."
+                )
+
+            time.sleep(max(0.25, min(wait_seconds, remaining, 1.0)))
 
         except sqlite3.OperationalError as e:
-            # Hosted SQLite may be briefly locked by another worker.
-            # Retry instead of throwing HTTP 500.
             print("API limiter SQLite busy:", e)
-            time.sleep(1.0)
+            time.sleep(0.5)
+
 
 def twelve_get_json(endpoint, params, timeout=15):
     """All Twelve Data requests pass through the persistent limiter."""
@@ -861,8 +882,19 @@ def latest_price(symbol, grp=None):
             _PRICE_CACHE[cache_key] = {"saved_at": now, "price": price}
         return price
 
+    except TwelveApiBusy:
+        with _CACHE_LOCK:
+            cached = _PRICE_CACHE.get(cache_key)
+            if cached:
+                return cached["price"]
+        return None
+
     except Exception as e:
         print('price error', symbol, e)
+        with _CACHE_LOCK:
+            cached = _PRICE_CACHE.get(cache_key)
+            if cached:
+                return cached["price"]
         return None
 
 
@@ -947,8 +979,30 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
 
         return candles, None
 
+    except TwelveApiBusy:
+        # Manual open should still work from the most recent cached candles
+        # instead of crashing or waiting until the web worker times out.
+        with _CACHE_LOCK:
+            cached = _OHLC_CACHE.get(cache_key)
+            if cached and len(cached["candles"]) >= outputsize:
+                return cached["candles"][-outputsize:], None
+            if cached and len(cached["candles"]) >= 40:
+                return cached["candles"], None
+
+        return None, (
+            "Twelve Data is busy at the moment. No cached data is available yet "
+            "for this timeframe. Wait a few seconds and open it again."
+        )
+
     except Exception as e:
         print("setup scanner data error", symbol, interval, e)
+
+        # Any temporary network/API problem should also prefer cached data.
+        with _CACHE_LOCK:
+            cached = _OHLC_CACHE.get(cache_key)
+            if cached and len(cached["candles"]) >= 40:
+                return cached["candles"], None
+
         return None, "Could not download setup data."
 
 
@@ -2362,7 +2416,7 @@ def favorite_use(i):
 @APP.route('/signal/<int:i>')
 def signal(i):
     # Manual screen request gets priority over background API scans.
-    give_manual_api_priority(90)
+    give_manual_api_priority(120)
 
     with db_conn() as c:
         f = c.execute(
@@ -2446,7 +2500,7 @@ def signal(i):
 @APP.route('/trend/<int:i>')
 def trend(i):
     # Manual screen request gets priority over background API scans.
-    give_manual_api_priority(90)
+    give_manual_api_priority(120)
 
     with db_conn() as c:
         f = c.execute(
@@ -2565,7 +2619,7 @@ def internal_error(error):
       <p>Please wait a few seconds and try again. The app will no longer show a blank Internal Server Error page.</p>
       <a href="/">← Back to Market Alerts</a>
     </div></div></body></html>
-    """, 500
+    """, 200
 
 
 @APP.route('/health')
