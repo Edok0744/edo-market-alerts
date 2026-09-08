@@ -1,4 +1,4 @@
-import os, time, sqlite3, threading
+import os, time, sqlite3, threading, json
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, redirect
 import requests
@@ -14,12 +14,30 @@ CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 # -------------------------------------------------
 # TWELVE DATA API PROTECTION
 # -------------------------------------------------
-# Twelve Data limit shown by the account: 8 credits/minute.
-# EdoSignal now uses a conservative maximum of 5 REAL API calls in any
-# rolling 60-second window. The limiter is stored in SQLite so it also works
-# if the hosting platform runs multiple Python workers/processes.
+# Twelve Data account limit seen by Edo: 8 credits/minute.
+# EdoSignal deliberately stays below that with a conservative maximum
+# of 5 REAL Twelve Data calls in any rolling 60-second window.
+#
+# IMPORTANT:
+# The API limiter no longer uses SQLite. On Railway, Gunicorn workers
+# could block each other on the SQLite database long enough for Gunicorn
+# to kill a worker. The limiter now uses a tiny file + Linux file lock.
+# This keeps the API protection shared between workers on the same service
+# without holding the main EdoSignal database open.
 TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '5'))
 TWELVE_CALL_WINDOW = 60.0
+
+_API_LIMIT_FILE = os.environ.get(
+    "EDO_API_LIMIT_FILE",
+    os.path.abspath(DB) + ".api_limit.json"
+)
+_API_LOCK_FILE = _API_LIMIT_FILE + ".lock"
+_LOCAL_API_LIMIT_LOCK = threading.Lock()
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 # Shared in-process caches.
 _OHLC_CACHE = {}
@@ -45,74 +63,93 @@ def manual_api_priority_active():
         return time.time() < _MANUAL_PRIORITY_UNTIL
 
 
-def ensure_api_limit_table():
+def _load_api_timestamps():
     try:
-        c = sqlite3.connect(DB, check_same_thread=False, timeout=15)
-        try:
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS twelve_api_calls(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL
-                )
-            """)
-            c.commit()
-        finally:
-            c.close()
-    except sqlite3.OperationalError as e:
-        print("Could not initialise API limiter table yet:", e)
+        with open(_API_LIMIT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        return [float(x) for x in data]
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError, OSError):
+        return []
+
+
+def _save_api_timestamps(values):
+    folder = os.path.dirname(_API_LIMIT_FILE)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+    temp_file = _API_LIMIT_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(values, f)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(temp_file, _API_LIMIT_FILE)
+
 
 def wait_for_twelve_credit():
     """
-    Persistent rolling-window limiter with SQLite lock protection.
+    Rolling Twelve Data limiter that does NOT use SQLite.
 
-    If SQLite is temporarily busy, EdoSignal waits and retries instead of
-    letting the Trend/Signal web page crash with Internal Server Error.
+    Railway/Gunicorn workers coordinate through a very short file lock.
+    The lock is held only while reading/updating a tiny timestamp file,
+    then released immediately. If the 5-call allowance is already used,
+    the request sleeps OUTSIDE the lock.
+
+    This prevents the old:
+        database is locked
+        Gunicorn worker timeout / SystemExit
+    problem.
     """
-    ensure_api_limit_table()
-
     while True:
         now = time.time()
+        wait_seconds = 0.5
 
-        try:
-            # Longer SQLite timeout helps on hosted systems.
-            c = sqlite3.connect(DB, check_same_thread=False, timeout=15)
-            c.row_factory = sqlite3.Row
-
+        # On Railway/Linux, flock coordinates all Gunicorn workers that
+        # share this filesystem. The threading lock is a local fallback.
+        with _LOCAL_API_LIMIT_LOCK:
+            lock_handle = None
             try:
-                c.execute("BEGIN IMMEDIATE")
+                folder = os.path.dirname(_API_LOCK_FILE)
+                if folder:
+                    os.makedirs(folder, exist_ok=True)
 
+                lock_handle = open(_API_LOCK_FILE, "a+", encoding="utf-8")
+
+                if fcntl is not None:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+
+                timestamps = _load_api_timestamps()
                 cutoff = now - TWELVE_CALL_WINDOW
-                c.execute("DELETE FROM twelve_api_calls WHERE ts < ?", (cutoff,))
+                timestamps = [ts for ts in timestamps if ts >= cutoff]
+                timestamps.sort()
 
-                rows = c.execute(
-                    "SELECT ts FROM twelve_api_calls ORDER BY ts"
-                ).fetchall()
-
-                if len(rows) < TWELVE_CALL_LIMIT:
-                    c.execute(
-                        "INSERT INTO twelve_api_calls(ts) VALUES(?)",
-                        (now,)
-                    )
-                    c.commit()
+                if len(timestamps) < TWELVE_CALL_LIMIT:
+                    timestamps.append(now)
+                    _save_api_timestamps(timestamps)
                     return
 
-                oldest = float(rows[0]["ts"])
-                c.commit()
+                oldest = timestamps[0]
+                wait_seconds = max(
+                    0.5,
+                    TWELVE_CALL_WINDOW - (now - oldest) + 0.35
+                )
 
             finally:
-                c.close()
+                if lock_handle is not None:
+                    try:
+                        if fcntl is not None:
+                            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        lock_handle.close()
 
-            wait_seconds = TWELVE_CALL_WINDOW - (now - oldest) + 0.5
-            time.sleep(max(0.5, wait_seconds))
+        # Never sleep while holding the file lock.
+        time.sleep(wait_seconds)
 
-        except sqlite3.OperationalError as e:
-            # Hosted SQLite may be briefly locked by another worker.
-            # Retry instead of throwing HTTP 500.
-            print("API limiter SQLite busy:", e)
-            time.sleep(1.0)
 
 def twelve_get_json(endpoint, params, timeout=15):
-    """All Twelve Data requests pass through the persistent limiter."""
+    """All Twelve Data requests pass through the shared file-based limiter."""
     wait_for_twelve_credit()
     r = requests.get(endpoint, params=params, timeout=timeout)
     return r.json()
@@ -126,6 +163,7 @@ def ohlc_cache_seconds(interval):
         "2h": 180,
         "4h": 240,
         "8h": 300,
+        "12h": 360,
         "1day": 600,
         "1week": 900,
         "1month": 1800,
@@ -1825,7 +1863,7 @@ def build_full_alignment(symbol, grp=None):
     Edo direct-candlestick alignment signal.
 
     Signal timeframes:
-      1W + 8H + 4H + 1H
+      12H + 8H + 4H + 1H
 
     Monthly is display-only and does not trigger a signal.
 
@@ -1836,7 +1874,7 @@ def build_full_alignment(symbol, grp=None):
       the last FULLY CLOSED candle on ALL five signal timeframes is red.
     """
     intervals = {
-        "1W": "1week",
+        "12H": "12h",
         "8H": "8h",
         "4H": "4h",
         "1H": "1h",
@@ -1925,7 +1963,7 @@ def active_trend_monitor():
                         direction = "bullish" if status == "FULL BULLISH" else "bearish"
                         send_push(
                             f"{icon} {symbol} — {status}",
-                            f"All 4 last CLOSED signal candles are {direction}: 1W, 8H, 4H, 1H. "
+                            f"All 4 last CLOSED signal candles are {direction}: 12H, 8H, 4H, 1H. "
                             f"Daily and Monthly are display-only. CFD markets may use an ETF proxy for trend data."
                         )
 
@@ -2101,7 +2139,7 @@ def build_trend_scan(symbol, grp=None):
     # These FOUR timeframes are the complete Full Trend indication.
     # Manual Trend page uses at most 4 Twelve Data requests.
     signal_intervals = [
-        ("1W", "1week"),
+        ("12H", "12h"),
         ("8H", "8h"),
         ("4H", "4h"),
         ("1H", "1h"),
@@ -2131,8 +2169,8 @@ def build_trend_scan(symbol, grp=None):
             "css": css,
         })
 
-    signal_labels = ("1W", "8H", "4H", "1H")
-    weights = {"1W": 4, "8H": 3, "4H": 2, "1H": 1}
+    signal_labels = ("12H", "8H", "4H", "1H")
+    weights = {"12H": 4, "8H": 3, "4H": 2, "1H": 1}
     score = 0
 
     for label in signal_labels:
@@ -2147,35 +2185,35 @@ def build_trend_scan(symbol, grp=None):
     if full_bull:
         summary = "FULL BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all GREEN. Bullish possibility."
+        detail = "Last CLOSED candles on 12H, 8H, 4H and 1H are all GREEN. Bullish possibility."
     elif full_bear:
         summary = "FULL BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Last CLOSED candles on Weekly, 8H, 4H and 1H are all RED. Bearish possibility."
-    elif states["1W"] == "Bullish" and any(
+        detail = "Last CLOSED candles on 12H, 8H, 4H and 1H are all RED. Bearish possibility."
+    elif states["12H"] == "Bullish" and any(
         states[x] == "Bearish" for x in ("8H", "4H", "1H")
     ):
         summary = "BULLISH — LOWER-TIMEFRAME PULLBACK"
         icon, css = "🟡", "mixed"
-        detail = "Weekly is bullish, but one or more lower signal timeframes are pulling back."
-    elif states["1W"] == "Bearish" and any(
+        detail = "12H is bullish, but one or more lower signal timeframes are pulling back."
+    elif states["12H"] == "Bearish" and any(
         states[x] == "Bullish" for x in ("8H", "4H", "1H")
     ):
         summary = "BEARISH — LOWER-TIMEFRAME BOUNCE"
         icon, css = "🟡", "mixed"
-        detail = "Weekly is bearish, but one or more lower signal timeframes are bouncing."
+        detail = "12H is bearish, but one or more lower signal timeframes are bouncing."
     elif score >= 6:
         summary = "BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Weekly, 8H, 4H and 1H lean bullish."
+        detail = "12H, 8H, 4H and 1H lean bullish."
     elif score <= -6:
         summary = "BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Weekly, 8H, 4H and 1H lean bearish."
+        detail = "12H, 8H, 4H and 1H lean bearish."
     else:
         summary = "MIXED / WAIT"
         icon, css = "🟡", "mixed"
-        detail = "Weekly, 8H, 4H and 1H are not aligned strongly enough."
+        detail = "12H, 8H, 4H and 1H are not aligned strongly enough."
 
     return {
         "results": results,
