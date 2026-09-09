@@ -1611,128 +1611,180 @@ def count_same_colour_before(candles, i, colour):
 
 def detect_support_resistance_signal(candles):
     """
-    Edo Support / Resistance proximity alert for 8H, Daily and Weekly.
+    Edo Support / Resistance REACTION alert for 8H, Daily and Weekly.
+
+    This is NOT a simple "price is near an old level" alert.
+
+    A valid alert requires:
+      1) an established support/resistance zone from prior swing reactions
+      2) price moved clearly away from that zone after a prior reaction
+      3) the newest fully CLOSED candle retests the same zone
+      4) the newest candle shows rejection/bounce away from the zone
 
     Works in bullish, bearish and range-bound markets.
-
-    Uses only fully closed candle price action:
-      - finds recent swing highs/lows
-      - groups nearby levels into zones
-      - requires at least 2 historical touches
-      - latest CLOSED candle must be near the zone
-
-    This is an awareness signal, not an automatic trade entry:
-      Near resistance -> BEARISH WATCH
-      Near support    -> BULLISH WATCH
     """
-    if not candles or len(candles) < 25:
+    if not candles or len(candles) < 30:
         return []
 
     latest = candles[-1]
-    latest_close = float(latest["close"])
+    history = candles[:-1]
+    recent = history[-100:] if len(history) > 100 else history
+
+    latest_open = float(latest["open"])
     latest_high = float(latest["high"])
     latest_low = float(latest["low"])
-    latest_range = max(latest_high - latest_low, 1e-12)
+    latest_close = float(latest["close"])
 
-    history = candles[:-1]
-    recent = history[-80:] if len(history) > 80 else history
-
-    highs = swing_points(recent, "high")
-    lows = swing_points(recent, "low")
-
-    # Typical recent candle range gives an adaptive zone width.
     recent_ranges = [
         max(float(c["high"]) - float(c["low"]), 0.0)
-        for c in recent[-20:]
+        for c in recent[-24:]
     ]
     med_range = median_value(recent_ranges)
     if med_range <= 0:
         return []
 
-    # Zone grouping tolerance.
-    group_tol = med_range * 0.35
+    zone_tol = med_range * 0.35
+    move_away_min = med_range * 1.20
 
-    def group_levels(points):
-        levels = sorted(float(v) for _, v in points)
+    highs = swing_points(recent, "high")
+    lows = swing_points(recent, "low")
+
+    def grouped_zones(points):
         zones = []
-        for level in levels:
+        for idx, level in points:
+            level = float(level)
             placed = False
             for z in zones:
-                center = sum(z) / len(z)
-                if abs(level - center) <= group_tol:
-                    z.append(level)
+                center = sum(x["level"] for x in z) / len(z)
+                if abs(level - center) <= zone_tol:
+                    z.append({"idx": idx, "level": level})
                     placed = True
                     break
             if not placed:
-                zones.append([level])
-        return [
-            {
-                "level": sum(z) / len(z),
+                zones.append([{"idx": idx, "level": level}])
+
+        out = []
+        for z in zones:
+            if len(z) < 2:
+                continue
+            center = sum(x["level"] for x in z) / len(z)
+            out.append({
+                "level": center,
                 "touches": len(z),
-                "spread": (max(z) - min(z)) if len(z) > 1 else 0.0,
-            }
-            for z in zones
-            if len(z) >= 2
-        ]
+                "points": z,
+            })
+        return out
 
-    resistance_zones = group_levels(highs)
-    support_zones = group_levels(lows)
+    support_zones = grouped_zones(lows)
+    resistance_zones = grouped_zones(highs)
 
-    # Latest candle can be considered "near" if either body close or wick
-    # reaches the zone within this adaptive distance.
-    proximity = med_range * 0.45
     found = []
 
-    # Resistance: zone should be at/above current area.
-    for z in resistance_zones:
-        level = z["level"]
-        distance = abs(level - latest_close)
-        wick_distance = abs(level - latest_high)
-        if min(distance, wick_distance) <= proximity:
-            found.append({
-                "name": "RESISTANCE ZONE WATCH",
-                "direction": "bearish",
-                "confirmed": True,
-                "score": 5.0 + min(3.0, z["touches"] * 0.5),
-                "confirmation_date": latest.get("datetime", ""),
-                "confirmation_close": latest_close,
-                "level": level,
-                "touches": z["touches"],
-                "distance": min(distance, wick_distance),
-                "context": "support_resistance",
-                "trend": local_structure_trend(candles, len(candles)-1),
-                "target": None,
-            })
-
-    # Support: zone should be at/below current area.
+    # SUPPORT retest + bounce
     for z in support_zones:
         level = z["level"]
-        distance = abs(level - latest_close)
-        wick_distance = abs(level - latest_low)
-        if min(distance, wick_distance) <= proximity:
-            found.append({
-                "name": "SUPPORT ZONE WATCH",
-                "direction": "bullish",
-                "confirmed": True,
-                "score": 5.0 + min(3.0, z["touches"] * 0.5),
-                "confirmation_date": latest.get("datetime", ""),
-                "confirmation_close": latest_close,
-                "level": level,
-                "touches": z["touches"],
-                "distance": min(distance, wick_distance),
-                "context": "support_resistance",
-                "trend": local_structure_trend(candles, len(candles)-1),
-                "target": None,
-            })
 
-    # Keep only the nearest support and nearest resistance.
-    best = {}
-    for p in found:
-        key = p["name"]
-        if key not in best or p["distance"] < best[key]["distance"]:
-            best[key] = p
+        # newest candle must actually reach/retest support
+        if latest_low > level + zone_tol:
+            continue
 
-    return list(best.values())
+        body_low = min(latest_open, latest_close)
+        lower_wick = max(0.0, body_low - latest_low)
+        body = abs(latest_close - latest_open)
+
+        # close back above the zone with visible rejection
+        rejection_ok = (
+            latest_close > level
+            and lower_wick >= max(body * 0.50, med_range * 0.12)
+        )
+        if not rejection_ok:
+            continue
+
+        valid_prior = None
+        for pt in reversed(z["points"]):
+            idx = pt["idx"]
+            if idx >= len(recent) - 3:
+                continue
+
+            after = recent[idx + 1:]
+            if not after:
+                continue
+
+            highest_after = max(float(c["high"]) for c in after)
+            if highest_after - level >= move_away_min:
+                valid_prior = pt
+                break
+
+        if valid_prior is None:
+            continue
+
+        found.append({
+            "name": "SUPPORT RETEST / BOUNCE WATCH",
+            "direction": "bullish",
+            "confirmed": True,
+            "score": 7.0 + min(2.0, z["touches"] * 0.4),
+            "confirmation_date": latest.get("datetime", ""),
+            "confirmation_close": latest_close,
+            "level": level,
+            "touches": z["touches"],
+            "prior_reaction_index": valid_prior["idx"],
+            "context": "support_resistance",
+            "trend": local_structure_trend(candles, len(candles)-1),
+            "target": None,
+        })
+
+    # RESISTANCE retest + rejection
+    for z in resistance_zones:
+        level = z["level"]
+
+        if latest_high < level - zone_tol:
+            continue
+
+        body_high = max(latest_open, latest_close)
+        upper_wick = max(0.0, latest_high - body_high)
+        body = abs(latest_close - latest_open)
+
+        rejection_ok = (
+            latest_close < level
+            and upper_wick >= max(body * 0.50, med_range * 0.12)
+        )
+        if not rejection_ok:
+            continue
+
+        valid_prior = None
+        for pt in reversed(z["points"]):
+            idx = pt["idx"]
+            if idx >= len(recent) - 3:
+                continue
+
+            after = recent[idx + 1:]
+            if not after:
+                continue
+
+            lowest_after = min(float(c["low"]) for c in after)
+            if level - lowest_after >= move_away_min:
+                valid_prior = pt
+                break
+
+        if valid_prior is None:
+            continue
+
+        found.append({
+            "name": "RESISTANCE RETEST / REJECTION WATCH",
+            "direction": "bearish",
+            "confirmed": True,
+            "score": 7.0 + min(2.0, z["touches"] * 0.4),
+            "confirmation_date": latest.get("datetime", ""),
+            "confirmation_close": latest_close,
+            "level": level,
+            "touches": z["touches"],
+            "prior_reaction_index": valid_prior["idx"],
+            "context": "support_resistance",
+            "trend": local_structure_trend(candles, len(candles)-1),
+            "target": None,
+        })
+
+    return found
 
 
 def detect_trend_pullback(candles, conf):
@@ -1873,16 +1925,20 @@ def describe_setup(p):
             f"Confirmation close: {p['confirmation_close']:.5f}"
         )
 
-    elif p["name"] in ("SUPPORT ZONE WATCH", "RESISTANCE ZONE WATCH"):
-        zone_word = "support" if p["name"] == "SUPPORT ZONE WATCH" else "resistance"
+    elif p["name"] in (
+        "SUPPORT RETEST / BOUNCE WATCH",
+        "RESISTANCE RETEST / REJECTION WATCH"
+    ):
+        zone_word = "support" if p["direction"] == "bullish" else "resistance"
         action_word = "Bullish watch" if bullish else "Bearish watch"
         trend_word = str(p.get("trend", "mixed")).upper()
 
         detail = (
-            f"{action_word}: the newest fully CLOSED candle on this timeframe is near an "
-            f"established {zone_word} zone. The zone has at least {p.get('touches', 2)} "
-            f"historical swing touches. Current local structure is {trend_word}, but this "
-            f"support/resistance alert is allowed in bullish, bearish and range-bound markets."
+            f"{action_word}: the newest fully CLOSED candle has RETESTED an established "
+            f"{zone_word} zone and shown a rejection/bounce away from it. "
+            f"The zone has at least {p.get('touches', 2)} historical swing touches, and price "
+            f"previously moved clearly away before returning. Current local structure is "
+            f"{trend_word}. This alert is allowed in bullish, bearish and range-bound markets."
         )
 
         level_text = (
@@ -2527,12 +2583,14 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
         if p.get("context") == "support_resistance":
             zone_word = "SUPPORT" if p["direction"] == "bullish" else "RESISTANCE"
+            reaction_word = "BOUNCE" if p["direction"] == "bullish" else "REJECTION"
             push_body = (
-                f"Newest fully CLOSED {tf_label} candle is near an established {zone_word} zone "
-                f"({p['level']:.5f}) with {p.get('touches', 2)} prior swing touches. "
-                f"Local structure: {str(p.get('trend','mixed')).upper()}. "
-                f"This alert is valid in bullish, bearish and range-bound markets. "
-                f"Review the chart before trading."
+                f"Newest fully CLOSED {tf_label} candle has RETESTED an established {zone_word} zone "
+                f"({p['level']:.5f}) and shown a {reaction_word} away from it. "
+                f"The zone has {p.get('touches', 2)} prior swing touches and price previously moved "
+                f"clearly away before this retest. Local structure: "
+                f"{str(p.get('trend','mixed')).upper()}. Valid in bullish, bearish and "
+                f"range-bound markets. Review the chart before trading."
             )
         else:
             push_body = (
