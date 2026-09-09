@@ -807,8 +807,12 @@ a{text-decoration:none}
     {% else %}
         <div class="pricebox">
             <div>
-                <div class="small">Latest close</div>
+                <div class="small">Latest FULLY CLOSED candle</div>
                 <div class="pricebig">{{ price }}</div>
+                <div class="small">{{ latest_closed_date }} UTC</div>
+                {% if market_source %}
+                <div class="small">Data source: {{ market_source }}</div>
+                {% endif %}
             </div>
             <div style="text-align:right">
                 <div class="small">Timeframe</div>
@@ -824,7 +828,13 @@ a{text-decoration:none}
 
             {% set newest = patterns[0] %}
             <div class="pattern newest-pattern">
-                <div class="newest-badge">MOST RECENT VALID PATTERN</div>
+                <div class="newest-badge">
+                    {% if newest.get('confirmation_date') == latest_closed_date %}
+                        NEWEST CLOSED-CANDLE TRIGGER
+                    {% else %}
+                        MOST RECENT HISTORICAL TRIGGER
+                    {% endif %}
+                </div>
                 <div class="pattern-title {{ newest['css'] }}">
                     {{ newest['icon'] }} {{ newest['name'] }}
                 </div>
@@ -858,9 +868,9 @@ a{text-decoration:none}
         {% endif %}
 
         <div class="small" style="margin-top:12px">
-            Updated: {{ updated }}. “Newest Trigger” means the most recent valid completed
-            pattern found on this selected timeframe. Older matches are kept below as
-            Previous Setups. The scanner uses closed candles only and does not place trades.
+            Updated: {{ updated }}. The headline refers ONLY to the newest fully closed candle.
+            If no new setup triggered on that candle, the older valid pattern below is labelled
+            historical. The scanner uses closed candles only and does not place trades.
         </div>
     {% endif %}
     </div>
@@ -1019,32 +1029,42 @@ def latest_price(symbol, grp=None):
             return cached["price"]
 
     try:
-        j = twelve_get_json(
-            'https://api.twelvedata.com/price',
-            {
-                'symbol': twelve_symbol(symbol, grp),
-                'apikey': TWELVE_KEY
-            },
-            timeout=10
-        )
+        for resolved_symbol in twelve_symbol_candidates(symbol, grp):
+            j = twelve_get_json(
+                'https://api.twelvedata.com/price',
+                {
+                    'symbol': resolved_symbol,
+                    'apikey': TWELVE_KEY
+                },
+                timeout=10
+            )
 
-        if j.get("status") == "error":
-            print("price API error", symbol, j.get("message", "Unknown error"))
-            return None
+            if j.get("status") == "error" or 'price' not in j:
+                continue
 
-        if 'price' not in j:
-            return None
+            price = float(j['price'])
 
-        price = float(j['price'])
-        with _CACHE_LOCK:
-            _PRICE_CACHE[cache_key] = {"saved_at": now, "price": price}
-        return price
+            with _CACHE_LOCK:
+                _PRICE_CACHE[cache_key] = {
+                    "saved_at": now,
+                    "price": price,
+                    "source_symbol": resolved_symbol
+                }
+
+            if grp == "CFD":
+                print("CFD price source", symbol, "->", resolved_symbol)
+
+            return price
+
+        print("price API error", symbol, "No direct or fallback symbol returned a price.")
+        return None
 
     except TwelveDataCoolingDown:
         return None
     except Exception as e:
         print('price error', symbol, e)
         return None
+
 
 
 
@@ -1087,45 +1107,59 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
         if cached and now - cached["saved_at"] < ttl and len(cached["candles"]) >= outputsize:
             return cached["candles"][-outputsize:], None
 
+    last_error = "Twelve Data returned no usable market data."
+
     try:
-        j = twelve_get_json(
-            "https://api.twelvedata.com/time_series",
-            {
-                "symbol": twelve_symbol(symbol, grp),
-                "interval": interval,
-                "outputsize": outputsize,
-                "apikey": TWELVE_KEY,
-                "format": "JSON",
-            },
-            timeout=15
-        )
+        for resolved_symbol in twelve_symbol_candidates(symbol, grp):
+            j = twelve_get_json(
+                "https://api.twelvedata.com/time_series",
+                {
+                    "symbol": resolved_symbol,
+                    "interval": interval,
+                    "outputsize": outputsize,
+                    "apikey": TWELVE_KEY,
+                    "format": "JSON",
+                    "timezone": "UTC",
+                },
+                timeout=15
+            )
 
-        if j.get("status") == "error":
-            return None, j.get("message", "Twelve Data returned an error.")
+            if j.get("status") == "error":
+                last_error = j.get("message", "Twelve Data returned an error.")
+                continue
 
-        values = j.get("values") or []
-        candles = []
-        for row in reversed(values):
-            try:
-                candles.append({
-                    "datetime": row.get("datetime", ""),
-                    "open": float(row["open"]),
-                    "high": float(row["high"]),
-                    "low": float(row["low"]),
-                    "close": float(row["close"]),
-                })
-            except (KeyError, TypeError, ValueError):
-                pass
+            values = j.get("values") or []
+            candles = []
 
-        if len(candles) < 40:
-            return None, f"Not enough {interval} candle history returned."
+            for row in reversed(values):
+                try:
+                    candles.append({
+                        "datetime": row.get("datetime", ""),
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "_source_symbol": resolved_symbol,
+                        "_source_label": source_label_for(symbol, grp, resolved_symbol),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    pass
 
-        with _CACHE_LOCK:
-            old = _OHLC_CACHE.get(cache_key)
-            if not old or len(candles) >= len(old["candles"]):
-                _OHLC_CACHE[cache_key] = {"saved_at": now, "candles": candles}
+            if len(candles) < 40:
+                last_error = f"Not enough {interval} candle history returned for {resolved_symbol}."
+                continue
 
-        return candles, None
+            with _CACHE_LOCK:
+                old = _OHLC_CACHE.get(cache_key)
+                if not old or len(candles) >= len(old["candles"]):
+                    _OHLC_CACHE[cache_key] = {"saved_at": now, "candles": candles}
+
+            if grp == "CFD":
+                print("CFD market source", symbol, "->", resolved_symbol)
+
+            return candles, None
+
+        return None, last_error
 
     except TwelveDataCoolingDown:
         return None, "API cooling down — please try again in a few seconds."
@@ -1160,6 +1194,59 @@ def candle_colour(c):
     if c["close"] < c["open"]:
         return "red"
     return "flat"
+
+
+def interval_seconds(interval):
+    mapping = {
+        "1h": 60 * 60,
+        "2h": 2 * 60 * 60,
+        "4h": 4 * 60 * 60,
+        "8h": 8 * 60 * 60,
+        "1day": 24 * 60 * 60,
+        "1week": 7 * 24 * 60 * 60,
+    }
+    return mapping.get(interval)
+
+
+def parse_candle_utc(value):
+    if not value:
+        return None
+    try:
+        from datetime import timezone
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def fully_closed_candles(candles, interval, now_utc=None):
+    """
+    Keep only candles whose complete interval has elapsed.
+    Twelve Data OHLC is requested in UTC, so this avoids accidentally
+    accepting a still-forming 4H/8H/Daily candle as a trigger.
+    """
+    from datetime import timezone, timedelta
+
+    seconds = interval_seconds(interval)
+    if not candles or not seconds:
+        return []
+
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    duration = timedelta(seconds=seconds)
+    closed = []
+
+    for c in candles:
+        start = parse_candle_utc(c.get("datetime", ""))
+        if start is None:
+            continue
+        if start + duration <= now_utc:
+            closed.append(c)
+
+    return closed
 
 
 def avg_range(candles, end=None, length=20):
@@ -1573,6 +1660,10 @@ def detect_trend_pullback(candles, conf):
         "penetration": penetration,
         "run_count": run_count,
         "run_colour": run_colour,
+        "run_dates": [
+            candles[j].get("datetime", "")
+            for j in range(run_start, i)
+        ],
         "trend": trend,
         "context": "trend",
         "target": target,
@@ -1604,12 +1695,14 @@ def describe_setup(p):
         )
 
     elif p["name"] == "TREND PULLBACK SETUP":
+        run_dates = ", ".join(p.get("run_dates", []))
         detail = (
             f"{direction_word} trend-pullback confirmation on {p['confirmation_date']}. "
             f"{p['run_count']} {p['run_colour']} CLOSED candles pulled against the larger "
             f"{p['trend']} price structure, then the opposite-colour confirmation candle "
             f"closed {p['penetration']:.0f}% through the BODY of the immediately previous "
-            f"pullback candle. Minimum required: 50%."
+            f"pullback candle. Minimum required: 50%. "
+            f"Pullback candle times: {run_dates or 'n/a'}."
         )
 
         level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
@@ -1635,6 +1728,7 @@ def describe_setup(p):
         "icon": icon,
         "css": css,
         "direction": p["direction"],
+        "confirmation_date": p.get("confirmation_date", ""),
         "confirmed": True,
         "score": p.get("score", 0),
     }
@@ -1655,9 +1749,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             return None, "Twelve Data is temporarily busy. EdoSignal is protecting your API limit. Wait a moment and press Scan Again."
         return None, error
 
-    # Ignore the newest API candle because it may still be forming.
-    # Pattern setups are confirmed from fully CLOSED candles only.
-    closed_candles = candles[:-1]
+    # Use timestamp-based closure checking instead of blindly dropping
+    # only the last returned candle.
+    closed_candles = fully_closed_candles(candles, interval)
 
     if len(closed_candles) < 40:
         return None, f"Not enough fully closed {interval} candle history returned."
@@ -1699,52 +1793,45 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         reverse=True
     )
 
-    bullish = [p for p in found if p["direction"] == "bullish"]
-    bearish = [p for p in found if p["direction"] == "bearish"]
+    latest_closed_date = closed_candles[-1].get("datetime", "")
+    current_patterns = [
+        p for p in found
+        if p.get("confirmation_date", "") == latest_closed_date
+    ]
+
+    bullish = [p for p in current_patterns if p["direction"] == "bullish"]
+    bearish = [p for p in current_patterns if p["direction"] == "bearish"]
 
     if bullish and not bearish:
-        signal = "BULLISH SETUP DETECTED"
+        signal = "NEW BULLISH SETUP TRIGGERED"
         icon, css = "🟢", "buy"
-        summary = (
-            "Your candle-close rules found a bullish setup. Review the chart yourself "
-            "before deciding whether to trade."
-        )
+        summary = "The newest fully CLOSED candle completed a valid bullish Edo pattern."
     elif bearish and not bullish:
-        signal = "BEARISH SETUP DETECTED"
+        signal = "NEW BEARISH SETUP TRIGGERED"
         icon, css = "🔴", "sell"
-        summary = (
-            "Your candle-close rules found a bearish setup. Review the chart yourself "
-            "before deciding whether to trade."
-        )
+        summary = "The newest fully CLOSED candle completed a valid bearish Edo pattern."
     elif bullish and bearish:
-        # If both exist, favour a clearly stronger/recent setup only when the score
-        # difference is meaningful; otherwise show mixed.
-        best_bull = max(bullish, key=lambda p: p.get("score", 0))
-        best_bear = max(bearish, key=lambda p: p.get("score", 0))
-        diff = best_bull.get("score", 0) - best_bear.get("score", 0)
-
-        if diff >= 2.0:
-            signal = "BULLISH SETUP DETECTED"
-            icon, css = "🟢", "buy"
-            summary = "Bullish evidence is stronger, but a bearish setup also exists. Review the chart."
-        elif diff <= -2.0:
-            signal = "BEARISH SETUP DETECTED"
-            icon, css = "🔴", "sell"
-            summary = "Bearish evidence is stronger, but a bullish setup also exists. Review the chart."
-        else:
-            signal = "MIXED SETUPS"
-            icon, css = "🟡", "wait"
-            summary = "Bullish and bearish setup evidence are both present. Review the chart and wait for clarity."
-    else:
-        signal = "NO EDO SETUP YET"
-        icon, css = "⚪", "neutral"
+        signal = "NEW MIXED SETUPS"
+        icon, css = "🟡", "wait"
         summary = (
-            "No recent setup matches your retest, 2+ candle trend-pullback, or range-reversal confirmation rules "
-            "on this timeframe."
+            "The newest fully CLOSED candle produced conflicting valid setup evidence. "
+            "Review the naked chart before trading."
         )
+    else:
+        signal = "NO NEW SETUP ON LATEST CLOSED CANDLE"
+        icon, css = "⚪", "neutral"
+        if found:
+            summary = (
+                "No pattern triggered on the newest fully closed candle. "
+                "The most recent older valid trigger is shown below for reference."
+            )
+        else:
+            summary = "No recent setup matches your candle-close pattern rules on this timeframe."
 
     data = {
-        "price": candles[-1]["close"],
+        "price": closed_candles[-1]["close"],
+        "latest_closed_date": latest_closed_date,
+        "market_source": closed_candles[-1].get("_source_label", ""),
         "signal": signal,
         "signal_icon": icon,
         "signal_css": css,
@@ -1863,8 +1950,11 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     if not candles or len(candles) < 41:
         return None, None, f"Not enough fully closed {interval} candle history returned."
 
-    # The newest API candle may still be forming, so exclude it.
-    closed_candles = candles[:-1]
+    # Use the same timestamp-based closure logic as the manual Signal page.
+    closed_candles = fully_closed_candles(candles, interval)
+    if len(closed_candles) < 40:
+        return None, None, f"Not enough fully closed {interval} candle history returned."
+
     latest_closed_date = closed_candles[-1].get("datetime", "")
     found = []
 
@@ -1951,37 +2041,50 @@ def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
     if not TWELVE_KEY:
         return None, "Twelve Data API key is not configured."
 
+    last_error = "Could not download daily alignment data."
+
     try:
-        j = twelve_get_json(
-            "https://api.twelvedata.com/time_series",
-            {
-                "symbol": twelve_symbol(symbol, grp),
-                "interval": "1day",
-                "outputsize": outputsize,
-                "apikey": TWELVE_KEY,
-                "format": "JSON",
-            },
-            timeout=20
-        )
+        for resolved_symbol in twelve_symbol_candidates(symbol, grp):
+            j = twelve_get_json(
+                "https://api.twelvedata.com/time_series",
+                {
+                    "symbol": resolved_symbol,
+                    "interval": "1day",
+                    "outputsize": outputsize,
+                    "apikey": TWELVE_KEY,
+                    "format": "JSON",
+                    "timezone": "UTC",
+                },
+                timeout=20
+            )
 
-        if j.get("status") == "error":
-            return None, j.get("message", "Twelve Data returned an error.")
+            if j.get("status") == "error":
+                last_error = j.get("message", "Twelve Data returned an error.")
+                continue
 
-        values = j.get("values") or []
-        rows = []
+            values = j.get("values") or []
+            rows = []
 
-        for row in reversed(values):
-            try:
-                dt = datetime.fromisoformat(row["datetime"])
-                rows.append((dt, float(row["close"])))
-            except Exception:
-                pass
+            for row in reversed(values):
+                try:
+                    dt = datetime.fromisoformat(row["datetime"])
+                    rows.append((dt, float(row["close"])))
+                except Exception:
+                    pass
 
-        if len(rows) < 300:
-            return None, "Not enough daily history for higher-timeframe alignment."
+            if len(rows) < 300:
+                last_error = f"Not enough daily history for {resolved_symbol}."
+                continue
 
-        return rows, None
+            if grp == "CFD":
+                print("CFD alignment source", symbol, "->", resolved_symbol)
 
+            return rows, None
+
+        return None, last_error
+
+    except TwelveDataCoolingDown:
+        return None, "API cooling down — please try again in a few seconds."
     except Exception as e:
         print("daily alignment error", symbol, e)
         return None, "Could not download daily alignment data."
@@ -2168,6 +2271,70 @@ TREND_INTERVALS = [
 ]
 
 
+
+def twelve_symbol_candidates(symbol, grp=None):
+    """
+    Return Twelve Data symbols in preferred order.
+
+    For Edo's US CFD aliases we now TRY the direct index first:
+      DJ30 / US30  -> DJI, then DIA fallback
+      NAS100/US100 -> NDX, then QQQ fallback
+      SP500/US500  -> GSPC, then SPY fallback
+
+    Twelve Data access can vary by plan/instrument, so the ETF fallback keeps
+    EdoSignal working if a direct index symbol is unavailable.
+    """
+    s = symbol.upper().strip().replace(" ", "")
+
+    if grp == "CFD" or s in {
+        "DJ30", "US30", "DOW30",
+        "NAS100", "NASDAQ100", "US100", "USTEC",
+        "SP500", "US500", "S&P500", "SPX500"
+    }:
+        direct = {
+            "DJ30": ["DJI", "DIA"],
+            "US30": ["DJI", "DIA"],
+            "DOW30": ["DJI", "DIA"],
+
+            "NAS100": ["NDX", "QQQ"],
+            "NASDAQ100": ["NDX", "QQQ"],
+            "US100": ["NDX", "QQQ"],
+            "USTEC": ["NDX", "QQQ"],
+
+            "SP500": ["GSPC", "SPY"],
+            "US500": ["GSPC", "SPY"],
+            "S&P500": ["GSPC", "SPY"],
+            "SPX500": ["GSPC", "SPY"],
+        }
+        if s in direct:
+            return direct[s]
+
+    return [twelve_symbol(symbol, grp)]
+
+
+def source_label_for(symbol, grp, resolved_symbol):
+    s = symbol.upper().strip().replace(" ", "")
+    if grp != "CFD":
+        return resolved_symbol
+
+    direct_sets = {
+        "DJ30": "DJI", "US30": "DJI", "DOW30": "DJI",
+        "NAS100": "NDX", "NASDAQ100": "NDX", "US100": "NDX", "USTEC": "NDX",
+        "SP500": "GSPC", "US500": "GSPC", "S&P500": "GSPC", "SPX500": "GSPC",
+    }
+    proxy_sets = {
+        "DJ30": "DIA", "US30": "DIA", "DOW30": "DIA",
+        "NAS100": "QQQ", "NASDAQ100": "QQQ", "US100": "QQQ", "USTEC": "QQQ",
+        "SP500": "SPY", "US500": "SPY", "S&P500": "SPY", "SPX500": "SPY",
+    }
+
+    if resolved_symbol == direct_sets.get(s):
+        return f"{resolved_symbol} direct index"
+    if resolved_symbol == proxy_sets.get(s):
+        return f"{resolved_symbol} ETF fallback"
+    return resolved_symbol
+
+
 def twelve_symbol(symbol, grp=None):
     """
     Convert the symbols Edo normally types into Twelve Data format.
@@ -2182,9 +2349,9 @@ def twelve_symbol(symbol, grp=None):
         SOLUSD -> SOL/USD
 
     CFD / INDEX broker aliases:
-        US500 / SP500 -> SPY
-        NAS100 / US100 -> QQQ
-        US30 / DJ30 -> DIA
+        US500 / SP500 -> direct index first, SPY fallback
+        NAS100 / US100 -> direct index first, QQQ fallback
+        US30 / DJ30 -> direct index first, DIA fallback
         GER40 / DE40 -> DAX
         UK100 -> FTSE
         FRA40 -> FCHI
@@ -2203,8 +2370,7 @@ def twelve_symbol(symbol, grp=None):
 
     # Common broker CFD/index aliases.
     cfd_aliases = {
-        # Use liquid US-listed ETF proxies for the US indices because
-        # they are much more reliable on Twelve Data Basic than direct CFD/index feeds.
+        # Fallback mappings used only if the preferred direct index call is unavailable.
         "US500": "SPY",
         "SP500": "SPY",
         "S&P500": "SPY",
@@ -2815,6 +2981,8 @@ def signal(i):
             selected_tf=selected_tf,
             selected_label=allowed[selected_tf],
             price='—',
+            latest_closed_date='—',
+            market_source='',
             signal='',
             signal_icon='',
             signal_css='neutral',
@@ -2833,6 +3001,8 @@ def signal(i):
         selected_tf=selected_tf,
         selected_label=allowed[selected_tf],
         price=f"{data['price']:.5f}",
+        latest_closed_date=data.get('latest_closed_date', ''),
+        market_source=data.get('market_source', ''),
         signal=data['signal'],
         signal_icon=data['signal_icon'],
         signal_css=data['signal_css'],
