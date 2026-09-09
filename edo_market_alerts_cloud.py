@@ -1608,6 +1608,133 @@ def count_same_colour_before(candles, i, colour):
     return count, j + 1
 
 
+
+def detect_support_resistance_signal(candles):
+    """
+    Edo Support / Resistance proximity alert for 8H, Daily and Weekly.
+
+    Works in bullish, bearish and range-bound markets.
+
+    Uses only fully closed candle price action:
+      - finds recent swing highs/lows
+      - groups nearby levels into zones
+      - requires at least 2 historical touches
+      - latest CLOSED candle must be near the zone
+
+    This is an awareness signal, not an automatic trade entry:
+      Near resistance -> BEARISH WATCH
+      Near support    -> BULLISH WATCH
+    """
+    if not candles or len(candles) < 25:
+        return []
+
+    latest = candles[-1]
+    latest_close = float(latest["close"])
+    latest_high = float(latest["high"])
+    latest_low = float(latest["low"])
+    latest_range = max(latest_high - latest_low, 1e-12)
+
+    history = candles[:-1]
+    recent = history[-80:] if len(history) > 80 else history
+
+    highs = swing_points(recent, "high")
+    lows = swing_points(recent, "low")
+
+    # Typical recent candle range gives an adaptive zone width.
+    recent_ranges = [
+        max(float(c["high"]) - float(c["low"]), 0.0)
+        for c in recent[-20:]
+    ]
+    med_range = median_value(recent_ranges)
+    if med_range <= 0:
+        return []
+
+    # Zone grouping tolerance.
+    group_tol = med_range * 0.35
+
+    def group_levels(points):
+        levels = sorted(float(v) for _, v in points)
+        zones = []
+        for level in levels:
+            placed = False
+            for z in zones:
+                center = sum(z) / len(z)
+                if abs(level - center) <= group_tol:
+                    z.append(level)
+                    placed = True
+                    break
+            if not placed:
+                zones.append([level])
+        return [
+            {
+                "level": sum(z) / len(z),
+                "touches": len(z),
+                "spread": (max(z) - min(z)) if len(z) > 1 else 0.0,
+            }
+            for z in zones
+            if len(z) >= 2
+        ]
+
+    resistance_zones = group_levels(highs)
+    support_zones = group_levels(lows)
+
+    # Latest candle can be considered "near" if either body close or wick
+    # reaches the zone within this adaptive distance.
+    proximity = med_range * 0.45
+    found = []
+
+    # Resistance: zone should be at/above current area.
+    for z in resistance_zones:
+        level = z["level"]
+        distance = abs(level - latest_close)
+        wick_distance = abs(level - latest_high)
+        if min(distance, wick_distance) <= proximity:
+            found.append({
+                "name": "RESISTANCE ZONE WATCH",
+                "direction": "bearish",
+                "confirmed": True,
+                "score": 5.0 + min(3.0, z["touches"] * 0.5),
+                "confirmation_date": latest.get("datetime", ""),
+                "confirmation_close": latest_close,
+                "level": level,
+                "touches": z["touches"],
+                "distance": min(distance, wick_distance),
+                "context": "support_resistance",
+                "trend": local_structure_trend(candles, len(candles)-1),
+                "target": None,
+            })
+
+    # Support: zone should be at/below current area.
+    for z in support_zones:
+        level = z["level"]
+        distance = abs(level - latest_close)
+        wick_distance = abs(level - latest_low)
+        if min(distance, wick_distance) <= proximity:
+            found.append({
+                "name": "SUPPORT ZONE WATCH",
+                "direction": "bullish",
+                "confirmed": True,
+                "score": 5.0 + min(3.0, z["touches"] * 0.5),
+                "confirmation_date": latest.get("datetime", ""),
+                "confirmation_close": latest_close,
+                "level": level,
+                "touches": z["touches"],
+                "distance": min(distance, wick_distance),
+                "context": "support_resistance",
+                "trend": local_structure_trend(candles, len(candles)-1),
+                "target": None,
+            })
+
+    # Keep only the nearest support and nearest resistance.
+    best = {}
+    for p in found:
+        key = p["name"]
+        if key not in best or p["distance"] < best[key]["distance"]:
+            best[key] = p
+
+    return list(best.values())
+
+
 def detect_trend_pullback(candles, conf):
     """
     Edo Trend Pullback rule.
@@ -1746,8 +1873,33 @@ def describe_setup(p):
             f"Confirmation close: {p['confirmation_close']:.5f}"
         )
 
+    elif p["name"] in ("SUPPORT ZONE WATCH", "RESISTANCE ZONE WATCH"):
+        zone_word = "support" if p["name"] == "SUPPORT ZONE WATCH" else "resistance"
+        action_word = "Bullish watch" if bullish else "Bearish watch"
+        trend_word = str(p.get("trend", "mixed")).upper()
+
+        detail = (
+            f"{action_word}: the newest fully CLOSED candle on this timeframe is near an "
+            f"established {zone_word} zone. The zone has at least {p.get('touches', 2)} "
+            f"historical swing touches. Current local structure is {trend_word}, but this "
+            f"support/resistance alert is allowed in bullish, bearish and range-bound markets."
+        )
+
+        level_text = (
+            f"{zone_word.title()} zone: {p['level']:.5f} • "
+            f"Latest close: {p['confirmation_close']:.5f}"
+        )
+
     elif p["name"] == "TREND PULLBACK SETUP":
         run_dates = ", ".join(p.get("run_dates", []))
+        htf_text = ""
+        if p.get("higher_tf_filter"):
+            htf = p.get("higher_tf_states", {})
+            htf_text = (
+                f" Strong 4H filter passed: "
+                f"8H {htf.get('8H','')}, 12H {htf.get('12H','')}, 1D {htf.get('1D','')}."
+            )
+
         detail = (
             f"{direction_word} trend-pullback confirmation on {p['confirmation_date']}. "
             f"{p['run_count']} {p['run_colour']} CLOSED candles pulled against the larger "
@@ -1755,6 +1907,7 @@ def describe_setup(p):
             f"closed {p['penetration']:.0f}% through the BODY of the immediately previous "
             f"pullback candle. Minimum required: 50%. "
             f"Pullback candle times: {run_dates or 'n/a'}."
+            f"{htf_text}"
         )
 
         level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
@@ -2070,6 +2223,80 @@ def weekly_spike_monitor():
 
 
 
+
+def strong_higher_timeframe_trend_for_4h(symbol, grp="FOREX"):
+    """
+    4H Trend Pullback filter:
+    the latest fully CLOSED 8H + 12H + Daily candles must all agree.
+
+    This is still pure candlestick direction / price action:
+      Bullish = close > open
+      Bearish = close < open
+
+    Weekly is not required for this 4H filter.
+    """
+    checks = [("8H", "8h"), ("12H", "12h"), ("1D", "1day")]
+    states = {}
+
+    for label, interval in checks:
+        if interval == "12h":
+            candles, err = get_candles(symbol, "12h", outputsize=4, grp=grp)
+            if err:
+                return None, states, err
+            closed = last_closed_candle(candles)
+        else:
+            candles, err = get_ohlc(symbol, interval, outputsize=50, grp=grp)
+            if err:
+                return None, states, err
+            closed_list = fully_closed_candles(candles, interval)
+            closed = closed_list[-1] if closed_list else None
+
+        if closed is None:
+            return None, states, f"Not enough completed {label} candle data."
+
+        states[label] = analyse_candle(closed)
+
+    if all(states[x] == "Bullish" for x in ("8H", "12H", "1D")):
+        return "bullish", states, None
+    if all(states[x] == "Bearish" for x in ("8H", "12H", "1D")):
+        return "bearish", states, None
+
+    return None, states, None
+
+
+def apply_4h_strong_trend_filter(symbol, grp, interval, setups):
+    """
+    Only 4H is filtered:
+      bullish 4H Trend Pullback -> 8H+12H+1D all Bullish
+      bearish 4H Trend Pullback -> 8H+12H+1D all Bearish
+
+    8H, Daily and Weekly setups are left unchanged.
+    """
+    if interval != "4h":
+        return setups, None, None
+
+    higher_direction, states, error = strong_higher_timeframe_trend_for_4h(symbol, grp)
+    if error:
+        return [], states, error
+
+    if higher_direction is None:
+        return [], states, None
+
+    filtered = []
+    for p in setups:
+        if (
+            p.get("name") == "TREND PULLBACK SETUP"
+            and p.get("direction") == higher_direction
+        ):
+            p = dict(p)
+            p["higher_tf_filter"] = True
+            p["higher_tf_direction"] = higher_direction
+            p["higher_tf_states"] = dict(states)
+            filtered.append(p)
+
+    return filtered, states, None
+
+
 def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     cache_key = f"{grp}|{symbol}|{interval}"
     now = time.time()
@@ -2104,6 +2331,12 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         if pullback:
             found.append(pullback)
 
+    # 8H, Daily and Weekly: also alert when the newest CLOSED candle is
+    # near an established support/resistance zone. This works regardless
+    # of whether the larger market is bullish, bearish or range-bound.
+    if interval in CORE_PATTERN_INTERVALS:
+        found.extend(detect_support_resistance_signal(closed_candles))
+
     # Avoid duplicate descriptions of the same setup/direction/confirmation.
     unique = {}
     for p in found:
@@ -2120,6 +2353,15 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             p for p in found
             if p.get("name") == "TREND PULLBACK SETUP"
         ]
+
+    # 4H signals require strong higher-timeframe alignment.
+    higher_tf_states = None
+    if interval == "4h":
+        found, higher_tf_states, htf_error = apply_4h_strong_trend_filter(
+            symbol, grp, interval, found
+        )
+        if htf_error:
+            return None, htf_error
 
     found.sort(
         key=lambda p: (
@@ -2162,7 +2404,15 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                 "The most recent older valid trigger is shown below for reference."
             )
         else:
-            summary = "No recent setup matches your candle-close pattern rules on this timeframe."
+            if interval == "4h" and higher_tf_states:
+                state_text = " | ".join(f"{k} {v}" for k, v in higher_tf_states.items())
+                summary = (
+                    "No 4H setup passed the strong higher-timeframe filter. "
+                    "For a 4H alert, 8H + 12H + 1D must all agree with the setup direction. "
+                    f"Current higher-timeframe state: {state_text}."
+                )
+            else:
+                summary = "No recent setup matches your candle-close pattern rules on this timeframe."
 
     weekly_spike = detect_weekly_spike(closed_candles) if interval == "1week" else None
 
@@ -2266,13 +2516,35 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         icon = "🟢" if bullish else "🔴"
         direction_word = "BULLISH" if bullish else "BEARISH"
 
-        send_push(
-            f"{icon} {symbol} [{grp}] — {direction_word} EDO SETUP",
-            (
-                f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
-                f"({confirmation_date}). {direction_word} possibility. "
+        if interval == "4h" and p.get("higher_tf_filter"):
+            htf = p.get("higher_tf_states", {})
+            trend_line = (
+                f"Strong higher-timeframe trend: "
+                f"8H {htf.get('8H','')} | 12H {htf.get('12H','')} | 1D {htf.get('1D','')}. "
+            )
+        else:
+            trend_line = ""
+
+        if p.get("context") == "support_resistance":
+            zone_word = "SUPPORT" if p["direction"] == "bullish" else "RESISTANCE"
+            push_body = (
+                f"Newest fully CLOSED {tf_label} candle is near an established {zone_word} zone "
+                f"({p['level']:.5f}) with {p.get('touches', 2)} prior swing touches. "
+                f"Local structure: {str(p.get('trend','mixed')).upper()}. "
+                f"This alert is valid in bullish, bearish and range-bound markets. "
                 f"Review the chart before trading."
             )
+        else:
+            push_body = (
+                f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
+                f"({confirmation_date}). "
+                f"{trend_line}"
+                f"{direction_word} possibility. Review the chart before trading."
+            )
+
+        send_push(
+            f"{icon} {symbol} [{grp}] — {p['name']}",
+            push_body
         )
 
 
@@ -2306,6 +2578,10 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         if pullback:
             found.append(pullback)
 
+    # 8H, Daily and Weekly support/resistance proximity alerts.
+    if interval in CORE_PATTERN_INTERVALS:
+        found.extend(detect_support_resistance_signal(closed_candles))
+
     unique = {}
     for p in found:
         key = (p["name"], p["direction"], p["confirmation_date"])
@@ -2320,6 +2596,15 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             p for p in setups
             if p.get("name") == "TREND PULLBACK SETUP"
         ]
+
+    # 4H only: require 8H + 12H + 1D alignment.
+    # 8H, Daily and Weekly remain unrestricted.
+    if interval == "4h":
+        setups, higher_tf_states, htf_error = apply_4h_strong_trend_filter(
+            symbol, grp, interval, setups
+        )
+        if htf_error:
+            return None, latest_closed_date, htf_error
 
     return setups, latest_closed_date, None
 
