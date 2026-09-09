@@ -845,7 +845,7 @@ a{text-decoration:none}
 
         {% if weekly_spike %}
         <div class="weekly-spike">
-            <div class="weekly-spike-title">🟣 WEEKLY SPIKE DETECTED</div>
+            <div class="weekly-spike-title">🟣 WEEKLY TREND SPIKE DETECTED</div>
             <div class="weekly-spike-detail">
                 {{ weekly_spike['message'] }}
             </div>
@@ -1800,21 +1800,35 @@ def median_value(values):
 
 def detect_weekly_spike(closed_weekly):
     """
-    Edo Weekly Spike warning.
+    Edo Weekly Spike warning — TREND FILTERED.
 
-    This is NOT a BUY/SELL signal. It looks only at the newest fully CLOSED
-    weekly candle and asks whether its upper or lower wick is clearly
-    out-of-ordinary compared with recent weekly candles.
+    Warning only, never a BUY/SELL signal.
 
-    A side qualifies when:
-      - wick is at least 2.2x the recent median same-side wick, AND
-      - wick is at least 45% of the recent median weekly range, AND
-      - wick is at least 1.2x the current candle body (tiny/doji bodies allowed)
+    The newest fully CLOSED Weekly candle can trigger only when there was a
+    clear price-action trend BEFORE the spike candle:
 
-    The result is a purple early-warning only. Edo's existing price-action
-    confirmation rules remain the actual setup signal.
+      Prior Weekly trend BULLISH -> only an unusual UPPER wick can alert.
+      Prior Weekly trend BEARISH -> only an unusual LOWER wick can alert.
+      Prior Weekly trend MIXED   -> NO Weekly Spike alert.
+
+    Trend is determined by EdoSignal's existing naked price-structure logic
+    (recent close progress + swing highs/lows). No moving averages, RSI, etc.
+
+    The wick itself must also be clearly out of ordinary:
+      - at least 2.2x the recent median same-side wick
+      - at least 45% of the recent median weekly range
+      - at least 1.2x the current candle body
     """
     if not closed_weekly or len(closed_weekly) < 14:
+        return None
+
+    spike_index = len(closed_weekly) - 1
+
+    # IMPORTANT: this looks ONLY at candles BEFORE the spike candle.
+    prior_trend = local_structure_trend(closed_weekly, spike_index)
+
+    # Edo only wants weekly spike alerts after a clear bullish/bearish trend.
+    if prior_trend not in ("bullish", "bearish"):
         return None
 
     current = closed_weekly[-1]
@@ -1863,28 +1877,34 @@ def detect_weekly_spike(closed_weekly):
         and lower >= body_floor * 1.2
     )
 
-    if not upper_hit and not lower_hit:
-        return None
-
-    if upper_hit and lower_hit:
-        side = "both"
-        label = "UPPER + LOWER"
-        ratio = max(upper_ratio, lower_ratio)
-        meaning = "Strong two-sided weekly rejection / indecision. Possible turning area."
-    elif upper_hit:
+    # Directional reversal filter:
+    # bullish run -> rejection above
+    # bearish run -> rejection below
+    if prior_trend == "bullish":
+        if not upper_hit:
+            return None
         side = "upper"
         label = "UPPER"
         ratio = upper_ratio
-        meaning = "Unusually long upper wick. Possible resistance / bearish reversal area."
+        meaning = (
+            "Weekly trend was BULLISH before this candle. "
+            "Unusually long upper wick may show rejection at the top / possible bearish reversal area."
+        )
     else:
+        if not lower_hit:
+            return None
         side = "lower"
         label = "LOWER"
         ratio = lower_ratio
-        meaning = "Unusually long lower wick. Possible support / bullish reversal area."
+        meaning = (
+            "Weekly trend was BEARISH before this candle. "
+            "Unusually long lower wick may show rejection at the bottom / possible bullish reversal area."
+        )
 
     date = current.get("datetime", "")
     message = (
         f"{label} wick spike on the newest fully CLOSED Weekly candle ({date}). "
+        f"Prior Weekly trend: {prior_trend.upper()}. "
         f"Wick is about {ratio:.1f}x its recent normal size. {meaning} "
         f"Warning only — wait for your normal candle confirmation before trading."
     )
@@ -1894,6 +1914,7 @@ def detect_weekly_spike(closed_weekly):
         "label": label,
         "ratio": ratio,
         "date": date,
+        "prior_trend": prior_trend,
         "message": message,
         "upper_wick": upper,
         "lower_wick": lower,
