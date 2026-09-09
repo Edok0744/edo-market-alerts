@@ -2669,54 +2669,110 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
 def pattern_signal_monitor():
     """
-    Background pattern scanner for all saved FOREX, CRYPTO, and CFD markets.
-    Checks one symbol/timeframe combination every five minutes.
+    Grow-55 background pattern scheduler.
+
+    Goal:
+      - get 4H/8H pattern notifications reasonably soon after a candle closes
+      - keep Daily/Weekly current
+      - NEVER crowd out manual Trend / Signal page requests
+
+    Protection:
+      - manual_api_priority_active() always wins
+      - only ONE background API job is processed at a time
+      - 20-second gap between background jobs
+      - each symbol/timeframe is checked only when its due interval expires
+
+    Check cadence per saved market:
+      4H     every 15 minutes
+      8H     every 20 minutes
+      Daily  every 60 minutes
+      Weekly every 6 hours
+
+    These are scan frequencies only. Signals still require a NEW fully CLOSED
+    candle, so repeated scans cannot create duplicate signals.
     """
-    time.sleep(150)
-    index = 0
+    time.sleep(180)
+
+    due_seconds = {
+        "4h": 15 * 60,
+        "8h": 20 * 60,
+        "1day": 60 * 60,
+        "1week": 6 * 60 * 60,
+    }
+
+    last_checked = {}
 
     while True:
         try:
+            # Manual Trend/Signal page requests have absolute priority.
             if manual_api_priority_active():
-                time.sleep(15)
+                time.sleep(10)
                 continue
 
             with db_conn() as c:
                 rows = c.execute(
-                    "SELECT symbol, grp FROM favorites WHERE grp IN ('FOREX','CRYPTO','CFD') ORDER BY grp,symbol"
+                    "SELECT symbol, grp FROM favorites "
+                    "WHERE grp IN ('FOREX','CRYPTO','CFD') "
+                    "ORDER BY grp,symbol"
                 ).fetchall()
 
+            now_ts = time.time()
             jobs = []
+
             for row in rows:
+                symbol = row["symbol"]
+                grp = row["grp"]
+
                 for tf in PATTERN_TIMEFRAMES:
-                    jobs.append((row["symbol"], row["grp"], tf["value"]))
+                    interval = tf["value"]
+                    key = (grp, symbol, interval)
+                    previous = last_checked.get(key, 0.0)
+                    due = due_seconds.get(interval, 30 * 60)
 
-            if jobs:
-                if index >= len(jobs):
-                    index = 0
+                    if now_ts - previous >= due:
+                        # Oldest/most-overdue jobs first.
+                        overdue = now_ts - previous - due
+                        jobs.append((overdue, symbol, grp, interval, key))
 
-                symbol, grp, interval = jobs[index]
-                index = (index + 1) % len(jobs)
+            jobs.sort(reverse=True, key=lambda x: x[0])
 
-                setups, latest_closed_date, error = collect_closed_pattern_setups(
-                    symbol, interval, grp
+            if not jobs:
+                time.sleep(20)
+                continue
+
+            # Process only ONE job, then yield. This is deliberate so a user
+            # opening Trend or Signal is not stuck behind a large background batch.
+            _, symbol, grp, interval, key = jobs[0]
+
+            # Check again immediately before consuming an API call.
+            if manual_api_priority_active():
+                time.sleep(10)
+                continue
+
+            setups, latest_closed_date, error = collect_closed_pattern_setups(
+                symbol, interval, grp
+            )
+
+            # Mark checked even on a normal API/data error so a broken symbol
+            # cannot spin rapidly and monopolise background capacity.
+            last_checked[key] = time.time()
+
+            if error:
+                print("pattern monitor error", symbol, interval, error)
+            else:
+                notify_new_pattern_setups(
+                    symbol,
+                    interval,
+                    setups,
+                    latest_closed_date,
+                    grp
                 )
-
-                if error:
-                    print("pattern monitor error", symbol, interval, error)
-                else:
-                    notify_new_pattern_setups(
-                        symbol,
-                        interval,
-                        setups,
-                        latest_closed_date,
-                        grp
-                    )
 
         except Exception as e:
             print("pattern signal monitor error", e)
 
-        time.sleep(300)
+        # Important Grow-55 safety / UI-responsiveness gap.
+        time.sleep(20)
 
 
 def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
