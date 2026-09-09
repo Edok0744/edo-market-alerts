@@ -784,6 +784,26 @@ a{text-decoration:none}
     font-size:12px;
     font-weight:900;
 }
+
+.weekly-spike{
+    background:#21183b;
+    border:2px solid #b56cff;
+    border-radius:14px;
+    padding:14px;
+    margin-top:14px;
+    box-shadow:0 0 0 1px rgba(181,108,255,.08) inset;
+}
+.weekly-spike-title{
+    color:#d8a7ff;
+    font-size:18px;
+    font-weight:900;
+}
+.weekly-spike-detail{
+    color:#d7c5e8;
+    font-size:13px;
+    line-height:1.45;
+    margin-top:6px;
+}
 </style>
 </head>
 <body>
@@ -822,6 +842,15 @@ a{text-decoration:none}
 
         <div class="signal {{ signal_css }}">{{ signal_icon }} {{ signal }}</div>
         <div class="small" style="margin-top:6px">{{ summary }}</div>
+
+        {% if weekly_spike %}
+        <div class="weekly-spike">
+            <div class="weekly-spike-title">🟣 WEEKLY SPIKE DETECTED</div>
+            <div class="weekly-spike-detail">
+                {{ weekly_spike['message'] }}
+            </div>
+        </div>
+        {% endif %}
 
         {% if patterns %}
             <div class="section-title newest-title">⚡ NEWEST TRIGGER</div>
@@ -968,6 +997,29 @@ def init_db():
             last_closed_date TEXT NOT NULL DEFAULT '',
             updated TEXT,
             PRIMARY KEY(grp, symbol, interval)
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_spike_notifications(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            grp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            candle_date TEXT NOT NULL,
+            side TEXT NOT NULL,
+            wick_ratio REAL,
+            sent_at TEXT NOT NULL,
+            UNIQUE(grp, symbol, candle_date, side)
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_spike_state(
+            grp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            last_closed_date TEXT NOT NULL DEFAULT '',
+            updated TEXT,
+            PRIMARY KEY(grp, symbol)
         )
         """)
 
@@ -1734,6 +1786,269 @@ def describe_setup(p):
     }
 
 
+
+def median_value(values):
+    clean = sorted(float(v) for v in values if v is not None)
+    if not clean:
+        return 0.0
+    n = len(clean)
+    mid = n // 2
+    if n % 2:
+        return clean[mid]
+    return (clean[mid - 1] + clean[mid]) / 2.0
+
+
+def detect_weekly_spike(closed_weekly):
+    """
+    Edo Weekly Spike warning.
+
+    This is NOT a BUY/SELL signal. It looks only at the newest fully CLOSED
+    weekly candle and asks whether its upper or lower wick is clearly
+    out-of-ordinary compared with recent weekly candles.
+
+    A side qualifies when:
+      - wick is at least 2.2x the recent median same-side wick, AND
+      - wick is at least 45% of the recent median weekly range, AND
+      - wick is at least 1.2x the current candle body (tiny/doji bodies allowed)
+
+    The result is a purple early-warning only. Edo's existing price-action
+    confirmation rules remain the actual setup signal.
+    """
+    if not closed_weekly or len(closed_weekly) < 14:
+        return None
+
+    current = closed_weekly[-1]
+    history = closed_weekly[-13:-1]
+
+    o = float(current["open"])
+    h = float(current["high"])
+    l = float(current["low"])
+    c = float(current["close"])
+
+    body = abs(c - o)
+    current_range = max(h - l, 1e-12)
+    upper = max(0.0, h - max(o, c))
+    lower = max(0.0, min(o, c) - l)
+
+    hist_upper = []
+    hist_lower = []
+    hist_ranges = []
+
+    for x in history:
+        xo = float(x["open"])
+        xh = float(x["high"])
+        xl = float(x["low"])
+        xc = float(x["close"])
+        hist_upper.append(max(0.0, xh - max(xo, xc)))
+        hist_lower.append(max(0.0, min(xo, xc) - xl))
+        hist_ranges.append(max(0.0, xh - xl))
+
+    med_upper = max(median_value(hist_upper), 1e-12)
+    med_lower = max(median_value(hist_lower), 1e-12)
+    med_range = max(median_value(hist_ranges), 1e-12)
+
+    body_floor = max(body, current_range * 0.06, 1e-12)
+
+    upper_ratio = upper / med_upper
+    lower_ratio = lower / med_lower
+
+    upper_hit = (
+        upper_ratio >= 2.2
+        and upper >= med_range * 0.45
+        and upper >= body_floor * 1.2
+    )
+    lower_hit = (
+        lower_ratio >= 2.2
+        and lower >= med_range * 0.45
+        and lower >= body_floor * 1.2
+    )
+
+    if not upper_hit and not lower_hit:
+        return None
+
+    if upper_hit and lower_hit:
+        side = "both"
+        label = "UPPER + LOWER"
+        ratio = max(upper_ratio, lower_ratio)
+        meaning = "Strong two-sided weekly rejection / indecision. Possible turning area."
+    elif upper_hit:
+        side = "upper"
+        label = "UPPER"
+        ratio = upper_ratio
+        meaning = "Unusually long upper wick. Possible resistance / bearish reversal area."
+    else:
+        side = "lower"
+        label = "LOWER"
+        ratio = lower_ratio
+        meaning = "Unusually long lower wick. Possible support / bullish reversal area."
+
+    date = current.get("datetime", "")
+    message = (
+        f"{label} wick spike on the newest fully CLOSED Weekly candle ({date}). "
+        f"Wick is about {ratio:.1f}x its recent normal size. {meaning} "
+        f"Warning only — wait for your normal candle confirmation before trading."
+    )
+
+    return {
+        "side": side,
+        "label": label,
+        "ratio": ratio,
+        "date": date,
+        "message": message,
+        "upper_wick": upper,
+        "lower_wick": lower,
+        "body": body,
+        "range": current_range,
+    }
+
+
+def notify_weekly_spike(symbol, grp, spike):
+    """Send one Pushover confirmation per detected fully closed weekly spike."""
+    if not spike:
+        return
+
+    candle_date = spike.get("date", "")
+    side = spike.get("side", "")
+    if not candle_date or not side:
+        return
+
+    try:
+        with db_conn() as c:
+            c.execute(
+                """
+                INSERT INTO weekly_spike_notifications(
+                    grp, symbol, candle_date, side, wick_ratio, sent_at
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    grp,
+                    symbol,
+                    candle_date,
+                    side,
+                    float(spike.get("ratio", 0.0)),
+                    datetime.utcnow().isoformat()
+                )
+            )
+            c.commit()
+    except sqlite3.IntegrityError:
+        return
+
+    send_push(
+        f"🟣 {symbol} [{grp}] — WEEKLY SPIKE",
+        spike["message"]
+    )
+
+
+def collect_weekly_spike(symbol, grp="FOREX"):
+    candles, error = get_ohlc(symbol, "1week", outputsize=80, grp=grp)
+    if error:
+        return None, None, error
+
+    closed = fully_closed_candles(candles, "1week")
+    if len(closed) < 14:
+        return None, None, "Not enough fully closed Weekly candle history."
+
+    latest_closed_date = closed[-1].get("datetime", "")
+    spike = detect_weekly_spike(closed)
+    return spike, latest_closed_date, None
+
+
+def weekly_spike_monitor():
+    """
+    Low-credit Weekly Spike monitor.
+
+    It checks one saved market per minute. This gives regular coverage without
+    competing heavily with the normal price/trend/pattern monitors.
+    """
+    time.sleep(210)
+    index = 0
+
+    while True:
+        try:
+            if manual_api_priority_active():
+                time.sleep(15)
+                continue
+
+            with db_conn() as c:
+                rows = c.execute(
+                    "SELECT symbol, grp FROM favorites "
+                    "WHERE grp IN ('FOREX','CRYPTO','CFD') ORDER BY grp,symbol"
+                ).fetchall()
+
+            if rows:
+                if index >= len(rows):
+                    index = 0
+
+                row = rows[index]
+                index = (index + 1) % len(rows)
+
+                symbol = row["symbol"]
+                grp = row["grp"]
+
+                spike, latest_closed_date, error = collect_weekly_spike(symbol, grp)
+
+                if error:
+                    print("weekly spike monitor error", symbol, error)
+                elif latest_closed_date:
+                    with db_conn() as c:
+                        state = c.execute(
+                            """
+                            SELECT last_closed_date
+                            FROM weekly_spike_state
+                            WHERE grp=? AND symbol=?
+                            """,
+                            (grp, symbol)
+                        ).fetchone()
+
+                        previous = state["last_closed_date"] if state else ""
+
+                        if state is None:
+                            c.execute(
+                                """
+                                INSERT INTO weekly_spike_state(
+                                    grp, symbol, last_closed_date, updated
+                                ) VALUES(?,?,?,?)
+                                """,
+                                (
+                                    grp,
+                                    symbol,
+                                    latest_closed_date,
+                                    datetime.utcnow().isoformat()
+                                )
+                            )
+                            c.commit()
+
+                            # On first installation, alert once if the latest
+                            # closed Weekly candle itself is already a spike.
+                            if spike:
+                                notify_weekly_spike(symbol, grp, spike)
+
+                        elif latest_closed_date != previous:
+                            c.execute(
+                                """
+                                UPDATE weekly_spike_state
+                                SET last_closed_date=?, updated=?
+                                WHERE grp=? AND symbol=?
+                                """,
+                                (
+                                    latest_closed_date,
+                                    datetime.utcnow().isoformat(),
+                                    grp,
+                                    symbol
+                                )
+                            )
+                            c.commit()
+
+                            if spike:
+                                notify_weekly_spike(symbol, grp, spike)
+
+        except Exception as e:
+            print("weekly spike monitor error", e)
+
+        time.sleep(60)
+
+
+
 def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     cache_key = f"{grp}|{symbol}|{interval}"
     now = time.time()
@@ -1828,10 +2143,13 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         else:
             summary = "No recent setup matches your candle-close pattern rules on this timeframe."
 
+    weekly_spike = detect_weekly_spike(closed_candles) if interval == "1week" else None
+
     data = {
         "price": closed_candles[-1]["close"],
         "latest_closed_date": latest_closed_date,
         "market_source": closed_candles[-1].get("_source_label", ""),
+        "weekly_spike": weekly_spike,
         "signal": signal,
         "signal_icon": icon,
         "signal_css": css,
@@ -2983,6 +3301,7 @@ def signal(i):
             price='—',
             latest_closed_date='—',
             market_source='',
+            weekly_spike=None,
             signal='',
             signal_icon='',
             signal_css='neutral',
@@ -3003,6 +3322,7 @@ def signal(i):
         price=f"{data['price']:.5f}",
         latest_closed_date=data.get('latest_closed_date', ''),
         market_source=data.get('market_source', ''),
+        weekly_spike=data.get('weekly_spike'),
         signal=data['signal'],
         signal_icon=data['signal_icon'],
         signal_css=data['signal_css'],
@@ -3157,6 +3477,11 @@ threading.Thread(
 
 threading.Thread(
     target=pattern_signal_monitor,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=weekly_spike_monitor,
     daemon=True
 ).start()
 
