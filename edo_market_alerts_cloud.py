@@ -15,6 +15,8 @@ FOREX_FACTORY_CALENDAR_URL = os.environ.get(
     'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
 )
 NEWS_REFRESH_SECONDS = int(os.environ.get('NEWS_REFRESH_SECONDS', '1800'))
+NEWS_WARNING_MINUTES = int(os.environ.get('NEWS_WARNING_MINUTES', '5'))
+NEWS_PUSH_SOUND = os.environ.get('NEWS_PUSH_SOUND', 'siren')
 CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 
 # -------------------------------------------------
@@ -1288,6 +1290,13 @@ def init_db():
         """)
 
         c.execute("""
+        CREATE TABLE IF NOT EXISTS economic_news_pushes(
+            event_id TEXT PRIMARY KEY,
+            sent_at TEXT NOT NULL
+        )
+        """)
+
+        c.execute("""
         CREATE TABLE IF NOT EXISTS weekly_spike_state(
             grp TEXT NOT NULL,
             symbol TEXT NOT NULL,
@@ -1503,6 +1512,106 @@ def economic_news_monitor():
         time.sleep(max(300, NEWS_REFRESH_SECONDS))
 
 
+
+def reserve_economic_news_push(event_id):
+    """
+    Persistently reserve this event so the 5-minute sound warning is sent once,
+    even if Railway restarts or multiple monitor loops see the same event.
+    """
+    try:
+        with db_conn() as c:
+            c.execute(
+                """
+                INSERT INTO economic_news_pushes(event_id, sent_at)
+                VALUES(?,?)
+                """,
+                (event_id, datetime.utcnow().isoformat())
+            )
+            c.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def economic_news_warning_monitor():
+    """
+    Check cached HIGH-impact Forex Factory events once per minute.
+
+    Around 5 minutes before an event:
+      - send ONE Pushover warning with a distinctive NEWS sound
+      - include affected saved pairs/markets
+      - do not alter or cancel any Edo trading signal
+
+    This monitor reads SQLite only and uses NO Twelve Data credits.
+    """
+    time.sleep(35)
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            window_start = now_utc + timedelta(minutes=max(0, NEWS_WARNING_MINUTES - 1))
+            window_end = now_utc + timedelta(minutes=NEWS_WARNING_MINUTES)
+
+            with db_conn() as c:
+                rows = c.execute(
+                    """
+                    SELECT event_id,event_time_utc,currency,event_name
+                    FROM economic_news
+                    WHERE event_time_utc >= ?
+                      AND event_time_utc <= ?
+                    ORDER BY event_time_utc ASC
+                    """,
+                    (window_start.isoformat(), window_end.isoformat())
+                ).fetchall()
+
+            perth = ZoneInfo("Australia/Perth")
+
+            for row in rows:
+                event_id = row["event_id"]
+
+                if not reserve_economic_news_push(event_id):
+                    continue
+
+                event_dt = datetime.fromisoformat(row["event_time_utc"])
+                if event_dt.tzinfo is None:
+                    event_dt = event_dt.replace(tzinfo=timezone.utc)
+
+                currency = str(row["currency"] or "").upper()
+                affected = saved_markets_for_news_currency(currency)
+                affected_text = ", ".join(affected) if affected else "No saved pair matched"
+
+                title = f"📰 {currency} HIGH-IMPACT NEWS — 5 MIN"
+                message = (
+                    f"{row['event_name']}\\n"
+                    f"Due {event_dt.astimezone(perth).strftime('%H:%M')} Perth\\n"
+                    f"Affects: {affected_text}\\n"
+                    f"⚠ Consider holding a new entry until the news has passed."
+                )
+
+                ok = send_push(
+                    title,
+                    message,
+                    sound=NEWS_PUSH_SOUND
+                )
+
+                # If delivery failed completely, allow a later retry.
+                if not ok:
+                    try:
+                        with db_conn() as c:
+                            c.execute(
+                                "DELETE FROM economic_news_pushes WHERE event_id=?",
+                                (event_id,)
+                            )
+                            c.commit()
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            print("economic news warning monitor error", e)
+
+        time.sleep(60)
+
+
 def news_warning_level(minutes_until):
     if minutes_until < -60:
         return "past"
@@ -1628,27 +1737,29 @@ def cached_home_news(limit=6):
 
 
 
-def send_push(title, msg):
+def send_push(title, msg, sound='cashregister'):
 
     if not PUSHOVER_APP_TOKEN or not PUSHOVER_USER_KEY:
         print('Pushover not configured:', title, msg)
-        return
+        return False
 
     try:
-        requests.post(
+        r = requests.post(
             'https://api.pushover.net/1/messages.json',
             data={
                 'token': PUSHOVER_APP_TOKEN,
                 'user': PUSHOVER_USER_KEY,
                 'title': title,
                 'message': msg,
-                'sound': 'cashregister'
+                'sound': sound
             },
             timeout=10
         )
+        return r.ok
 
     except Exception as e:
         print('push error', e)
+        return False
 
 
 def latest_price(symbol, grp=None):
@@ -4825,6 +4936,11 @@ threading.Thread(
 
 threading.Thread(
     target=economic_news_monitor,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=economic_news_warning_monitor,
     daemon=True
 ).start()
 
