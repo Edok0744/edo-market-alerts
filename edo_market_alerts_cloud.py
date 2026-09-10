@@ -1504,10 +1504,12 @@ def parse_ff_event_time(value):
 
 def refresh_economic_news():
     """
-    Refresh HIGH-impact Forex Factory events for currencies relevant to the
-    user's saved markets. No paid economic-calendar API is required.
+    Refresh ALL supported HIGH-impact Forex Factory events into SQLite.
+
+    Favorites are applied later when deciding what to display on the HOME page.
+    This prevents a temporary Favorites lookup issue from wiping valid news.
     """
-    currencies = relevant_news_currencies_from_favorites()
+    supported_currencies = {"USD", "EUR", "GBP", "AUD", "CAD", "CHF", "JPY", "NZD"}
     now_utc = datetime.now(timezone.utc)
 
     try:
@@ -1534,7 +1536,7 @@ def refresh_economic_news():
                 continue
 
             currency = str(item.get("country") or "").strip().upper()
-            if currency not in currencies:
+            if currency not in supported_currencies:
                 continue
 
             event_name = str(item.get("title") or "High-impact economic event").strip()
@@ -1559,6 +1561,10 @@ def refresh_economic_news():
                 fetched,
             ))
 
+        # Never erase a good cache because of a temporary empty/bad feed.
+        if not rows:
+            return False, "Forex Factory returned no usable upcoming High-impact rows; existing cache kept."
+
         with db_conn() as c:
             c.execute("DELETE FROM economic_news")
             c.executemany(
@@ -1573,6 +1579,7 @@ def refresh_economic_news():
             )
             c.commit()
 
+        print(f"Forex Factory news cache refreshed: {len(rows)} High-impact event(s).")
         return True, None
 
     except Exception as e:
@@ -2035,7 +2042,7 @@ def cached_home_news(limit=6):
                 """,
                 (
                     (now_utc - timedelta(minutes=30)).isoformat(),
-                    int(limit),
+                    max(40, int(limit) * 8),
                 ),
             ).fetchall()
     except Exception as e:
@@ -2067,6 +2074,11 @@ def cached_home_news(limit=6):
 
             affected_pairs = saved_markets_for_news_currency(row["currency"])
 
+            # The cache now contains all High-impact currencies.
+            # Only display events that affect at least one saved market.
+            if not affected_pairs:
+                continue
+
             items.append({
                 "event_id": row["event_id"],
                 "currency": row["currency"],
@@ -2083,7 +2095,7 @@ def cached_home_news(limit=6):
         except Exception:
             continue
 
-    return items
+    return items[:int(limit)]
 
 
 
@@ -5030,16 +5042,35 @@ def refresh_news_now():
     """
     try:
         ok, error = refresh_economic_news()
+
+        cached_count = 0
+        try:
+            with db_conn() as c:
+                cached_count = c.execute(
+                    "SELECT COUNT(*) AS n FROM economic_news"
+                ).fetchone()["n"]
+        except Exception:
+            pass
+
         if error:
             print("manual Forex Factory refresh:", error)
-            return jsonify(ok=False, error=str(error)), 200
+            return jsonify(
+                ok=False,
+                error=str(error),
+                cached_high_impact_events=cached_count
+            ), 200
 
-        return jsonify(ok=True), 200
+        return jsonify(
+            ok=True,
+            cached_high_impact_events=cached_count
+        ), 200
 
     except Exception as e:
         print("manual Forex Factory refresh error", e)
-        # Return JSON instead of the global HTML 500 page.
-        return jsonify(ok=False, error="News refresh failed temporarily."), 200
+        return jsonify(
+            ok=False,
+            error="News refresh failed temporarily."
+        ), 200
 
 
 @APP.route('/')
