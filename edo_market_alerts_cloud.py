@@ -426,6 +426,15 @@ h2{font-size:18px}
     .trend-grid{grid-template-columns:1fr}
 }
 a{text-decoration:none}
+
+.news-flash{
+    color:#ff4d5a !important;
+    animation:edoNewsFlash 1s infinite;
+}
+@keyframes edoNewsFlash{
+    0%,100%{opacity:1}
+    50%{opacity:.25}
+}
 </style>
 </head>
 
@@ -685,6 +694,115 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
 </div>
 
 </div>
+
+<script>
+(function () {
+    function formatLeft(msLeft) {
+        if (msLeft <= 0) {
+            const minsPast = Math.floor(Math.abs(msLeft) / 60000);
+            if (minsPast < 1) return 'NOW';
+            if (minsPast < 60) return minsPast + 'm ago';
+            return Math.floor(minsPast / 60) + 'h ago';
+        }
+
+        const total = Math.floor(msLeft / 1000);
+        const days = Math.floor(total / 86400);
+        const hours = Math.floor((total % 86400) / 3600);
+        const mins = Math.floor((total % 3600) / 60);
+        const secs = total % 60;
+
+        if (days > 0) return 'in ' + days + 'd ' + hours + 'h ' + mins + 'm';
+        if (hours > 0) return 'in ' + hours + 'h ' + mins + 'm ' + secs + 's';
+        return 'in ' + mins + 'm ' + secs + 's';
+    }
+
+    function updateNewsCountdowns() {
+        const now = Date.now();
+        const rows = document.querySelectorAll('.js-news-countdown');
+
+        rows.forEach(function (row) {
+            const eventMs = Number(row.dataset.eventMs || 0);
+            if (!eventMs) return;
+
+            const left = eventMs - now;
+            const minsLeft = left / 60000;
+            const timeNode = row.querySelector('.js-news-timeleft');
+            const warningNode = row.querySelector('.js-news-warning');
+
+            if (timeNode) timeNode.textContent = formatLeft(left);
+
+            row.classList.remove('news-red', 'news-amber', 'news-normal', 'news-flash');
+
+            if (minsLeft <= 30 && minsLeft >= 0) {
+                row.classList.add('news-red', 'news-flash');
+                if (warningNode) warningNode.innerHTML = '🔴 HOLD / WAIT<br>';
+            } else if (minsLeft <= 60 && minsLeft > 30) {
+                row.classList.add('news-red');
+                if (warningNode) warningNode.innerHTML = '⚠ HOLD / WAIT<br>';
+            } else if (minsLeft <= 240 && minsLeft > 60) {
+                row.classList.add('news-amber');
+                if (warningNode) warningNode.innerHTML = '⚠ NEWS SOON<br>';
+            } else if (minsLeft < 0 && minsLeft >= -60) {
+                row.classList.add('news-red');
+                if (warningNode) warningNode.innerHTML = '⚠ NEWS RELEASED<br>';
+            } else {
+                row.classList.add('news-normal');
+                if (warningNode) warningNode.innerHTML = '';
+            }
+        });
+    }
+
+    updateNewsCountdowns();
+    setInterval(updateNewsCountdowns, 1000);
+
+    const refreshBtn = document.getElementById('news-refresh-btn');
+    const refreshStatus = document.getElementById('news-refresh-status');
+
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', async function () {
+            const oldText = refreshBtn.textContent;
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = '↻ Updating...';
+
+            if (refreshStatus) {
+                refreshStatus.style.display = 'block';
+                refreshStatus.textContent = 'Refreshing Forex Factory high-impact news...';
+            }
+
+            try {
+                const response = await fetch('/refresh-news', {
+                    method: 'POST',
+                    headers: {'X-Requested-With': 'XMLHttpRequest'},
+                    cache: 'no-store'
+                });
+
+                const result = await response.json();
+
+                if (result.ok) {
+                    if (refreshStatus) refreshStatus.textContent = '✓ News updated.';
+                    setTimeout(function () {
+                        window.location.replace('/?news=' + Date.now());
+                    }, 300);
+                } else {
+                    if (refreshStatus) {
+                        refreshStatus.textContent =
+                            '⚠ Forex Factory did not return an update just now. Existing news remains displayed.';
+                    }
+                    refreshBtn.disabled = false;
+                    refreshBtn.textContent = oldText;
+                }
+            } catch (err) {
+                if (refreshStatus) {
+                    refreshStatus.textContent =
+                        '⚠ News refresh failed temporarily. Existing news remains displayed.';
+                }
+                refreshBtn.disabled = false;
+                refreshBtn.textContent = oldText;
+            }
+        });
+    }
+})();
+</script>
 </body>
 </html>
 '''
@@ -1005,113 +1123,7 @@ a{text-decoration:none}
     </div>
 </div>
 
-<script>
-(function () {
-    const rows = Array.from(document.querySelectorAll('.js-news-countdown'));
 
-    function formatLeft(msLeft) {
-        if (msLeft <= 0) {
-            const minsPast = Math.floor(Math.abs(msLeft) / 60000);
-            if (minsPast < 1) return 'NOW';
-            if (minsPast < 60) return minsPast + 'm ago';
-            return Math.floor(minsPast / 60) + 'h ago';
-        }
-
-        const total = Math.floor(msLeft / 1000);
-        const days = Math.floor(total / 86400);
-        const hours = Math.floor((total % 86400) / 3600);
-        const mins = Math.floor((total % 3600) / 60);
-        const secs = total % 60;
-
-        if (days > 0) return 'in ' + days + 'd ' + hours + 'h ' + mins + 'm';
-        if (hours > 0) return 'in ' + hours + 'h ' + mins + 'm ' + secs + 's';
-        return 'in ' + mins + 'm ' + secs + 's';
-    }
-
-    function updateNewsCountdowns() {
-        const now = Date.now();
-
-        rows.forEach(function (row) {
-            const eventMs = Number(row.dataset.eventMs || 0);
-            if (!eventMs) return;
-
-            const left = eventMs - now;
-            const minsLeft = left / 60000;
-            const timeNode = row.querySelector('.js-news-timeleft');
-            const warningNode = row.querySelector('.js-news-warning');
-
-            if (timeNode) timeNode.textContent = formatLeft(left);
-
-            row.classList.remove('news-red', 'news-amber', 'news-normal');
-
-            if (minsLeft <= 60 && minsLeft >= -60) {
-                row.classList.add('news-red');
-                if (warningNode) warningNode.innerHTML = '⚠ HOLD / WAIT<br>';
-            } else if (minsLeft <= 240 && minsLeft > 60) {
-                row.classList.add('news-amber');
-                if (warningNode) warningNode.innerHTML = '⚠ NEWS SOON<br>';
-            } else {
-                row.classList.add('news-normal');
-                if (warningNode) warningNode.innerHTML = '';
-            }
-        });
-    }
-
-    updateNewsCountdowns();
-    setInterval(updateNewsCountdowns, 1000);
-
-    const refreshBtn = document.getElementById('news-refresh-btn');
-    const refreshStatus = document.getElementById('news-refresh-status');
-
-    if (refreshBtn) {
-        refreshBtn.addEventListener('click', async function () {
-            const oldText = refreshBtn.textContent;
-            refreshBtn.disabled = true;
-            refreshBtn.textContent = '↻ Updating...';
-
-            if (refreshStatus) {
-                refreshStatus.style.display = 'block';
-                refreshStatus.textContent = 'Refreshing Forex Factory high-impact news...';
-            }
-
-            try {
-                const response = await fetch('/refresh-news', {
-                    method: 'POST',
-                    headers: {'X-Requested-With': 'XMLHttpRequest'}
-                });
-
-                const result = await response.json();
-
-                if (result.ok) {
-                    if (refreshStatus) {
-                        refreshStatus.textContent = '✓ News updated. Refreshing this page...';
-                    }
-
-                    // Reload the SAME home page so new/changed events appear.
-                    // This does not navigate to a separate refresh/error page.
-                    setTimeout(function () {
-                        window.location.reload();
-                    }, 350);
-                } else {
-                    if (refreshStatus) {
-                        refreshStatus.textContent =
-                            '⚠ Could not refresh the feed just now. Existing news remains displayed.';
-                    }
-                    refreshBtn.disabled = false;
-                    refreshBtn.textContent = oldText;
-                }
-            } catch (err) {
-                if (refreshStatus) {
-                    refreshStatus.textContent =
-                        '⚠ Could not refresh the feed just now. Existing news remains displayed.';
-                }
-                refreshBtn.disabled = false;
-                refreshBtn.textContent = oldText;
-            }
-        });
-    }
-})();
-</script>
 </body>
 </html>
 """
