@@ -174,6 +174,7 @@ def ohlc_cache_seconds(interval):
     # Signals use fully CLOSED candles, so these cache periods are safe and
     # prevent repeat downloads when the same page is opened several times.
     return {
+        "1min": 20,
         "1h": 120,
         "2h": 180,
         "4h": 240,
@@ -384,20 +385,6 @@ h2{font-size:18px}
 .news-row:last-child{border-bottom:0}
 .news-left{min-width:0}
 .news-title{font-size:14px;font-weight:900}
-.news-reaction{
-    display:inline-block;
-    margin-left:7px;
-    padding:3px 7px;
-    border-radius:999px;
-    font-size:11px;
-    font-weight:900;
-    white-space:nowrap;
-    vertical-align:2px;
-}
-.news-reaction-bull{background:#123f31;color:#35e39b}
-.news-reaction-bear{background:#4b1f2a;color:#ff6f84}
-.news-reaction-mixed{background:#44391b;color:#ffd34f}
-.news-reaction-pending{background:#173047;color:#9ab0c6}
 .news-time{font-size:12px;color:#9eb5c9;margin-top:3px}
 .news-count{
     font-size:12px;
@@ -417,6 +404,22 @@ h2{font-size:18px}
 .news-red{color:#ff6b7d}
 .news-amber{color:#f2c94c}
 .news-normal{color:#8ca7bf}
+.news-reaction{
+    display:inline-block;
+    margin-left:7px;
+    padding:3px 7px;
+    border-radius:8px;
+    font-size:11px;
+    font-weight:900;
+    white-space:nowrap;
+    vertical-align:1px;
+    border:1px solid rgba(255,255,255,.13);
+}
+.news-reaction.reading{color:#9dccff;background:#183a5e}
+.news-reaction.bullish{color:#72f0a0;background:#173e2a}
+.news-reaction.bearish{color:#ff7d8d;background:#4a1d28}
+.news-reaction.mixed{color:#f2c94c;background:#4a4020}
+
 .news-chip{
     display:inline-block;
     padding:3px 7px;
@@ -539,15 +542,9 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
             <div class="news-left">
                 <div class="news-title">
                     <span class="news-chip">{{ n['currency'] }}</span>{{ n['event_name'] }}
-                    {% if n.get('reaction') == 'BULLISH' %}
-                    <span class="news-reaction news-reaction-bull">▲ BULLISH</span>
-                    {% elif n.get('reaction') == 'BEARISH' %}
-                    <span class="news-reaction news-reaction-bear">▼ BEARISH</span>
-                    {% elif n.get('reaction') == 'MIXED' %}
-                    <span class="news-reaction news-reaction-mixed">↔ MIXED</span>
-                    {% elif n.get('reaction') == 'PENDING' and n.get('released') %}
-                    <span class="news-reaction news-reaction-pending">… READING</span>
-                    {% endif %}
+                    <span class="news-reaction reading js-news-reaction"
+                          data-event-id="{{ n['event_id'] }}"
+                          data-event-ms="{{ n['event_time_ms'] }}">... READING</span>
                 </div>
                 <div class="news-time">{{ n['perth_time'] }} Perth</div>
                 {% if n.get('affected_pairs') %}
@@ -566,7 +563,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
         </div>
         {% endfor %}
         <div class="small" style="margin-top:8px">
-            Information only. EdoSignal does not block your setup. After release, ▲/▼ shows the actual currency reaction across your saved FX pairs — not whether the news number itself was good or bad.
+            Information only. EdoSignal does not block your setup. Use the affected-pair line to decide whether to hold a new entry before major news.
         </div>
     {% else %}
         <div class="small">No cached high-impact event is currently approaching for your saved markets.</div>
@@ -795,6 +792,61 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
 
     updateNewsCountdowns();
     setInterval(updateNewsCountdowns, 1000);
+
+
+    function renderReactionBadge(node, item) {
+        if (!node || !item) return;
+
+        node.classList.remove('reading', 'bullish', 'bearish', 'mixed');
+
+        const status = item.status || 'READING';
+        const stage = item.stage || '';
+
+        if (status === 'BULLISH') {
+            node.classList.add('bullish');
+            node.textContent = (stage ? stage + ' ' : '') + '▲ BULLISH' +
+                (item.confirmed ? ' ✓' : '');
+        } else if (status === 'BEARISH') {
+            node.classList.add('bearish');
+            node.textContent = (stage ? stage + ' ' : '') + '▼ BEARISH' +
+                (item.confirmed ? ' ✓' : '');
+        } else if (status === 'MIXED') {
+            node.classList.add('mixed');
+            node.textContent = (stage ? stage + ' ' : '') + '↔ MIXED';
+        } else {
+            node.classList.add('reading');
+            const eventMs = Number(node.dataset.eventMs || 0);
+            const ageMin = eventMs ? ((Date.now() - eventMs) / 60000) : 0;
+            if (ageMin >= 0 && ageMin < 15) {
+                node.textContent = '... READING';
+            } else {
+                node.textContent = '... CHECKING';
+            }
+        }
+    }
+
+    async function refreshNewsReactions() {
+        try {
+            const response = await fetch('/news-reactions?ts=' + Date.now(), {
+                cache: 'no-store'
+            });
+            if (!response.ok) return;
+
+            const payload = await response.json();
+
+            document.querySelectorAll('.js-news-reaction').forEach(function(node) {
+                const eventId = node.dataset.eventId || '';
+                if (payload[eventId]) {
+                    renderReactionBadge(node, payload[eventId]);
+                }
+            });
+        } catch (e) {
+            // Keep the last visible reading if the tiny status request fails.
+        }
+    }
+
+    refreshNewsReactions();
+    setInterval(refreshNewsReactions, 30000);
 
     const refreshBtn = document.getElementById('news-refresh-btn');
     const refreshStatus = document.getElementById('news-refresh-status');
@@ -1322,11 +1374,11 @@ def init_db():
         c.execute("""
         CREATE TABLE IF NOT EXISTS economic_news_reactions(
             event_id TEXT PRIMARY KEY,
-            reaction TEXT NOT NULL DEFAULT 'PENDING',
-            avg_move_pct REAL,
-            sample_count INTEGER NOT NULL DEFAULT 0,
-            stage_minutes INTEGER NOT NULL DEFAULT 0,
-            updated TEXT NOT NULL
+            reaction_15 TEXT,
+            score_15 REAL,
+            reaction_30 TEXT,
+            score_30 REAL,
+            updated TEXT
         )
         """)
 
@@ -1572,7 +1624,7 @@ def economic_news_warning_monitor():
     Check cached HIGH-impact Forex Factory events once per minute.
 
     Around 5 minutes before an event:
-      - send ONE Pushover warning with a distinctive NEWS sound
+      - send THREE Pushover siren warnings in a short burst
       - include affected saved pairs/markets
       - do not alter or cancel any Edo trading signal
 
@@ -1659,160 +1711,157 @@ def economic_news_warning_monitor():
 
 
 
-def saved_fx_pairs_for_currency(currency, max_items=4):
-    """Return up to four saved FOREX pairs containing the event currency."""
-    currency = str(currency or "").upper().strip()
-    found = []
-    try:
-        with db_conn() as c:
-            rows = c.execute(
-                "SELECT symbol FROM favorites WHERE grp='FOREX' ORDER BY symbol"
-            ).fetchall()
-        for row in rows:
-            symbol = str(row["symbol"] or "").upper().strip()
-            s = normalize_pair_symbol(symbol)
-            if len(s) >= 6 and currency in (s[:3], s[3:6]):
-                found.append(symbol)
-    except Exception as e:
-        print("news reaction saved-pairs error", e)
-    return found[:max_items]
+# -------------------------------------------------
+# POST-NEWS MARKET REACTION — 15 MIN / 30 MIN
+# -------------------------------------------------
+# This is INFORMATION ONLY. It does not create or block a trading signal.
+#
+# EdoSignal judges how the affected CURRENCY actually moved after the release,
+# rather than trying to label the economic number itself bullish or bearish.
+#
+# A small basket of FX crosses is used for each currency. Pair moves are
+# direction-normalised so, for example:
+#   EUR/USD up  -> EUR strength
+#   USD/CAD up  -> CAD weakness (therefore inverted for CAD)
+#
+# The reading stays MIXED / LITTLE MOVE unless the basket has a clear majority
+# and a meaningful median move. This is intentionally conservative.
+
+NEWS_REACTION_BASKETS = {
+    "EUR": [("EUR/USD",  1), ("EUR/GBP",  1), ("EUR/JPY",  1)],
+    "USD": [("EUR/USD", -1), ("GBP/USD", -1), ("USD/JPY",  1)],
+    "GBP": [("GBP/USD",  1), ("EUR/GBP", -1), ("GBP/JPY",  1)],
+    "AUD": [("AUD/USD",  1), ("AUD/JPY",  1), ("EUR/AUD", -1)],
+    "CAD": [("USD/CAD", -1), ("CAD/JPY",  1), ("EUR/CAD", -1)],
+    "CHF": [("USD/CHF", -1), ("EUR/CHF", -1), ("CHF/JPY",  1)],
+    "JPY": [("USD/JPY", -1), ("EUR/JPY", -1), ("GBP/JPY", -1)],
+    "NZD": [("NZD/USD",  1), ("NZD/JPY",  1), ("EUR/NZD", -1)],
+}
+
+NEWS_REACTION_MIN_MOVE_15 = 0.0005   # 0.05%
+NEWS_REACTION_MIN_MOVE_30 = 0.0008   # 0.08%
 
 
-def oriented_currency_move_pct(symbol, currency, event_dt_utc, stage_minutes):
-    """
-    Positive result means the event currency strengthened.
-    Negative means it weakened.
-    """
-    candles, err = get_ohlc(symbol, "15min", outputsize=40, grp="FOREX")
-    if err or not candles:
-        return None
-
-    closed = fully_closed_candles(candles, "15min")
-    if len(closed) < 2:
-        return None
-
-    event_dt_utc = event_dt_utc.astimezone(timezone.utc)
-    cutoff = event_dt_utc + timedelta(minutes=stage_minutes)
-
-    before = None
-    after = None
-
-    for c in closed:
+def _price_close_at_or_before(candles, target_utc):
+    """Return latest 1-minute candle close whose candle is fully closed by target_utc."""
+    best = None
+    for c in candles or []:
         start = parse_candle_utc(c.get("datetime", ""))
         if start is None:
             continue
-        end = start + timedelta(minutes=15)
-
-        if end <= event_dt_utc:
-            before = c
-        if end <= cutoff:
-            after = c
-
-    if before is None or after is None:
-        return None
-
-    before_close = float(before["close"])
-    after_close = float(after["close"])
-    if before_close <= 0:
-        return None
-
-    pair_move_pct = ((after_close - before_close) / before_close) * 100.0
-    s = normalize_pair_symbol(symbol)
-    if len(s) < 6:
-        return None
-
-    base, quote = s[:3], s[3:6]
-    if currency == base:
-        return pair_move_pct
-    if currency == quote:
-        return -pair_move_pct
-    return None
+        end = start + timedelta(minutes=1)
+        if end <= target_utc:
+            best = float(c["close"])
+        else:
+            break
+    return best
 
 
-def calculate_news_reaction(event_id, event_time_utc, currency, stage_minutes):
+def _news_currency_reaction(currency, event_dt, minutes_after):
     """
-    Actual market reaction across saved FX pairs.
+    Calculate the actual currency reaction from the release to +15m or +30m.
 
-    >= +0.03% average -> BULLISH
-    <= -0.03% average -> BEARISH
-    otherwise -> MIXED
+    Returns:
+      ("BULLISH" | "BEARISH" | "MIXED", median_signed_return)
+    or (None, None) if there is not enough market data yet.
     """
-    try:
-        event_dt = datetime.fromisoformat(event_time_utc)
-        if event_dt.tzinfo is None:
-            event_dt = event_dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return False
+    basket = NEWS_REACTION_BASKETS.get(str(currency).upper(), [])
+    if not basket:
+        return None, None
 
-    moves = []
-    for symbol in saved_fx_pairs_for_currency(currency, max_items=4):
-        move = oriented_currency_move_pct(
-            symbol, str(currency).upper(), event_dt, stage_minutes
-        )
-        if move is not None:
-            moves.append(move)
+    baseline_target = event_dt
+    target = event_dt + timedelta(minutes=int(minutes_after))
 
-    if not moves:
-        return False
+    signed_moves = []
 
-    avg_move = sum(moves) / len(moves)
-    positive = sum(1 for x in moves if x > 0)
-    negative = sum(1 for x in moves if x < 0)
+    for pair, direction in basket:
+        candles, error = get_ohlc(pair, "1min", outputsize=120, grp="FOREX")
+        if not candles:
+            continue
 
-    if avg_move >= 0.03 and positive >= negative:
-        reaction = "BULLISH"
-    elif avg_move <= -0.03 and negative >= positive:
-        reaction = "BEARISH"
+        before = _price_close_at_or_before(candles, baseline_target)
+        after = _price_close_at_or_before(candles, target)
+
+        if before is None or after is None or before == 0:
+            continue
+
+        raw_return = (after - before) / before
+        signed_moves.append(raw_return * direction)
+
+    # Require at least two usable crosses.
+    if len(signed_moves) < 2:
+        return None, None
+
+    signed_moves.sort()
+    n = len(signed_moves)
+    if n % 2:
+        median_move = signed_moves[n // 2]
     else:
-        reaction = "MIXED"
+        median_move = (signed_moves[n // 2 - 1] + signed_moves[n // 2]) / 2.0
+
+    threshold = (
+        NEWS_REACTION_MIN_MOVE_15
+        if int(minutes_after) <= 15
+        else NEWS_REACTION_MIN_MOVE_30
+    )
+
+    bullish_votes = sum(1 for x in signed_moves if x > 0)
+    bearish_votes = sum(1 for x in signed_moves if x < 0)
+
+    # Conservative majority requirement.
+    majority_needed = 2 if len(signed_moves) >= 3 else 2
+
+    if bullish_votes >= majority_needed and median_move >= threshold:
+        return "BULLISH", median_move
+
+    if bearish_votes >= majority_needed and median_move <= -threshold:
+        return "BEARISH", median_move
+
+    return "MIXED", median_move
+
+
+def _save_news_reaction(event_id, minutes_after, reaction, score):
+    column = "reaction_15" if int(minutes_after) == 15 else "reaction_30"
+    score_column = "score_15" if int(minutes_after) == 15 else "score_30"
 
     with db_conn() as c:
         c.execute(
-            """
-            INSERT INTO economic_news_reactions(
-                event_id,reaction,avg_move_pct,sample_count,stage_minutes,updated
-            )
-            VALUES(?,?,?,?,?,?)
+            f"""
+            INSERT INTO economic_news_reactions(event_id,{column},{score_column},updated)
+            VALUES(?,?,?,?)
             ON CONFLICT(event_id) DO UPDATE SET
-                reaction=excluded.reaction,
-                avg_move_pct=excluded.avg_move_pct,
-                sample_count=excluded.sample_count,
-                stage_minutes=excluded.stage_minutes,
+                {column}=excluded.{column},
+                {score_column}=excluded.{score_column},
                 updated=excluded.updated
             """,
-            (
-                event_id, reaction, avg_move, len(moves),
-                stage_minutes, datetime.utcnow().isoformat()
-            )
+            (event_id, reaction, score, datetime.utcnow().isoformat())
         )
         c.commit()
-
-    print("news reaction", currency, stage_minutes, reaction, avg_move, len(moves))
-    return True
 
 
 def economic_news_reaction_monitor():
     """
-    First reaction reading about 15 minutes after release.
-    Final update about 30 minutes after release.
+    After each HIGH-impact event:
+      +15 minutes -> first conservative reaction reading
+      +30 minutes -> stronger second reading
+
+    Events sharing the same currency and release time reuse one calculation,
+    so a rate decision + statement released together do not waste API credits.
     """
-    time.sleep(50)
+    time.sleep(45)
 
     while True:
         try:
-            if manual_api_priority_active():
-                time.sleep(20)
-                continue
-
             now_utc = datetime.now(timezone.utc)
 
             with db_conn() as c:
                 rows = c.execute(
                     """
                     SELECT n.event_id,n.event_time_utc,n.currency,
-                           COALESCE(r.stage_minutes,0) AS stage_minutes
+                           r.reaction_15,r.reaction_30
                     FROM economic_news n
-                    LEFT JOIN economic_news_reactions r ON r.event_id=n.event_id
+                    LEFT JOIN economic_news_reactions r
+                      ON r.event_id=n.event_id
                     WHERE n.event_time_utc <= ?
                       AND n.event_time_utc >= ?
                     ORDER BY n.event_time_utc ASC
@@ -1823,32 +1872,88 @@ def economic_news_reaction_monitor():
                     )
                 ).fetchall()
 
+            # Group identical currency + release-time events.
+            groups = {}
             for row in rows:
-                event_dt = datetime.fromisoformat(row["event_time_utc"])
+                key = (str(row["currency"]).upper(), row["event_time_utc"])
+                groups.setdefault(key, []).append(row)
+
+            for (currency, event_time_text), group_rows in groups.items():
+                event_dt = datetime.fromisoformat(event_time_text)
                 if event_dt.tzinfo is None:
                     event_dt = event_dt.replace(tzinfo=timezone.utc)
 
-                age_min = (now_utc - event_dt).total_seconds() / 60.0
-                stage = int(row["stage_minutes"] or 0)
+                age_minutes = (now_utc - event_dt).total_seconds() / 60.0
 
-                if age_min >= 15 and stage < 15:
-                    calculate_news_reaction(
-                        row["event_id"], row["event_time_utc"],
-                        row["currency"], 15
-                    )
-                elif age_min >= 30 and stage < 30:
-                    calculate_news_reaction(
-                        row["event_id"], row["event_time_utc"],
-                        row["currency"], 30
-                    )
+                need_15 = age_minutes >= 15 and any(not r["reaction_15"] for r in group_rows)
+                need_30 = age_minutes >= 30 and any(not r["reaction_30"] for r in group_rows)
 
-                time.sleep(4)
+                # One calculation is reused for every same-time event.
+                if need_15:
+                    reaction, score = _news_currency_reaction(currency, event_dt, 15)
+                    if reaction:
+                        for row in group_rows:
+                            if not row["reaction_15"]:
+                                _save_news_reaction(row["event_id"], 15, reaction, score)
+
+                if need_30:
+                    reaction, score = _news_currency_reaction(currency, event_dt, 30)
+                    if reaction:
+                        for row in group_rows:
+                            if not row["reaction_30"]:
+                                _save_news_reaction(row["event_id"], 30, reaction, score)
 
         except Exception as e:
             print("economic news reaction monitor error", e)
 
         time.sleep(60)
 
+
+def news_reaction_payload():
+    """Small DB-only payload used by the home page for live reaction badges."""
+    try:
+        with db_conn() as c:
+            rows = c.execute(
+                """
+                SELECT n.event_id,n.event_time_utc,n.currency,
+                       r.reaction_15,r.score_15,r.reaction_30,r.score_30
+                FROM economic_news n
+                LEFT JOIN economic_news_reactions r
+                  ON r.event_id=n.event_id
+                WHERE n.event_time_utc >= ?
+                ORDER BY n.event_time_utc ASC
+                """,
+                ((datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),)
+            ).fetchall()
+
+        result = {}
+        for row in rows:
+            r15 = row["reaction_15"]
+            r30 = row["reaction_30"]
+
+            status = "READING"
+            stage = ""
+            confirmed = False
+
+            if r30:
+                status = r30
+                stage = "30M"
+                confirmed = bool(r15 and r30 == r15 and r30 in ("BULLISH", "BEARISH"))
+            elif r15:
+                status = r15
+                stage = "15M"
+
+            result[row["event_id"]] = {
+                "status": status,
+                "stage": stage,
+                "confirmed": confirmed,
+            }
+
+        return result
+
+    except Exception as e:
+        print("news reaction payload error", e)
+        return {}
 
 
 def news_warning_level(minutes_until):
@@ -1920,16 +2025,16 @@ def cached_home_news(limit=6):
             rows = c.execute(
                 """
                 SELECT n.event_id,n.event_time_utc,n.currency,n.event_name,n.importance,
-                       COALESCE(r.reaction,'PENDING') AS reaction,
-                       r.avg_move_pct,r.sample_count,r.stage_minutes
+                       r.reaction_15,r.reaction_30
                 FROM economic_news n
-                LEFT JOIN economic_news_reactions r ON r.event_id=n.event_id
+                LEFT JOIN economic_news_reactions r
+                  ON r.event_id=n.event_id
                 WHERE n.event_time_utc >= ?
                 ORDER BY n.event_time_utc ASC
                 LIMIT ?
                 """,
                 (
-                    (now_utc - timedelta(minutes=75)).isoformat(),
+                    (now_utc - timedelta(minutes=30)).isoformat(),
                     int(limit),
                 ),
             ).fetchall()
@@ -1963,18 +2068,16 @@ def cached_home_news(limit=6):
             affected_pairs = saved_markets_for_news_currency(row["currency"])
 
             items.append({
+                "event_id": row["event_id"],
                 "currency": row["currency"],
                 "event_name": row["event_name"],
+                "reaction_15": row["reaction_15"],
+                "reaction_30": row["reaction_30"],
                 "perth_time": event_dt.astimezone(perth).strftime("%a %d %b • %H:%M"),
                 "countdown": countdown,
                 "level": news_warning_level(minutes_until),
                 "affected_pairs": affected_pairs,
                 "event_time_ms": int(event_dt.timestamp() * 1000),
-                "reaction": row["reaction"] or "PENDING",
-                "reaction_move_pct": row["avg_move_pct"],
-                "reaction_samples": row["sample_count"] or 0,
-                "reaction_stage": row["stage_minutes"] or 0,
-                "released": minutes_until <= 0,
             })
 
         except Exception:
@@ -2191,6 +2294,7 @@ def candle_colour(c):
 
 def interval_seconds(interval):
     mapping = {
+        "1min": 60,
         "1h": 60 * 60,
         "2h": 2 * 60 * 60,
         "4h": 4 * 60 * 60,
@@ -4840,6 +4944,11 @@ def monitor():
 
         time.sleep(CHECK_SECONDS)
 
+
+
+@APP.route('/news-reactions')
+def news_reactions_api():
+    return jsonify(news_reaction_payload())
 
 
 @APP.route('/refresh-news', methods=['POST'])
