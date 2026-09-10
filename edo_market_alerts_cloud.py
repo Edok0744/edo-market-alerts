@@ -478,6 +478,11 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
                     <span class="news-chip">{{ n['currency'] }}</span>{{ n['event_name'] }}
                 </div>
                 <div class="news-time">{{ n['perth_time'] }} Perth</div>
+                {% if n.get('affected_pairs') %}
+                <div class="news-time">
+                    Affects: {{ n['affected_pairs'] | join(', ') }}
+                </div>
+                {% endif %}
             </div>
             <div class="news-count {{ 'news-red' if n['level']=='red' else 'news-amber' if n['level']=='amber' else 'news-normal' }}">
                 {% if n['level']=='red' %}⚠ HOLD / WAIT<br>{% elif n['level']=='amber' %}⚠ NEWS SOON<br>{% endif %}
@@ -486,7 +491,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
         </div>
         {% endfor %}
         <div class="small" style="margin-top:8px">
-            Information only. EdoSignal does not block your setup; you decide whether to wait before entering.
+            Information only. EdoSignal does not block your setup. Use the affected-pair line to decide whether to hold a new entry before major news.
         </div>
     {% else %}
         <div class="small">No cached high-impact event is currently approaching for your saved markets.</div>
@@ -1347,6 +1352,52 @@ def news_warning_level(minutes_until):
     return "normal"
 
 
+
+def saved_markets_for_news_currency(currency, max_items=8):
+    """
+    Return saved markets affected by a given news currency.
+
+    Examples:
+      EUR -> EUR/CAD, EUR/USD, EUR/GBP ...
+      USD -> GBP/USD, AUD/USD, NAS100, SP500, BTCUSD ...
+    """
+    currency = str(currency).upper().strip()
+    affected = []
+
+    try:
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT symbol, grp FROM favorites "
+                "WHERE grp IN ('FOREX','CRYPTO','CFD') "
+                "ORDER BY grp,symbol"
+            ).fetchall()
+
+        for row in rows:
+            symbol = row["symbol"]
+            grp = row["grp"]
+            if currency in currencies_for_market(symbol, grp):
+                display_symbol = str(symbol).upper()
+                if grp == "FOREX":
+                    s = normalize_pair_symbol(display_symbol)
+                    if len(s) >= 6:
+                        display_symbol = f"{s[:3]}/{s[3:6]}"
+                affected.append(display_symbol)
+
+    except Exception as e:
+        print("affected news markets error", e)
+
+    # Deduplicate while preserving order.
+    seen = set()
+    unique = []
+    for item in affected:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+
+    return unique[:max_items]
+
+
+
 def cached_home_news(limit=6):
     """
     Read cached HIGH-impact Forex Factory events for the HOME page only.
@@ -1397,12 +1448,15 @@ def cached_home_news(limit=6):
             else:
                 countdown = f"in {minutes_until // (24*60)} day(s)"
 
+            affected_pairs = saved_markets_for_news_currency(row["currency"])
+
             items.append({
                 "currency": row["currency"],
                 "event_name": row["event_name"],
                 "perth_time": event_dt.astimezone(perth).strftime("%a %d %b • %H:%M"),
                 "countdown": countdown,
                 "level": news_warning_level(minutes_until),
+                "affected_pairs": affected_pairs,
             })
 
         except Exception:
