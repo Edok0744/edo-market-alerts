@@ -1,5 +1,6 @@
 import os, time, sqlite3, threading, json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, render_template_string, redirect
 import requests
 
@@ -890,8 +891,7 @@ a{text-decoration:none}
             <div class="pattern">
                 <div class="pattern-title neutral">No matching setup yet</div>
                 <div class="pattern-detail">
-                    No recent candle sequence matches your bounce/retest, 2+ candle trend-pullback,
-                    or range-reversal confirmation rules on this timeframe.
+                    No recent candle sequence matches your 2+ candle trend-pullback confirmation rule on this timeframe.
                 </div>
             </div>
         {% endif %}
@@ -989,6 +989,19 @@ def init_db():
             UNIQUE(symbol, interval, pattern_name, direction, confirmation_date)
         )
         ''')
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS pattern_daily_pushes(
+            grp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            signal_family TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            local_day TEXT NOT NULL,
+            pattern_name TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY(grp, symbol, signal_family, direction, local_day)
+        )
+        """)
+
         c.execute("""
         CREATE TABLE IF NOT EXISTS pattern_monitor_state(
             grp TEXT NOT NULL,
@@ -2379,17 +2392,17 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     confirmations = recent_confirmations(closed_candles, lookback=7)
 
     for conf in confirmations:
-        retest = detect_bounce_retest(closed_candles, conf)
-        if retest:
-            found.append(retest)
-
+        # Edo original trading rule:
+        # 2+ same-colour fully CLOSED pullback candles, then an opposite-colour
+        # fully CLOSED confirmation candle penetrating at least 50% through
+        # the BODY of the immediately previous candle.
         pullback = detect_trend_pullback(closed_candles, conf)
         if pullback:
             found.append(pullback)
 
-    # 8H, Daily and Weekly: also alert when the newest CLOSED candle is
-    # near an established support/resistance zone. This works regardless
-    # of whether the larger market is bullish, bearish or range-bound.
+    # 8H, Daily and Weekly: separate SUPPORT/RESISTANCE WATCH alerts.
+    # These are not trading-pattern signals and do not replace Edo's
+    # original 2+ candle + 50% confirmation rule.
     if interval in CORE_PATTERN_INTERVALS:
         found.extend(detect_support_resistance_signal(closed_candles))
 
@@ -2402,8 +2415,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = list(unique.values())
 
-    # Edo rule: on 4H, ONLY Trend Pullback is active.
-    # Bounce/Retest and Range Reversal stay 8H + 1D + 1W.
+    # Edo trading rule: Trend Pullback is the trading setup.
+    # Separate S/R reaction WATCH alerts are allowed on 8H + 1D + 1W.
     if interval not in CORE_PATTERN_INTERVALS:
         found = [
             p for p in found
@@ -2490,6 +2503,89 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
 
 
+
+def pattern_signal_family(p):
+    """
+    Group signals that mean the same thing to Edo so only one phone push
+    of that type is sent for the same pair/direction on the same Perth day.
+
+    In particular:
+      SUPPORT RETEST / BOUNCE WATCH
+      RESISTANCE RETEST / REJECTION WATCH
+      BOUNCE / RETEST SETUP
+    are one BOUNCE_RETEST family.
+    """
+    name = str(p.get("name", "")).upper()
+
+    if p.get("context") == "support_resistance":
+        return "SUPPORT_RESISTANCE_REACTION"
+    if "TREND PULLBACK" in name:
+        return "TREND_PULLBACK"
+    if "RANGE" in name and "REVERSAL" in name:
+        return "RANGE_REVERSAL"
+
+    return name.replace(" ", "_") or "OTHER"
+
+
+def pattern_push_priority(p):
+    """
+    If two equivalent signals are found on the same scan, prefer the stronger
+    confirmation so Edo receives one useful notification instead of two.
+    """
+    name = str(p.get("name", "")).upper()
+
+    if p.get("context") == "support_resistance":
+        return 20
+    if "TREND PULLBACK" in name:
+        return 20
+    if "RANGE" in name and "REVERSAL" in name:
+        return 20
+    return 10
+
+
+def perth_day_string():
+    try:
+        return datetime.now(ZoneInfo("Australia/Perth")).strftime("%Y-%m-%d")
+    except Exception:
+        # Perth is UTC+8 year-round; fallback only if timezone data is unavailable.
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def reserve_daily_pattern_push(grp, symbol, p):
+    """
+    Return True only for the FIRST signal of this family + direction + pair
+    on the current Perth calendar day. Persisted in SQLite, so a restart or
+    redeploy cannot create another same-day Pushover.
+    """
+    family = pattern_signal_family(p)
+    direction = str(p.get("direction", "")).lower()
+    local_day = perth_day_string()
+
+    try:
+        with db_conn() as c:
+            c.execute(
+                """
+                INSERT INTO pattern_daily_pushes(
+                    grp, symbol, signal_family, direction,
+                    local_day, pattern_name, sent_at
+                )
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                (
+                    grp,
+                    symbol,
+                    family,
+                    direction,
+                    local_day,
+                    p.get("name", ""),
+                    datetime.utcnow().isoformat(),
+                )
+            )
+            c.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
 def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, grp="FOREX"):
     """
     Persist the last processed CLOSED candle in SQLite so restarts/redeploys
@@ -2545,9 +2641,33 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
     tf_labels = {x["value"]: x["label"] for x in PATTERN_TIMEFRAMES}
     tf_label = tf_labels.get(interval, interval)
 
-    for p in patterns:
+    # First keep only the strongest signal in each equivalent signal family
+    # for this newest closed candle. This prevents e.g. SUPPORT BOUNCE WATCH
+    # and BOUNCE / RETEST SETUP both firing for the same USD/CHF reaction.
+    newest_patterns = [
+        p for p in patterns
+        if p.get("confirmation_date", "") == latest_closed_date
+    ]
+
+    best_by_family = {}
+    for p in newest_patterns:
+        family_key = (pattern_signal_family(p), str(p.get("direction", "")).lower())
+        current = best_by_family.get(family_key)
+        if current is None or pattern_push_priority(p) > pattern_push_priority(current):
+            best_by_family[family_key] = p
+
+    for p in best_by_family.values():
         confirmation_date = p.get("confirmation_date", "")
-        if not confirmation_date or confirmation_date != latest_closed_date:
+        if not confirmation_date:
+            continue
+
+        # Edo rule: once this pair has already produced this TYPE + DIRECTION
+        # of pattern Pushover today (Perth day), do not send it again today.
+        if not reserve_daily_pattern_push(grp, symbol, p):
+            print(
+                "daily pattern push suppressed",
+                grp, symbol, pattern_signal_family(p), p.get("direction"), perth_day_string()
+            )
             continue
 
         try:
@@ -2608,7 +2728,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     """
-    Collect raw Bounce/Retest, Trend Pullback, and Range Reversal setups from closed candles only.
+    Collect Edo Trend Pullback setups plus separate S/R WATCH alerts from fully closed candles only.
 
     Returns:
       setups, latest_closed_date, error
@@ -2628,10 +2748,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     found = []
 
     for conf in recent_confirmations(closed_candles, lookback=7):
-        retest = detect_bounce_retest(closed_candles, conf)
-        if retest:
-            found.append(retest)
-
+        # Edo original trading rule only. Bounce/Retest is NOT a trading signal.
         pullback = detect_trend_pullback(closed_candles, conf)
         if pullback:
             found.append(pullback)
