@@ -1,5 +1,5 @@
 import os, time, sqlite3, threading, json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, render_template_string, redirect
 import requests
@@ -10,6 +10,8 @@ DB = os.environ.get('EDO_DB', 'edo_market_alerts.db')
 TWELVE_KEY = os.environ.get('TWELVE_DATA_API_KEY', '')
 PUSHOVER_APP_TOKEN = os.environ.get('PUSHOVER_APP_TOKEN', '')
 PUSHOVER_USER_KEY = os.environ.get('PUSHOVER_USER_KEY', '')
+TRADING_ECONOMICS_API_KEY = os.environ.get('TRADING_ECONOMICS_API_KEY', '')
+NEWS_REFRESH_SECONDS = int(os.environ.get('NEWS_REFRESH_SECONDS', '1800'))
 CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 
 # -------------------------------------------------
@@ -362,6 +364,33 @@ h2{font-size:18px}
 }
 .fullbull{color:#35e28a}
 .fullbear{color:#ff6b7d}
+.news-card{
+    border:1px solid #294761;
+}
+.news-row{
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    padding:10px 0;
+    border-bottom:1px solid #1c3449;
+}
+.news-row:last-child{border-bottom:0}
+.news-left{min-width:0}
+.news-title{font-size:14px;font-weight:900}
+.news-time{font-size:12px;color:#9eb5c9;margin-top:3px}
+.news-count{font-size:12px;font-weight:900;white-space:nowrap;text-align:right}
+.news-red{color:#ff6b7d}
+.news-amber{color:#f2c94c}
+.news-normal{color:#8ca7bf}
+.news-chip{
+    display:inline-block;
+    padding:3px 7px;
+    border-radius:999px;
+    background:#1a3045;
+    margin-right:6px;
+    font-size:11px;
+    font-weight:900;
+}
 .trendbtn{background:#5dade2;color:#07111f}
 .livebtn{background:#f2c94c;color:#07111f}
 .trend-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-top:12px}
@@ -431,6 +460,39 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 </button>
 </form>
 
+</div>
+
+
+<div class="card news-card">
+<h2>📰 High-Impact News</h2>
+
+{% if news_configured %}
+    {% if news_items %}
+        {% for n in news_items %}
+        <div class="news-row">
+            <div class="news-left">
+                <div class="news-title">
+                    <span class="news-chip">{{ n['currency'] }}</span>{{ n['event_name'] }}
+                </div>
+                <div class="news-time">{{ n['perth_time'] }} Perth</div>
+            </div>
+            <div class="news-count {{ 'news-red' if n['level']=='red' else 'news-amber' if n['level']=='amber' else 'news-normal' }}">
+                {% if n['level']=='red' %}⚠ HOLD / WAIT<br>{% elif n['level']=='amber' %}⚠ NEWS SOON<br>{% endif %}
+                {{ n['countdown'] }}
+            </div>
+        </div>
+        {% endfor %}
+        <div class="small" style="margin-top:8px">
+            Information only. EdoSignal does not block your setup; you decide whether to wait before entering.
+        </div>
+    {% else %}
+        <div class="small">No cached high-impact event is currently approaching for your saved markets.</div>
+    {% endif %}
+{% else %}
+    <div class="small">
+        📰 News calendar is ready but not connected yet. Add TRADING_ECONOMICS_API_KEY in Railway.
+    </div>
+{% endif %}
 </div>
 
 
@@ -990,6 +1052,18 @@ def init_db():
         )
         ''')
         c.execute("""
+        CREATE TABLE IF NOT EXISTS pair_daily_pushes(
+            grp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            local_day TEXT NOT NULL,
+            signal_name TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY(grp, symbol, local_day)
+        )
+        """)
+
+        c.execute("""
         CREATE TABLE IF NOT EXISTS pattern_daily_pushes(
             grp TEXT NOT NULL,
             symbol TEXT NOT NULL,
@@ -1027,6 +1101,24 @@ def init_db():
         """)
 
         c.execute("""
+        CREATE TABLE IF NOT EXISTS economic_news(
+            event_id TEXT PRIMARY KEY,
+            event_time_utc TEXT NOT NULL,
+            country TEXT,
+            currency TEXT,
+            event_name TEXT NOT NULL,
+            category TEXT,
+            importance INTEGER NOT NULL DEFAULT 3,
+            fetched_at TEXT NOT NULL
+        )
+        """)
+
+        c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_economic_news_time
+        ON economic_news(event_time_utc)
+        """)
+
+        c.execute("""
         CREATE TABLE IF NOT EXISTS weekly_spike_state(
             grp TEXT NOT NULL,
             symbol TEXT NOT NULL,
@@ -1056,6 +1148,338 @@ def reset_old_signal_history():
         c.execute("DELETE FROM trend_status")
         c.execute("DELETE FROM pattern_notifications")
         c.commit()
+
+
+
+# -------------------------------------------------
+# HIGH-IMPACT ECONOMIC NEWS CALENDAR
+# -------------------------------------------------
+# This is INFORMATION ONLY. It never cancels or creates a trading setup.
+# Edo decides whether to hold an entry around important scheduled news.
+#
+# Data source: Trading Economics Economic Calendar.
+# Configure on Railway:
+#   TRADING_ECONOMICS_API_KEY = your Trading Economics API key
+#
+# The HOME page NEVER calls this API. A background thread refreshes the
+# calendar and stores it in SQLite so opening EdoSignal stays fast.
+
+CURRENCY_COUNTRY = {
+    "USD": "united states",
+    "EUR": "euro area",
+    "GBP": "united kingdom",
+    "AUD": "australia",
+    "NZD": "new zealand",
+    "CAD": "canada",
+    "CHF": "switzerland",
+    "JPY": "japan",
+    "CNY": "china",
+    "CNH": "china",
+}
+
+COUNTRY_CURRENCY = {
+    "united states": "USD",
+    "euro area": "EUR",
+    "united kingdom": "GBP",
+    "australia": "AUD",
+    "new zealand": "NZD",
+    "canada": "CAD",
+    "switzerland": "CHF",
+    "japan": "JPY",
+    "china": "CNY",
+}
+
+CFD_NEWS_CURRENCY = {
+    "SP500": "USD", "US500": "USD", "SPX500": "USD", "GSPC": "USD",
+    "DJ30": "USD", "US30": "USD", "DOW30": "USD", "DJI": "USD",
+    "NAS100": "USD", "US100": "USD", "NASDAQ100": "USD", "USTEC": "USD", "NDX": "USD",
+    "DAX": "EUR", "DE40": "EUR", "GER40": "EUR",
+    "FTSE": "GBP", "UK100": "GBP",
+    "N225": "JPY", "JPN225": "JPY",
+    "STOXX50E": "EUR", "EU50": "EUR",
+}
+
+MAJOR_NEWS_KEYWORDS = (
+    "non farm payroll", "nonfarm payroll", "nfp",
+    "employment change", "unemployment rate",
+    "consumer price", "cpi", "inflation rate",
+    "interest rate", "rate decision", "fomc",
+    "federal reserve", "ecb", "bank of england",
+    "bank of japan", "reserve bank", "snb",
+    "pce", "gross domestic product", "gdp",
+    "retail sales", "ism", "pmi",
+)
+
+
+def normalize_pair_symbol(symbol):
+    return "".join(ch for ch in str(symbol).upper() if ch.isalpha())
+
+
+def currencies_for_market(symbol, grp):
+    """
+    Return currencies whose HIGH-impact news is relevant to this saved market.
+    """
+    s = normalize_pair_symbol(symbol)
+
+    if grp == "FOREX":
+        if len(s) >= 6:
+            return {s[:3], s[3:6]}
+        return set()
+
+    if grp == "CFD":
+        ccy = CFD_NEWS_CURRENCY.get(s)
+        return {ccy} if ccy else set()
+
+    # Crypto pairs quoted in USD/USDT can still be sensitive to major USD news.
+    if grp == "CRYPTO":
+        if s.endswith("USD") or s.endswith("USDT"):
+            return {"USD"}
+
+    return set()
+
+
+def relevant_news_currencies_from_favorites():
+    currencies = set()
+    try:
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT symbol, grp FROM favorites "
+                "WHERE grp IN ('FOREX','CRYPTO','CFD')"
+            ).fetchall()
+        for row in rows:
+            currencies.update(currencies_for_market(row["symbol"], row["grp"]))
+    except Exception as e:
+        print("news favorites error", e)
+
+    # If nothing is saved yet, still cover the main currencies.
+    if not currencies:
+        currencies = {"USD", "EUR", "GBP", "AUD", "CAD", "CHF", "JPY", "NZD"}
+
+    return currencies
+
+
+def parse_te_event_time(value):
+    """
+    Trading Economics calendar Date is treated as UTC and converted later
+    to Perth time for display.
+    """
+    if not value:
+        return None
+
+    try:
+        raw = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def refresh_economic_news():
+    """
+    Refresh HIGH-impact events for currencies used by saved markets.
+    One compact API request is used where possible.
+    """
+    if not TRADING_ECONOMICS_API_KEY:
+        return False, "Trading Economics API key is not configured."
+
+    currencies = relevant_news_currencies_from_favorites()
+    countries = sorted({
+        CURRENCY_COUNTRY[c]
+        for c in currencies
+        if c in CURRENCY_COUNTRY
+    })
+
+    if not countries:
+        return False, "No supported news currencies are currently required."
+
+    now_utc = datetime.now(timezone.utc)
+    start_date = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
+    end_date = (now_utc + timedelta(days=3)).strftime("%Y-%m-%d")
+
+    country_path = requests.utils.quote(",".join(countries), safe=",")
+
+    url = (
+        f"https://api.tradingeconomics.com/calendar/country/"
+        f"{country_path}/{start_date}/{end_date}"
+    )
+
+    try:
+        r = requests.get(
+            url,
+            params={
+                "c": TRADING_ECONOMICS_API_KEY,
+                "importance": 3,
+                "f": "json",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        if not isinstance(data, list):
+            return False, "Economic calendar returned no usable event list."
+
+        fetched = datetime.utcnow().isoformat()
+        rows = []
+
+        for item in data:
+            try:
+                importance = int(item.get("Importance") or 0)
+            except Exception:
+                importance = 0
+
+            if importance != 3:
+                continue
+
+            country = str(item.get("Country") or "").strip()
+            country_key = country.lower()
+            currency = COUNTRY_CURRENCY.get(country_key, "")
+
+            if not currency or currency not in currencies:
+                continue
+
+            event_name = str(
+                item.get("Event")
+                or item.get("Category")
+                or "High-impact economic event"
+            ).strip()
+
+            event_dt = parse_te_event_time(item.get("Date"))
+            if event_dt is None:
+                continue
+
+            # Keep a small window of recently passed events and upcoming events.
+            if event_dt < now_utc - timedelta(hours=2):
+                continue
+
+            event_id = str(
+                item.get("CalendarId")
+                or f"{country}|{event_name}|{event_dt.isoformat()}"
+            )
+
+            rows.append((
+                event_id,
+                event_dt.isoformat(),
+                country,
+                currency,
+                event_name,
+                str(item.get("Category") or ""),
+                importance,
+                fetched,
+            ))
+
+        with db_conn() as c:
+            # Replace the short-lived cache atomically.
+            c.execute("DELETE FROM economic_news")
+            c.executemany(
+                """
+                INSERT OR REPLACE INTO economic_news(
+                    event_id,event_time_utc,country,currency,event_name,
+                    category,importance,fetched_at
+                )
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                rows,
+            )
+            c.commit()
+
+        return True, None
+
+    except Exception as e:
+        print("economic news refresh error", e)
+        return False, str(e)
+
+
+def economic_news_monitor():
+    """
+    Background-only news refresh.
+    It does not consume Twelve Data credits and does not block the HOME page.
+    """
+    time.sleep(20)
+
+    while True:
+        try:
+            refresh_economic_news()
+        except Exception as e:
+            print("economic news monitor error", e)
+
+        time.sleep(max(300, NEWS_REFRESH_SECONDS))
+
+
+def news_warning_level(minutes_until):
+    if minutes_until < -60:
+        return "past"
+    if minutes_until <= 60:
+        return "red"
+    if minutes_until <= 240:
+        return "amber"
+    return "normal"
+
+
+def cached_home_news(limit=6):
+    """
+    Read cached high-impact news for the HOME page only.
+    No external API calls are made here.
+    """
+    now_utc = datetime.now(timezone.utc)
+    perth = ZoneInfo("Australia/Perth")
+
+    try:
+        with db_conn() as c:
+            rows = c.execute(
+                """
+                SELECT event_time_utc,country,currency,event_name,importance
+                FROM economic_news
+                WHERE event_time_utc >= ?
+                ORDER BY event_time_utc ASC
+                LIMIT ?
+                """,
+                (
+                    (now_utc - timedelta(minutes=30)).isoformat(),
+                    int(limit),
+                ),
+            ).fetchall()
+    except Exception as e:
+        print("home news cache error", e)
+        return []
+
+    items = []
+
+    for row in rows:
+        try:
+            event_dt = datetime.fromisoformat(row["event_time_utc"])
+            if event_dt.tzinfo is None:
+                event_dt = event_dt.replace(tzinfo=timezone.utc)
+
+            minutes_until = int(
+                (event_dt.astimezone(timezone.utc) - now_utc).total_seconds() / 60
+            )
+
+            if minutes_until < 0:
+                countdown = "NOW / just released"
+            elif minutes_until < 60:
+                countdown = f"in {minutes_until} min"
+            elif minutes_until < 24 * 60:
+                h = minutes_until // 60
+                m = minutes_until % 60
+                countdown = f"in {h}h {m:02d}m"
+            else:
+                countdown = f"in {minutes_until // (24*60)} day(s)"
+
+            items.append({
+                "currency": row["currency"],
+                "event_name": row["event_name"],
+                "perth_time": event_dt.astimezone(perth).strftime("%a %d %b • %H:%M"),
+                "countdown": countdown,
+                "level": news_warning_level(minutes_until),
+            })
+
+        except Exception:
+            continue
+
+    return items
 
 
 def send_push(title, msg):
@@ -2293,31 +2717,39 @@ def weekly_spike_monitor():
 
 
 
-def strong_higher_timeframe_trend_for_4h(symbol, grp="FOREX"):
+def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
     """
-    4H Trend Pullback filter:
-    the latest fully CLOSED 8H + 12H + Daily candles must all agree.
+    Edo strong-trend filter using CLOSED higher-timeframe candles only.
 
-    This is still pure candlestick direction / price action:
-      Bullish = close > open
-      Bearish = close < open
+    4H continuation setup:
+      require 8H + 12H + 1D all aligned with the setup direction.
 
-    Weekly is not required for this 4H filter.
+    8H continuation setup:
+      require 12H + 1D + 1W all aligned with the setup direction.
+
+    Daily and Weekly Trend Pullback patterns are NOT blocked by this filter.
+    No indicators are used; Bullish = close > open, Bearish = close < open.
     """
-    checks = [("8H", "8h"), ("12H", "12h"), ("1D", "1day")]
+    if interval == "4h":
+        checks = [("8H", "8h"), ("12H", "12h"), ("1D", "1day")]
+    elif interval == "8h":
+        checks = [("12H", "12h"), ("1D", "1day"), ("1W", "1week")]
+    else:
+        return None, {}, None
+
     states = {}
 
-    for label, interval in checks:
-        if interval == "12h":
-            candles, err = get_candles(symbol, "12h", outputsize=4, grp=grp)
+    for label, tf_interval in checks:
+        if tf_interval == "12h":
+            candles, err = get_candles(symbol, "12h", outputsize=6, grp=grp)
             if err:
                 return None, states, err
             closed = last_closed_candle(candles)
         else:
-            candles, err = get_ohlc(symbol, interval, outputsize=50, grp=grp)
+            candles, err = get_ohlc(symbol, tf_interval, outputsize=60, grp=grp)
             if err:
                 return None, states, err
-            closed_list = fully_closed_candles(candles, interval)
+            closed_list = fully_closed_candles(candles, tf_interval)
             closed = closed_list[-1] if closed_list else None
 
         if closed is None:
@@ -2325,26 +2757,32 @@ def strong_higher_timeframe_trend_for_4h(symbol, grp="FOREX"):
 
         states[label] = analyse_candle(closed)
 
-    if all(states[x] == "Bullish" for x in ("8H", "12H", "1D")):
+    labels = [label for label, _ in checks]
+
+    if all(states[x] == "Bullish" for x in labels):
         return "bullish", states, None
-    if all(states[x] == "Bearish" for x in ("8H", "12H", "1D")):
+    if all(states[x] == "Bearish" for x in labels):
         return "bearish", states, None
 
     return None, states, None
 
 
-def apply_4h_strong_trend_filter(symbol, grp, interval, setups):
+def apply_strong_trend_filter(symbol, grp, interval, setups):
     """
-    Only 4H is filtered:
-      bullish 4H Trend Pullback -> 8H+12H+1D all Bullish
-      bearish 4H Trend Pullback -> 8H+12H+1D all Bearish
+    4H and 8H Trend Pullback signals are continuation-only signals.
 
-    8H, Daily and Weekly setups are left unchanged.
+    A bullish setup is allowed only when all required CLOSED higher
+    timeframes are Bullish. A bearish setup is allowed only when they
+    are all Bearish.
+
+    Daily and Weekly setups remain unrestricted by this strong-trend filter.
     """
-    if interval != "4h":
+    if interval not in ("4h", "8h"):
         return setups, None, None
 
-    higher_direction, states, error = strong_higher_timeframe_trend_for_4h(symbol, grp)
+    higher_direction, states, error = strong_higher_timeframe_trend(
+        symbol, grp, interval
+    )
     if error:
         return [], states, error
 
@@ -2353,10 +2791,12 @@ def apply_4h_strong_trend_filter(symbol, grp, interval, setups):
 
     filtered = []
     for p in setups:
-        if (
-            p.get("name") == "TREND PULLBACK SETUP"
-            and p.get("direction") == higher_direction
-        ):
+        if p.get("name") != "TREND PULLBACK SETUP":
+            # Keep non-trading WATCH alerts separate.
+            filtered.append(p)
+            continue
+
+        if p.get("direction") == higher_direction:
             p = dict(p)
             p["higher_tf_filter"] = True
             p["higher_tf_direction"] = higher_direction
@@ -2364,6 +2804,159 @@ def apply_4h_strong_trend_filter(symbol, grp, interval, setups):
             filtered.append(p)
 
     return filtered, states, None
+
+
+def confirmation_room_filter(candles, setup, interval):
+    """
+    Edo's 'do not chase the confirmation candle into S/R' filter.
+
+    Applied ONLY to 4H and 8H Trend Pullback trading signals.
+
+    The original setup still requires:
+      2+ same-colour retracement candles
+      opposite-colour CLOSED confirmation
+      >= 50% penetration through the previous candle BODY
+
+    This extra filter REJECTS the trade signal when the confirmation candle
+    has already travelled too far and closes at/very near the next important
+    historical swing level in the continuation direction.
+
+    It also flags an unusually oversized confirmation body as an extra reason
+    when that candle is already pressing into the historical level.
+    """
+    if interval not in ("4h", "8h"):
+        return True, None
+
+    if setup.get("name") != "TREND PULLBACK SETUP":
+        return True, None
+
+    i = None
+    confirmation_date = setup.get("confirmation_date", "")
+    for idx, c in enumerate(candles):
+        if c.get("datetime", "") == confirmation_date:
+            i = idx
+            break
+
+    if i is None or i < 10:
+        return True, None
+
+    run_count = int(setup.get("run_count", 2))
+    run_start = max(0, i - run_count)
+    direction = setup.get("direction")
+    confirm = candles[i]
+    confirm_close = float(confirm["close"])
+    confirm_body = abs(float(confirm["close"]) - float(confirm["open"]))
+
+    # Use only history BEFORE the retracement started to find the old level.
+    history = candles[max(0, run_start - 70):run_start]
+    if len(history) < 8:
+        return True, None
+
+    recent_before = candles[max(0, run_start - 24):run_start]
+    ranges = [
+        max(0.0, float(c["high"]) - float(c["low"]))
+        for c in recent_before
+    ]
+    bodies = [
+        abs(float(c["close"]) - float(c["open"]))
+        for c in recent_before
+    ]
+
+    positive_ranges = sorted(x for x in ranges if x > 0)
+    positive_bodies = sorted(x for x in bodies if x > 0)
+
+    if not positive_ranges:
+        return True, None
+
+    med_range = positive_ranges[len(positive_ranges)//2]
+    med_body = (
+        positive_bodies[len(positive_bodies)//2]
+        if positive_bodies else med_range * 0.5
+    )
+
+    # The 'near level' zone is deliberately fairly tight: we only reject
+    # when the confirmation is effectively arriving at the old turning point.
+    near_tol = med_range * 0.35
+
+    if direction == "bullish":
+        pts = swing_points(history, "high")
+        if not pts:
+            return True, None
+
+        levels = sorted(float(v) for _, v in pts if float(v) > float(candles[run_start]["low"]))
+        if not levels:
+            return True, None
+
+        # Nearest historical resistance at/above the confirmation close,
+        # otherwise the closest resistance just crossed by the candle.
+        above = [v for v in levels if v >= confirm_close]
+        level = min(above) if above else max(levels)
+
+        distance = level - confirm_close
+        at_or_near = abs(distance) <= near_tol or confirm_close >= level
+        oversized = med_body > 0 and confirm_body >= med_body * 1.8
+
+        if at_or_near:
+            reason = (
+                f"REJECTED: bullish confirmation moved too far and closed at/near "
+                f"historical resistance {level:.5f}. "
+                f"Confirmation close {confirm_close:.5f}; "
+                f"only {abs(distance):.5f} room remained."
+            )
+            if oversized:
+                reason += " Confirmation body was also unusually large."
+            return False, reason
+
+    elif direction == "bearish":
+        pts = swing_points(history, "low")
+        if not pts:
+            return True, None
+
+        levels = sorted(float(v) for _, v in pts if float(v) < float(candles[run_start]["high"]))
+        if not levels:
+            return True, None
+
+        below = [v for v in levels if v <= confirm_close]
+        level = max(below) if below else min(levels)
+
+        distance = confirm_close - level
+        at_or_near = abs(distance) <= near_tol or confirm_close <= level
+        oversized = med_body > 0 and confirm_body >= med_body * 1.8
+
+        if at_or_near:
+            reason = (
+                f"REJECTED: bearish confirmation moved too far and closed at/near "
+                f"historical support {level:.5f}. "
+                f"Confirmation close {confirm_close:.5f}; "
+                f"only {abs(distance):.5f} room remained."
+            )
+            if oversized:
+                reason += " Confirmation body was also unusually large."
+            return False, reason
+
+    return True, None
+
+
+def apply_confirmation_room_filter(candles, interval, setups):
+    """
+    Remove overextended 4H/8H trading signals from notification eligibility,
+    while keeping the rejection reason so the manual Signal page can explain
+    exactly what Edo does not like about the setup.
+    """
+    accepted = []
+    rejected = []
+
+    for p in setups:
+        ok, reason = confirmation_room_filter(candles, p, interval)
+        if ok:
+            accepted.append(p)
+        else:
+            rp = dict(p)
+            rp["rejected"] = True
+            rp["rejection_reason"] = reason
+            rejected.append(rp)
+
+    return accepted, rejected
 
 
 def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
@@ -2423,14 +3016,20 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             if p.get("name") == "TREND PULLBACK SETUP"
         ]
 
-    # 4H signals require strong higher-timeframe alignment.
+    # 4H and 8H continuation signals require strong higher-timeframe alignment.
     higher_tf_states = None
-    if interval == "4h":
-        found, higher_tf_states, htf_error = apply_4h_strong_trend_filter(
+    if interval in ("4h", "8h"):
+        found, higher_tf_states, htf_error = apply_strong_trend_filter(
             symbol, grp, interval, found
         )
         if htf_error:
             return None, htf_error
+
+    # Edo filter: do not chase a valid 4H/8H confirmation candle if it has
+    # already shot into the next important historical S/R level.
+    found, rejected_room_setups = apply_confirmation_room_filter(
+        closed_candles, interval, found
+    )
 
     found.sort(
         key=lambda p: (
@@ -2473,11 +3072,20 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                 "The most recent older valid trigger is shown below for reference."
             )
         else:
-            if interval == "4h" and higher_tf_states:
+            if rejected_room_setups:
+                summary = rejected_room_setups[0].get(
+                    "rejection_reason",
+                    "Pattern detected, but rejected because the confirmation candle moved too far into historical support/resistance."
+                )
+            elif interval in ("4h", "8h") and higher_tf_states:
                 state_text = " | ".join(f"{k} {v}" for k, v in higher_tf_states.items())
+                if interval == "4h":
+                    rule_text = "8H + 12H + 1D"
+                else:
+                    rule_text = "12H + 1D + 1W"
                 summary = (
-                    "No 4H setup passed the strong higher-timeframe filter. "
-                    "For a 4H alert, 8H + 12H + 1D must all agree with the setup direction. "
+                    f"No {interval.upper()} setup passed the strong higher-timeframe filter. "
+                    f"For this alert, {rule_text} must all agree with the setup direction. "
                     f"Current higher-timeframe state: {state_text}."
                 )
             else:
@@ -2495,6 +3103,11 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         "signal_css": css,
         "summary": summary,
         "patterns": [describe_setup(p) for p in found[:4]],
+        "rejected_setups": [
+            p.get("rejection_reason", "")
+            for p in rejected_room_setups[:3]
+            if p.get("rejection_reason")
+        ],
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -2553,31 +3166,33 @@ def perth_day_string():
 
 def reserve_daily_pattern_push(grp, symbol, p):
     """
-    Return True only for the FIRST signal of this family + direction + pair
-    on the current Perth calendar day. Persisted in SQLite, so a restart or
-    redeploy cannot create another same-day Pushover.
+    Edo rule:
+      ONE automatic pattern/watch Pushover per market pair per Perth day.
+
+    Example:
+      if GBP/USD already sent any Trend Pullback or S/R Watch today,
+      no second automatic pattern/watch Pushover for GBP/USD is sent today.
+
+    Signal type and direction do NOT matter for the daily limit.
+    The limit is persisted in SQLite, so restart/redeploy does not reset it.
     """
-    family = pattern_signal_family(p)
-    direction = str(p.get("direction", "")).lower()
     local_day = perth_day_string()
 
     try:
         with db_conn() as c:
             c.execute(
                 """
-                INSERT INTO pattern_daily_pushes(
-                    grp, symbol, signal_family, direction,
-                    local_day, pattern_name, sent_at
+                INSERT INTO pair_daily_pushes(
+                    grp, symbol, local_day, signal_name, direction, sent_at
                 )
-                VALUES(?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?)
                 """,
                 (
                     grp,
                     symbol,
-                    family,
-                    direction,
                     local_day,
                     p.get("name", ""),
+                    str(p.get("direction", "")),
                     datetime.utcnow().isoformat(),
                 )
             )
@@ -2585,6 +3200,7 @@ def reserve_daily_pattern_push(grp, symbol, p):
         return True
     except sqlite3.IntegrityError:
         return False
+
 
 def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, grp="FOREX"):
     """
@@ -2661,12 +3277,12 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         if not confirmation_date:
             continue
 
-        # Edo rule: once this pair has already produced this TYPE + DIRECTION
-        # of pattern Pushover today (Perth day), do not send it again today.
+        # Edo rule: once this pair has produced ANY automatic pattern/watch
+        # Pushover today (Perth day), do not send another for this pair today.
         if not reserve_daily_pattern_push(grp, symbol, p):
             print(
-                "daily pattern push suppressed",
-                grp, symbol, pattern_signal_family(p), p.get("direction"), perth_day_string()
+                "daily pair push suppressed",
+                grp, symbol, p.get("name"), p.get("direction"), perth_day_string()
             )
             continue
 
@@ -2772,14 +3388,25 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             if p.get("name") == "TREND PULLBACK SETUP"
         ]
 
-    # 4H only: require 8H + 12H + 1D alignment.
-    # 8H, Daily and Weekly remain unrestricted.
-    if interval == "4h":
-        setups, higher_tf_states, htf_error = apply_4h_strong_trend_filter(
+    # 4H and 8H are continuation-only: require strong higher-timeframe alignment.
+    # Daily and Weekly Trend Pullback patterns remain unrestricted.
+    if interval in ("4h", "8h"):
+        setups, higher_tf_states, htf_error = apply_strong_trend_filter(
             symbol, grp, interval, setups
         )
         if htf_error:
             return None, latest_closed_date, htf_error
+
+    # Reject overextended 4H/8H confirmations that have already arrived at
+    # the next important historical S/R level. Rejected setups do NOT Push.
+    setups, rejected_room_setups = apply_confirmation_room_filter(
+        closed_candles, interval, setups
+    )
+    for rp in rejected_room_setups:
+        print(
+            "pattern rejected - confirmation too far into S/R",
+            symbol, interval, rp.get("rejection_reason", "")
+        )
 
     return setups, latest_closed_date, None
 
@@ -2789,7 +3416,7 @@ def pattern_signal_monitor():
     Grow-55 background pattern scheduler.
 
     Goal:
-      - get 4H/8H pattern notifications reasonably soon after a candle closes
+      - get 4H/8H strong-trend continuation notifications reasonably soon after a candle closes
       - keep Daily/Weekly current
       - NEVER crowd out manual Trend / Signal page requests
 
@@ -3642,6 +4269,10 @@ def home():
     selected_symbol = request.args.get('symbol', '')
     selected_group = request.args.get('group', 'FOREX')
 
+    # News comes from SQLite cache only, so HOME remains fast.
+    news_items = cached_home_news(limit=6)
+    news_configured = bool(TRADING_ECONOMICS_API_KEY)
+
     try:
         with db_conn() as c:
             markets = c.execute(
@@ -3701,7 +4332,9 @@ def home():
         selected_symbol=selected_symbol,
         selected_group=selected_group,
         trend_statuses=trend_statuses,
-        trend_snapshots=trend_snapshots
+        trend_snapshots=trend_snapshots,
+        news_items=news_items,
+        news_configured=news_configured
     )
 
 
@@ -4019,6 +4652,11 @@ threading.Thread(
 
 threading.Thread(
     target=weekly_spike_monitor,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=economic_news_monitor,
     daemon=True
 ).start()
 
