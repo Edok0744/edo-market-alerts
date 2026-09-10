@@ -2483,27 +2483,18 @@ def detect_support_resistance_signal(candles):
 
 def detect_trend_pullback(candles, conf, allow_sr_exception=False):
     """
-    Edo Trend Pullback rule.
+    Edo Trend Pullback rule — NO 50% penetration requirement.
 
     BEARISH trend / possible SELL:
-      1) Minimum 2 consecutive bullish candles pull upward.
-      2) Next candle is bearish.
-      3) That bearish candle must be FULLY CLOSED.
-      4) Its close must reach at least 50% DOWN through the BODY
-         of the immediately previous bullish candle.
-      5) If it closes less than 50% through that previous body,
-         the setup is INVALID and must NOT trigger.
+      1) Minimum 2 consecutive bullish fully CLOSED candles pull upward.
+      2) Next fully CLOSED candle is bearish.
+      3) No minimum body-penetration percentage is required.
 
     BULLISH trend / possible BUY:
-      1) Minimum 2 consecutive bearish candles pull downward.
-      2) Next candle is bullish.
-      3) That bullish candle must be FULLY CLOSED.
-      4) Its close must reach at least 50% UP through the BODY
-         of the immediately previous bearish candle.
-      5) If it closes less than 50% through that previous body,
-         the setup is INVALID and must NOT trigger.
+      1) Minimum 2 consecutive bearish fully CLOSED candles pull downward.
+      2) Next fully CLOSED candle is bullish.
+      3) No minimum body-penetration percentage is required.
 
-    Wicks do not count toward the 50% calculation; candle BODY only.
     No forming candle may trigger a signal.
     """
     i = conf["index"]
@@ -2512,69 +2503,34 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False):
 
     direction = conf["direction"]
     confirm_candle = candles[i]
-    prev = candles[i - 1]
-
-    prev_open = float(prev["open"])
-    prev_close = float(prev["close"])
     confirm_close = float(confirm_candle["close"])
 
-    prev_body_high = max(prev_open, prev_close)
-    prev_body_low = min(prev_open, prev_close)
-    prev_body_size = prev_body_high - prev_body_low
-
-    if prev_body_size <= 0:
-        return None
-
     if direction == "bearish":
-        # SELL setup: 2+ bullish pullback candles, then bearish confirmation.
         run_colour = "green"
         required_trend = "bearish"
         run_count, run_start = count_same_colour_before(candles, i, run_colour)
-
         if run_count < 2:
             return None
 
-        # 50% point measured downward through previous bullish body.
-        fifty_level = prev_body_high - (prev_body_size * 0.50)
-
-        # Bearish confirmation must close at or below the halfway point.
-        if confirm_close > fifty_level:
-            return None
-
-        penetration = ((prev_body_high - confirm_close) / prev_body_size) * 100.0
-
     elif direction == "bullish":
-        # BUY setup: 2+ bearish pullback candles, then bullish confirmation.
         run_colour = "red"
         required_trend = "bullish"
         run_count, run_start = count_same_colour_before(candles, i, run_colour)
-
         if run_count < 2:
             return None
-
-        # 50% point measured upward through previous bearish body.
-        fifty_level = prev_body_low + (prev_body_size * 0.50)
-
-        # Bullish confirmation must close at or above the halfway point.
-        if confirm_close < fifty_level:
-            return None
-
-        penetration = ((confirm_close - prev_body_low) / prev_body_size) * 100.0
 
     else:
         return None
 
     trend = local_structure_trend(candles, run_start)
 
-    # Normal rule: Trend Pullback must agree with established local trend.
-    # 8H / Daily may temporarily keep the candidate when the caller is
-    # evaluating Edo's SECOND S/R REACTION WITH GAP exception.
+    # Normal rule: setup direction must agree with established local structure.
+    # 8H / Daily may keep the candidate only while evaluating Edo's genuine
+    # SECOND S/R REACTION WITH GAP early/developing-trend exception.
     if trend != required_trend and not allow_sr_exception:
         return None
 
     score = 6.0 + min(3.0, (run_count - 2) * 0.75)
-    score += min(2.0, max(0.0, penetration - 50.0) / 25.0)
-
     target = previous_target(candles, direction, run_start)
 
     return {
@@ -2584,7 +2540,6 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False):
         "score": score,
         "confirmation_date": conf["date"],
         "confirmation_close": confirm_close,
-        "penetration": penetration,
         "run_count": run_count,
         "run_colour": run_colour,
         "run_dates": [
@@ -2596,16 +2551,13 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False):
         "normal_local_trend_ok": trend == required_trend,
         "context": "trend",
         "target": target,
-        "fifty_percent_level": fifty_level,
     }
-
-
 
 def sr_second_reaction_exception(candles, setup):
     """
     Edo 8H / Daily early-trend exception.
 
-    Allows the normal 2+ same-colour + >=50% BODY confirmation setup before a
+    Allows the normal 2+ same-colour + opposite-colour CLOSED confirmation setup before a
     strong trend is fully established ONLY when the SAME fully closed
     confirmation candle is also a genuine second separated reaction from an
     established historical S/R zone.
@@ -2613,7 +2565,7 @@ def sr_second_reaction_exception(candles, setup):
     Bullish setup -> second support retest/bounce with a real move-away gap.
     Bearish setup -> second resistance retest/rejection with a real move-away gap.
 
-    This does not create a signal by itself. The normal 2+ / 50% closed-candle
+    This does not create a signal by itself. The normal 2+ / opposite-colour closed-candle
     pattern must already be valid.
     """
     if not candles or not setup:
@@ -2647,12 +2599,12 @@ def apply_edo_8h_daily_context_rule(candles, interval, setups):
     8H:
       normal strong-trend continuation is allowed;
       OR the second separated S/R reaction exception may allow the normal
-      2+ / 50% setup before the trend has become strong.
+      2+ / opposite-colour setup before the trend has become strong.
 
     Daily:
       normal local-trend retracement is allowed;
       OR the same second separated S/R reaction exception may allow the
-      normal 2+ / 50% setup while a new trend is developing.
+      normal 2+ / opposite-colour setup while a new trend is developing.
 
     No forming candle can qualify.
     """
@@ -2743,8 +2695,7 @@ def describe_setup(p):
             f"{direction_word} trend-pullback confirmation on {p['confirmation_date']}. "
             f"{p['run_count']} {p['run_colour']} CLOSED candles pulled against the larger "
             f"{p['trend']} price structure, then the opposite-colour confirmation candle "
-            f"closed {p['penetration']:.0f}% through the BODY of the immediately previous "
-            f"pullback candle. Minimum required: 50%. "
+            f"fully CLOSED. No minimum body-penetration percentage is required. "
             f"Pullback candle times: {run_dates or 'n/a'}."
             f"{htf_text}"
         )
@@ -3181,7 +3132,7 @@ def confirmation_room_filter(candles, setup, interval):
     The original setup still requires:
       2+ same-colour retracement candles
       opposite-colour CLOSED confirmation
-      >= 50% penetration through the previous candle BODY
+      opposite-colour fully CLOSED confirmation candle
 
     This extra filter REJECTS the trade signal when the confirmation candle
     has already travelled too far and closes at/very near the next important
@@ -3353,7 +3304,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     for conf in confirmations:
         # Edo original trading rule:
         # 2+ same-colour fully CLOSED pullback candles, then an opposite-colour
-        # fully CLOSED confirmation candle penetrating at least 50% through
+        # fully CLOSED opposite-colour confirmation candle after
         # the BODY of the immediately previous candle.
         pullback = detect_trend_pullback(
             closed_candles,
@@ -3365,7 +3316,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     # 8H, Daily and Weekly: separate SUPPORT/RESISTANCE WATCH alerts.
     # These are not trading-pattern signals and do not replace Edo's
-    # original 2+ candle + 50% confirmation rule.
+    # original 2+ candle + opposite-colour closed confirmation rule.
     if interval in CORE_PATTERN_INTERVALS:
         found.extend(detect_support_resistance_signal(closed_candles))
 
@@ -3387,7 +3338,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         ]
 
     # 8H / Daily: allow Edo's second separated S/R reaction exception while
-    # a new trend is developing. The normal 2+ / >=50% closed-candle rule
+    # a new trend is developing. The normal 2+ / opposite-colour closed-candle rule
     # still has to pass first.
     found = apply_edo_8h_daily_context_rule(closed_candles, interval, found)
 
