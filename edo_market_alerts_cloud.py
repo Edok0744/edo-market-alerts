@@ -10,7 +10,10 @@ DB = os.environ.get('EDO_DB', 'edo_market_alerts.db')
 TWELVE_KEY = os.environ.get('TWELVE_DATA_API_KEY', '')
 PUSHOVER_APP_TOKEN = os.environ.get('PUSHOVER_APP_TOKEN', '')
 PUSHOVER_USER_KEY = os.environ.get('PUSHOVER_USER_KEY', '')
-TRADING_ECONOMICS_API_KEY = os.environ.get('TRADING_ECONOMICS_API_KEY', '')
+FOREX_FACTORY_CALENDAR_URL = os.environ.get(
+    'FOREX_FACTORY_CALENDAR_URL',
+    'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
+)
 NEWS_REFRESH_SECONDS = int(os.environ.get('NEWS_REFRESH_SECONDS', '1800'))
 CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 
@@ -490,7 +493,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
     {% endif %}
 {% else %}
     <div class="small">
-        📰 News calendar is ready but not connected yet. Add TRADING_ECONOMICS_API_KEY in Railway.
+        📰 Forex Factory calendar feed is enabled. Waiting for the next background refresh.
     </div>
 {% endif %}
 </div>
@@ -1152,42 +1155,17 @@ def reset_old_signal_history():
 
 
 # -------------------------------------------------
-# HIGH-IMPACT ECONOMIC NEWS CALENDAR
+# HIGH-IMPACT ECONOMIC NEWS CALENDAR — FOREX FACTORY
 # -------------------------------------------------
-# This is INFORMATION ONLY. It never cancels or creates a trading setup.
+# INFORMATION ONLY. It never cancels, creates, or changes a trading setup.
 # Edo decides whether to hold an entry around important scheduled news.
 #
-# Data source: Trading Economics Economic Calendar.
-# Configure on Railway:
-#   TRADING_ECONOMICS_API_KEY = your Trading Economics API key
+# Source:
+#   Forex Factory weekly JSON calendar export
 #
-# The HOME page NEVER calls this API. A background thread refreshes the
-# calendar and stores it in SQLite so opening EdoSignal stays fast.
-
-CURRENCY_COUNTRY = {
-    "USD": "united states",
-    "EUR": "euro area",
-    "GBP": "united kingdom",
-    "AUD": "australia",
-    "NZD": "new zealand",
-    "CAD": "canada",
-    "CHF": "switzerland",
-    "JPY": "japan",
-    "CNY": "china",
-    "CNH": "china",
-}
-
-COUNTRY_CURRENCY = {
-    "united states": "USD",
-    "euro area": "EUR",
-    "united kingdom": "GBP",
-    "australia": "AUD",
-    "new zealand": "NZD",
-    "canada": "CAD",
-    "switzerland": "CHF",
-    "japan": "JPY",
-    "china": "CNY",
-}
+# No API key is required.
+# The HOME page never downloads the feed directly. A background thread refreshes
+# the feed and stores HIGH-impact events in SQLite so EdoSignal stays fast.
 
 CFD_NEWS_CURRENCY = {
     "SP500": "USD", "US500": "USD", "SPX500": "USD", "GSPC": "USD",
@@ -1198,17 +1176,6 @@ CFD_NEWS_CURRENCY = {
     "N225": "JPY", "JPN225": "JPY",
     "STOXX50E": "EUR", "EU50": "EUR",
 }
-
-MAJOR_NEWS_KEYWORDS = (
-    "non farm payroll", "nonfarm payroll", "nfp",
-    "employment change", "unemployment rate",
-    "consumer price", "cpi", "inflation rate",
-    "interest rate", "rate decision", "fomc",
-    "federal reserve", "ecb", "bank of england",
-    "bank of japan", "reserve bank", "snb",
-    "pce", "gross domestic product", "gdp",
-    "retail sales", "ism", "pmi",
-)
 
 
 def normalize_pair_symbol(symbol):
@@ -1230,7 +1197,7 @@ def currencies_for_market(symbol, grp):
         ccy = CFD_NEWS_CURRENCY.get(s)
         return {ccy} if ccy else set()
 
-    # Crypto pairs quoted in USD/USDT can still be sensitive to major USD news.
+    # Major USD news can matter to crypto quoted against USD/USDT.
     if grp == "CRYPTO":
         if s.endswith("USD") or s.endswith("USDT"):
             return {"USD"}
@@ -1251,26 +1218,24 @@ def relevant_news_currencies_from_favorites():
     except Exception as e:
         print("news favorites error", e)
 
-    # If nothing is saved yet, still cover the main currencies.
     if not currencies:
         currencies = {"USD", "EUR", "GBP", "AUD", "CAD", "CHF", "JPY", "NZD"}
 
     return currencies
 
 
-def parse_te_event_time(value):
+def parse_ff_event_time(value):
     """
-    Trading Economics calendar Date is treated as UTC and converted later
-    to Perth time for display.
+    Forex Factory JSON dates include an explicit UTC offset.
+    Keep that offset, convert to UTC for storage, and later display in Perth.
     """
     if not value:
         return None
 
     try:
-        raw = str(value).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(raw)
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            return None
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
@@ -1278,40 +1243,18 @@ def parse_te_event_time(value):
 
 def refresh_economic_news():
     """
-    Refresh HIGH-impact events for currencies used by saved markets.
-    One compact API request is used where possible.
+    Refresh HIGH-impact Forex Factory events for currencies relevant to the
+    user's saved markets. No paid economic-calendar API is required.
     """
-    if not TRADING_ECONOMICS_API_KEY:
-        return False, "Trading Economics API key is not configured."
-
     currencies = relevant_news_currencies_from_favorites()
-    countries = sorted({
-        CURRENCY_COUNTRY[c]
-        for c in currencies
-        if c in CURRENCY_COUNTRY
-    })
-
-    if not countries:
-        return False, "No supported news currencies are currently required."
-
     now_utc = datetime.now(timezone.utc)
-    start_date = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
-    end_date = (now_utc + timedelta(days=3)).strftime("%Y-%m-%d")
-
-    country_path = requests.utils.quote(",".join(countries), safe=",")
-
-    url = (
-        f"https://api.tradingeconomics.com/calendar/country/"
-        f"{country_path}/{start_date}/{end_date}"
-    )
 
     try:
         r = requests.get(
-            url,
-            params={
-                "c": TRADING_ECONOMICS_API_KEY,
-                "importance": 3,
-                "f": "json",
+            FOREX_FACTORY_CALENDAR_URL,
+            headers={
+                "User-Agent": "Mozilla/5.0 EdoSignal/1.0",
+                "Accept": "application/json,text/plain,*/*",
             },
             timeout=15,
         )
@@ -1319,59 +1262,43 @@ def refresh_economic_news():
         data = r.json()
 
         if not isinstance(data, list):
-            return False, "Economic calendar returned no usable event list."
+            return False, "Forex Factory calendar returned no usable event list."
 
         fetched = datetime.utcnow().isoformat()
         rows = []
 
         for item in data:
-            try:
-                importance = int(item.get("Importance") or 0)
-            except Exception:
-                importance = 0
-
-            if importance != 3:
+            impact = str(item.get("impact") or "").strip().lower()
+            if impact != "high":
                 continue
 
-            country = str(item.get("Country") or "").strip()
-            country_key = country.lower()
-            currency = COUNTRY_CURRENCY.get(country_key, "")
-
-            if not currency or currency not in currencies:
+            currency = str(item.get("country") or "").strip().upper()
+            if currency not in currencies:
                 continue
 
-            event_name = str(
-                item.get("Event")
-                or item.get("Category")
-                or "High-impact economic event"
-            ).strip()
-
-            event_dt = parse_te_event_time(item.get("Date"))
+            event_name = str(item.get("title") or "High-impact economic event").strip()
+            event_dt = parse_ff_event_time(item.get("date"))
             if event_dt is None:
                 continue
 
-            # Keep a small window of recently passed events and upcoming events.
+            # Keep just-passed events briefly plus all upcoming events in this week.
             if event_dt < now_utc - timedelta(hours=2):
                 continue
 
-            event_id = str(
-                item.get("CalendarId")
-                or f"{country}|{event_name}|{event_dt.isoformat()}"
-            )
+            event_id = f"{currency}|{event_name}|{event_dt.isoformat()}"
 
             rows.append((
                 event_id,
                 event_dt.isoformat(),
-                country,
+                "",
                 currency,
                 event_name,
-                str(item.get("Category") or ""),
-                importance,
+                "Forex Factory High Impact",
+                3,
                 fetched,
             ))
 
         with db_conn() as c:
-            # Replace the short-lived cache atomically.
             c.execute("DELETE FROM economic_news")
             c.executemany(
                 """
@@ -1388,20 +1315,22 @@ def refresh_economic_news():
         return True, None
 
     except Exception as e:
-        print("economic news refresh error", e)
+        print("Forex Factory economic news refresh error", e)
         return False, str(e)
 
 
 def economic_news_monitor():
     """
-    Background-only news refresh.
-    It does not consume Twelve Data credits and does not block the HOME page.
+    Background-only Forex Factory calendar refresh.
+    This does not consume Twelve Data credits and never blocks the HOME page.
     """
     time.sleep(20)
 
     while True:
         try:
-            refresh_economic_news()
+            ok, error = refresh_economic_news()
+            if error:
+                print("Forex Factory news refresh:", error)
         except Exception as e:
             print("economic news monitor error", e)
 
@@ -1420,8 +1349,8 @@ def news_warning_level(minutes_until):
 
 def cached_home_news(limit=6):
     """
-    Read cached high-impact news for the HOME page only.
-    No external API calls are made here.
+    Read cached HIGH-impact Forex Factory events for the HOME page only.
+    No external web/API call is made in the home request.
     """
     now_utc = datetime.now(timezone.utc)
     perth = ZoneInfo("Australia/Perth")
@@ -1430,7 +1359,7 @@ def cached_home_news(limit=6):
         with db_conn() as c:
             rows = c.execute(
                 """
-                SELECT event_time_utc,country,currency,event_name,importance
+                SELECT event_time_utc,currency,event_name,importance
                 FROM economic_news
                 WHERE event_time_utc >= ?
                 ORDER BY event_time_utc ASC
@@ -1480,6 +1409,7 @@ def cached_home_news(limit=6):
             continue
 
     return items
+
 
 
 def send_push(title, msg):
@@ -4271,7 +4201,7 @@ def home():
 
     # News comes from SQLite cache only, so HOME remains fast.
     news_items = cached_home_news(limit=6)
-    news_configured = bool(TRADING_ECONOMICS_API_KEY)
+    news_configured = True
 
     try:
         with db_conn() as c:
