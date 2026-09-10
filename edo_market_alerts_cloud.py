@@ -383,6 +383,15 @@ h2{font-size:18px}
 .news-time{font-size:12px;color:#9eb5c9;margin-top:3px}
 .news-count{font-size:12px;font-weight:900;white-space:nowrap;text-align:right}
 .news-red{color:#ff6b7d}
+.news-urgent{
+    color:#ff3b30;
+    font-weight:1000;
+    animation:newsPulse 1.4s ease-in-out infinite;
+}
+@keyframes newsPulse{
+    0%,100%{opacity:1}
+    50%{opacity:.62}
+}
 .news-amber{color:#f2c94c}
 .news-normal{color:#8ca7bf}
 .news-chip{
@@ -393,6 +402,24 @@ h2{font-size:18px}
     margin-right:6px;
     font-size:11px;
     font-weight:900;
+}
+
+.news-head{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    margin-bottom:8px;
+}
+.news-refresh{
+    border:1px solid #315674;
+    background:#132b3f;
+    color:#d8e8f5;
+    border-radius:10px;
+    padding:8px 11px;
+    font-size:12px;
+    font-weight:900;
+    cursor:pointer;
 }
 .trendbtn{background:#5dade2;color:#07111f}
 .livebtn{background:#f2c94c;color:#07111f}
@@ -467,7 +494,12 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 
 
 <div class="card news-card">
-<h2>📰 High-Impact News</h2>
+<div class="news-head">
+    <h2 style="margin:0">📰 High-Impact News</h2>
+    <form method="post" action="{{ url_for('refresh_news_now') }}" style="margin:0">
+        <button class="news-refresh" type="submit">↻ Refresh</button>
+    </form>
+</div>
 
 {% if news_configured %}
     {% if news_items %}
@@ -484,9 +516,12 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
                 </div>
                 {% endif %}
             </div>
-            <div class="news-count {{ 'news-red' if n['level']=='red' else 'news-amber' if n['level']=='amber' else 'news-normal' }}">
-                {% if n['level']=='red' %}⚠ HOLD / WAIT<br>{% elif n['level']=='amber' %}⚠ NEWS SOON<br>{% endif %}
-                {{ n['countdown'] }}
+            <div class="news-count js-news-countdown {{ 'news-red' if n['level']=='red' else 'news-amber' if n['level']=='amber' else 'news-normal' }}"
+                 data-event-ms="{{ n['event_time_ms'] }}">
+                <span class="js-news-warning">
+                    {% if n['level']=='red' %}⚠ HOLD / WAIT<br>{% elif n['level']=='amber' %}⚠ NEWS SOON<br>{% endif %}
+                </span>
+                <span class="js-news-timeleft">{{ n['countdown'] }}</span>
             </div>
         </div>
         {% endfor %}
@@ -979,6 +1014,66 @@ a{text-decoration:none}
         <a href="/"><button>← Back to Market Alerts</button></a>
     </div>
 </div>
+
+<script>
+(function () {
+    const rows = Array.from(document.querySelectorAll('.js-news-countdown'));
+
+    function formatLeft(msLeft) {
+        if (msLeft <= 0) {
+            const minsPast = Math.floor(Math.abs(msLeft) / 60000);
+            if (minsPast < 1) return 'NOW';
+            if (minsPast < 60) return minsPast + 'm ago';
+            return Math.floor(minsPast / 60) + 'h ago';
+        }
+
+        const total = Math.floor(msLeft / 1000);
+        const days = Math.floor(total / 86400);
+        const hours = Math.floor((total % 86400) / 3600);
+        const mins = Math.floor((total % 3600) / 60);
+        const secs = total % 60;
+
+        if (days > 0) return 'in ' + days + 'd ' + hours + 'h ' + mins + 'm';
+        if (hours > 0) return 'in ' + hours + 'h ' + mins + 'm ' + secs + 's';
+        return 'in ' + mins + 'm ' + secs + 's';
+    }
+
+    function updateNewsCountdowns() {
+        const now = Date.now();
+
+        rows.forEach(function (row) {
+            const eventMs = Number(row.dataset.eventMs || 0);
+            if (!eventMs) return;
+
+            const left = eventMs - now;
+            const minsLeft = left / 60000;
+            const timeNode = row.querySelector('.js-news-timeleft');
+            const warningNode = row.querySelector('.js-news-warning');
+
+            if (timeNode) timeNode.textContent = formatLeft(left);
+
+            row.classList.remove('news-urgent', 'news-red', 'news-amber', 'news-normal');
+
+            if (minsLeft <= 30 && minsLeft >= -60) {
+                row.classList.add('news-urgent');
+                if (warningNode) warningNode.innerHTML = '🔴 HIGH RISK — 30 MIN<br>';
+            } else if (minsLeft <= 60 && minsLeft > 30) {
+                row.classList.add('news-red');
+                if (warningNode) warningNode.innerHTML = '⚠ HOLD / WAIT<br>';
+            } else if (minsLeft <= 240 && minsLeft > 60) {
+                row.classList.add('news-amber');
+                if (warningNode) warningNode.innerHTML = '⚠ NEWS SOON<br>';
+            } else {
+                row.classList.add('news-normal');
+                if (warningNode) warningNode.innerHTML = '';
+            }
+        });
+    }
+
+    updateNewsCountdowns();
+    setInterval(updateNewsCountdowns, 1000);
+})();
+</script>
 </body>
 </html>
 """
@@ -1457,6 +1552,7 @@ def cached_home_news(limit=6):
                 "countdown": countdown,
                 "level": news_warning_level(minutes_until),
                 "affected_pairs": affected_pairs,
+                "event_time_ms": int(event_dt.timestamp() * 1000),
             })
 
         except Exception:
@@ -4240,6 +4336,23 @@ def monitor():
             print('monitor error', e)
 
         time.sleep(CHECK_SECONDS)
+
+
+
+@APP.route('/refresh-news', methods=['POST'])
+def refresh_news_now():
+    """
+    Manual Forex Factory calendar refresh.
+    Does not use Twelve Data credits.
+    """
+    try:
+        ok, error = refresh_economic_news()
+        if error:
+            print("manual Forex Factory refresh:", error)
+    except Exception as e:
+        print("manual Forex Factory refresh error", e)
+
+    return redirect(url_for('home'))
 
 
 @APP.route('/')
