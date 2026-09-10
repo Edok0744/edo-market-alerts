@@ -566,7 +566,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
             Information only. EdoSignal does not block your setup. Use the affected-pair line to decide whether to hold a new entry before major news.
         </div>
     {% else %}
-        <div class="small">No cached high-impact event is currently approaching for your saved markets.</div>
+        <div class="small">✅ No more High-Impact news today for your saved markets.</div>
     {% endif %}
 {% else %}
     <div class="small">
