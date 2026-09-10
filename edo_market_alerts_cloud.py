@@ -2481,7 +2481,7 @@ def detect_support_resistance_signal(candles):
     return found
 
 
-def detect_trend_pullback(candles, conf):
+def detect_trend_pullback(candles, conf, allow_sr_exception=False):
     """
     Edo Trend Pullback rule.
 
@@ -2566,8 +2566,10 @@ def detect_trend_pullback(candles, conf):
 
     trend = local_structure_trend(candles, run_start)
 
-    # Trend Pullback must agree with the established trend.
-    if trend != required_trend:
+    # Normal rule: Trend Pullback must agree with established local trend.
+    # 8H / Daily may temporarily keep the candidate when the caller is
+    # evaluating Edo's SECOND S/R REACTION WITH GAP exception.
+    if trend != required_trend and not allow_sr_exception:
         return None
 
     score = 6.0 + min(3.0, (run_count - 2) * 0.75)
@@ -2590,10 +2592,97 @@ def detect_trend_pullback(candles, conf):
             for j in range(run_start, i)
         ],
         "trend": trend,
+        "required_trend": required_trend,
+        "normal_local_trend_ok": trend == required_trend,
         "context": "trend",
         "target": target,
         "fifty_percent_level": fifty_level,
     }
+
+
+
+def sr_second_reaction_exception(candles, setup):
+    """
+    Edo 8H / Daily early-trend exception.
+
+    Allows the normal 2+ same-colour + >=50% BODY confirmation setup before a
+    strong trend is fully established ONLY when the SAME fully closed
+    confirmation candle is also a genuine second separated reaction from an
+    established historical S/R zone.
+
+    Bullish setup -> second support retest/bounce with a real move-away gap.
+    Bearish setup -> second resistance retest/rejection with a real move-away gap.
+
+    This does not create a signal by itself. The normal 2+ / 50% closed-candle
+    pattern must already be valid.
+    """
+    if not candles or not setup:
+        return None
+
+    reactions = detect_support_resistance_signal(candles)
+    wanted = "SUPPORT RETEST / BOUNCE WATCH" if setup.get("direction") == "bullish" \
+        else "RESISTANCE RETEST / REJECTION WATCH"
+
+    confirmation_date = setup.get("confirmation_date", "")
+
+    matches = [
+        r for r in reactions
+        if r.get("name") == wanted
+        and r.get("direction") == setup.get("direction")
+        and r.get("confirmation_date", "") == confirmation_date
+    ]
+
+    if not matches:
+        return None
+
+    best = max(matches, key=lambda r: r.get("score", 0))
+    return best
+
+
+def apply_edo_8h_daily_context_rule(candles, interval, setups):
+    """
+    4H:
+      handled elsewhere and remains STRONG-TREND ONLY.
+
+    8H:
+      normal strong-trend continuation is allowed;
+      OR the second separated S/R reaction exception may allow the normal
+      2+ / 50% setup before the trend has become strong.
+
+    Daily:
+      normal local-trend retracement is allowed;
+      OR the same second separated S/R reaction exception may allow the
+      normal 2+ / 50% setup while a new trend is developing.
+
+    No forming candle can qualify.
+    """
+    if interval not in ("8h", "1day"):
+        return setups
+
+    out = []
+    for p in setups:
+        if p.get("name") != "TREND PULLBACK SETUP":
+            out.append(p)
+            continue
+
+        # Normal local price-structure rule already agrees.
+        if p.get("normal_local_trend_ok"):
+            out.append(p)
+            continue
+
+        reaction = sr_second_reaction_exception(candles, p)
+        if reaction:
+            q = dict(p)
+            q["sr_second_reaction_exception"] = True
+            q["sr_exception_level"] = reaction.get("level")
+            q["sr_exception_touches"] = reaction.get("touches", 2)
+            q["context"] = "second_sr_reaction"
+            # This is deliberately an early/developing-trend setup, not a
+            # claim that the market is already strongly trending.
+            q["trend"] = "developing"
+            out.append(q)
+
+    return out
 
 
 def describe_setup(p):
@@ -3044,6 +3133,18 @@ def apply_strong_trend_filter(symbol, grp, interval, setups):
         return [], states, error
 
     if higher_direction is None:
+        if interval == "8h":
+            exception_setups = []
+            for p in setups:
+                if p.get("name") != "TREND PULLBACK SETUP":
+                    exception_setups.append(p)
+                elif p.get("sr_second_reaction_exception"):
+                    q = dict(p)
+                    q["higher_tf_filter"] = False
+                    q["higher_tf_states"] = dict(states)
+                    q["signal_context"] = "8H second S/R reaction with gap — developing trend"
+                    exception_setups.append(q)
+            return exception_setups, states, None
         return [], states, None
 
     filtered = []
@@ -3058,6 +3159,14 @@ def apply_strong_trend_filter(symbol, grp, interval, setups):
             p["higher_tf_filter"] = True
             p["higher_tf_direction"] = higher_direction
             p["higher_tf_states"] = dict(states)
+            filtered.append(p)
+        elif interval == "8h" and p.get("sr_second_reaction_exception"):
+            # Early/developing-trend exception: a genuine second separated
+            # S/R reaction may qualify even before higher TFs fully align.
+            p = dict(p)
+            p["higher_tf_filter"] = False
+            p["higher_tf_states"] = dict(states)
+            p["signal_context"] = "8H second S/R reaction with gap — developing trend"
             filtered.append(p)
 
     return filtered, states, None
@@ -3246,7 +3355,11 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         # 2+ same-colour fully CLOSED pullback candles, then an opposite-colour
         # fully CLOSED confirmation candle penetrating at least 50% through
         # the BODY of the immediately previous candle.
-        pullback = detect_trend_pullback(closed_candles, conf)
+        pullback = detect_trend_pullback(
+            closed_candles,
+            conf,
+            allow_sr_exception=(interval in ("8h", "1day"))
+        )
         if pullback:
             found.append(pullback)
 
@@ -3273,7 +3386,13 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             if p.get("name") == "TREND PULLBACK SETUP"
         ]
 
-    # 4H and 8H continuation signals require strong higher-timeframe alignment.
+    # 8H / Daily: allow Edo's second separated S/R reaction exception while
+    # a new trend is developing. The normal 2+ / >=50% closed-candle rule
+    # still has to pass first.
+    found = apply_edo_8h_daily_context_rule(closed_candles, interval, found)
+
+    # 4H remains strong-trend-only. 8H normally uses the strong-trend filter,
+    # but an approved second-S/R-reaction exception may bypass it.
     higher_tf_states = None
     if interval in ("4h", "8h"):
         found, higher_tf_states, htf_error = apply_strong_trend_filter(
@@ -3622,7 +3741,11 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     for conf in recent_confirmations(closed_candles, lookback=7):
         # Edo original trading rule only. Bounce/Retest is NOT a trading signal.
-        pullback = detect_trend_pullback(closed_candles, conf)
+        pullback = detect_trend_pullback(
+            closed_candles,
+            conf,
+            allow_sr_exception=(interval in ("8h", "1day"))
+        )
         if pullback:
             found.append(pullback)
 
@@ -3647,6 +3770,8 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     # 4H and 8H are continuation-only: require strong higher-timeframe alignment.
     # Daily and Weekly Trend Pullback patterns remain unrestricted.
+    setups = apply_edo_8h_daily_context_rule(closed_candles, interval, setups)
+
     if interval in ("4h", "8h"):
         setups, higher_tf_states, htf_error = apply_strong_trend_filter(
             symbol, grp, interval, setups
