@@ -373,15 +373,31 @@ h2{font-size:18px}
 .news-row{
     display:flex;
     justify-content:space-between;
+    align-items:flex-start;
     gap:12px;
     padding:10px 0;
     border-bottom:1px solid #1c3449;
+    min-height:58px;
 }
 .news-row:last-child{border-bottom:0}
 .news-left{min-width:0}
 .news-title{font-size:14px;font-weight:900}
 .news-time{font-size:12px;color:#9eb5c9;margin-top:3px}
-.news-count{font-size:12px;font-weight:900;white-space:nowrap;text-align:right}
+.news-count{
+    font-size:12px;
+    font-weight:900;
+    white-space:nowrap;
+    text-align:right;
+    min-width:118px;
+    width:118px;
+    flex:0 0 118px;
+    font-variant-numeric:tabular-nums;
+}
+.js-news-timeleft{
+    display:inline-block;
+    min-width:92px;
+    text-align:right;
+}
 .news-red{color:#ff6b7d}
 .news-amber{color:#f2c94c}
 .news-normal{color:#8ca7bf}
