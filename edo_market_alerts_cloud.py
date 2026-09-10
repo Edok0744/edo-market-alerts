@@ -383,15 +383,6 @@ h2{font-size:18px}
 .news-time{font-size:12px;color:#9eb5c9;margin-top:3px}
 .news-count{font-size:12px;font-weight:900;white-space:nowrap;text-align:right}
 .news-red{color:#ff6b7d}
-.news-urgent{
-    color:#ff3b30;
-    font-weight:1000;
-    animation:newsPulse 1.4s ease-in-out infinite;
-}
-@keyframes newsPulse{
-    0%,100%{opacity:1}
-    50%{opacity:.62}
-}
 .news-amber{color:#f2c94c}
 .news-normal{color:#8ca7bf}
 .news-chip{
@@ -496,10 +487,9 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 <div class="card news-card">
 <div class="news-head">
     <h2 style="margin:0">📰 High-Impact News</h2>
-    <form method="post" action="{{ url_for('refresh_news_now') }}" style="margin:0">
-        <button class="news-refresh" type="submit">↻ Refresh</button>
-    </form>
+    <button class="news-refresh" id="news-refresh-btn" type="button">↻ Refresh</button>
 </div>
+<div id="news-refresh-status" class="small" style="display:none;margin-bottom:8px"></div>
 
 {% if news_configured %}
     {% if news_items %}
@@ -1052,12 +1042,9 @@ a{text-decoration:none}
 
             if (timeNode) timeNode.textContent = formatLeft(left);
 
-            row.classList.remove('news-urgent', 'news-red', 'news-amber', 'news-normal');
+            row.classList.remove('news-red', 'news-amber', 'news-normal');
 
-            if (minsLeft <= 30 && minsLeft >= -60) {
-                row.classList.add('news-urgent');
-                if (warningNode) warningNode.innerHTML = '🔴 HIGH RISK — 30 MIN<br>';
-            } else if (minsLeft <= 60 && minsLeft > 30) {
+            if (minsLeft <= 60 && minsLeft >= -60) {
                 row.classList.add('news-red');
                 if (warningNode) warningNode.innerHTML = '⚠ HOLD / WAIT<br>';
             } else if (minsLeft <= 240 && minsLeft > 60) {
@@ -1072,6 +1059,57 @@ a{text-decoration:none}
 
     updateNewsCountdowns();
     setInterval(updateNewsCountdowns, 1000);
+
+    const refreshBtn = document.getElementById('news-refresh-btn');
+    const refreshStatus = document.getElementById('news-refresh-status');
+
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', async function () {
+            const oldText = refreshBtn.textContent;
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = '↻ Updating...';
+
+            if (refreshStatus) {
+                refreshStatus.style.display = 'block';
+                refreshStatus.textContent = 'Refreshing Forex Factory high-impact news...';
+            }
+
+            try {
+                const response = await fetch('/refresh-news', {
+                    method: 'POST',
+                    headers: {'X-Requested-With': 'XMLHttpRequest'}
+                });
+
+                const result = await response.json();
+
+                if (result.ok) {
+                    if (refreshStatus) {
+                        refreshStatus.textContent = '✓ News updated. Refreshing this page...';
+                    }
+
+                    // Reload the SAME home page so new/changed events appear.
+                    // This does not navigate to a separate refresh/error page.
+                    setTimeout(function () {
+                        window.location.reload();
+                    }, 350);
+                } else {
+                    if (refreshStatus) {
+                        refreshStatus.textContent =
+                            '⚠ Could not refresh the feed just now. Existing news remains displayed.';
+                    }
+                    refreshBtn.disabled = false;
+                    refreshBtn.textContent = oldText;
+                }
+            } catch (err) {
+                if (refreshStatus) {
+                    refreshStatus.textContent =
+                        '⚠ Could not refresh the feed just now. Existing news remains displayed.';
+                }
+                refreshBtn.disabled = false;
+                refreshBtn.textContent = oldText;
+            }
+        });
+    }
 })();
 </script>
 </body>
@@ -4342,17 +4380,22 @@ def monitor():
 @APP.route('/refresh-news', methods=['POST'])
 def refresh_news_now():
     """
-    Manual Forex Factory calendar refresh.
-    Does not use Twelve Data credits.
+    Manual Forex Factory calendar refresh for AJAX use.
+    The browser stays on the HOME page.
+    This does not use Twelve Data credits.
     """
     try:
         ok, error = refresh_economic_news()
         if error:
             print("manual Forex Factory refresh:", error)
+            return jsonify(ok=False, error=str(error)), 200
+
+        return jsonify(ok=True), 200
+
     except Exception as e:
         print("manual Forex Factory refresh error", e)
-
-    return redirect(url_for('home'))
+        # Return JSON instead of the global HTML 500 page.
+        return jsonify(ok=False, error="News refresh failed temporarily."), 200
 
 
 @APP.route('/')
