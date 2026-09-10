@@ -2015,9 +2015,8 @@ def avg_body(candles, end=None, length=20):
 
 def confirmation_at(candles, i):
     """
-    Edo confirmation:
-      bullish = green candle closes >50% back through previous red body
-      bearish = red candle closes >50% back through previous green body
+    Legacy confirmation helper retained for older secondary logic.
+    Main Trend Pullback signals no longer require the 50% penetration rule.
     """
     if i <= 0 or i >= len(candles):
         return None
@@ -3041,7 +3040,7 @@ def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
             candles, err = get_candles(symbol, "12h", outputsize=6, grp=grp)
             if err:
                 return None, states, err
-            closed = last_closed_candle(candles)
+            closed = last_closed_candle(candles, interval)
         else:
             candles, err = get_ohlc(symbol, tf_interval, outputsize=60, grp=grp)
             if err:
@@ -3974,7 +3973,7 @@ def build_full_alignment(symbol, grp=None):
         if err:
             return "", err
 
-        closed = last_closed_candle(candles)
+        closed = last_closed_candle(candles, interval)
         if closed is None:
             return "", f"Not enough completed {label} candle data."
 
@@ -3985,7 +3984,7 @@ def build_full_alignment(symbol, grp=None):
     weekly_state = ""
     weekly_candles, weekly_err = get_candles(symbol, "1week", outputsize=3, grp=grp)
     if not weekly_err:
-        weekly_closed = last_closed_candle(weekly_candles)
+        weekly_closed = last_closed_candle(weekly_candles, "1week")
         if weekly_closed is not None:
             weekly_state = analyse_candle(weekly_closed)
 
@@ -4329,17 +4328,19 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
     return candles[-outputsize:], None
 
 
-def last_closed_candle(candles):
+def last_closed_candle(candles, interval):
     """
-    Return the last fully completed candle.
+    Return the newest candle that is ACTUALLY fully closed.
 
-    Twelve Data can include the currently forming candle as the newest item.
-    Because candles are stored oldest -> newest, candles[-1] may still move.
-    We deliberately use candles[-2] so EdoSignal cannot trigger from a live candle.
+    This uses the candle timestamp + interval duration instead of assuming
+    candles[-2] is closed. Twelve Data may return a set where the newest item
+    is already closed, so blindly using [-2] can make EdoSignal one candle
+    behind the broker chart.
     """
-    if not candles or len(candles) < 2:
+    closed = fully_closed_candles(candles, interval)
+    if not closed:
         return None
-    return candles[-2]
+    return closed[-1]
 
 
 def analyse_candle(candle):
@@ -4357,12 +4358,12 @@ def analyse_candle(candle):
     return "Mixed"
 
 
-def analyse_closes(candles):
+def analyse_closes(candles, interval):
     """
-    Kept under the old function name so the rest of the app stays simple.
-    It now analyses ONLY the last fully closed candlestick colour -- no SMA20/SMA50.
+    Analyse ONLY the newest truly fully closed candlestick colour.
+    No SMA/EMA/RSI logic is used.
     """
-    closed = last_closed_candle(candles)
+    closed = last_closed_candle(candles, interval)
     if closed is None:
         return "Mixed"
     return analyse_candle(closed)
@@ -4399,7 +4400,7 @@ def build_trend_scan(symbol, grp=None):
         if error:
             return None, error
 
-        closed = last_closed_candle(candles)
+        closed = last_closed_candle(candles, interval)
         if closed is None:
             return None, f"Not enough completed {label} candle data."
 
@@ -4413,6 +4414,7 @@ def build_trend_scan(symbol, grp=None):
             "icon": "",
             "css": css,
             "reference_only": True,
+            "closed_time": closed.get("datetime", ""),
         })
 
     # Existing signal rows stay unchanged.
@@ -4422,7 +4424,7 @@ def build_trend_scan(symbol, grp=None):
         if error:
             return None, error
 
-        closed = last_closed_candle(candles)
+        closed = last_closed_candle(candles, interval)
         if closed is None:
             return None, f"Not enough completed {label} candle data."
 
@@ -4437,6 +4439,7 @@ def build_trend_scan(symbol, grp=None):
             "icon": icon,
             "css": css,
             "reference_only": False,
+            "closed_time": closed.get("datetime", ""),
         })
 
     signal_labels = ("12H", "8H", "4H", "1H")
