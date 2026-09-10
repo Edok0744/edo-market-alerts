@@ -384,6 +384,20 @@ h2{font-size:18px}
 .news-row:last-child{border-bottom:0}
 .news-left{min-width:0}
 .news-title{font-size:14px;font-weight:900}
+.news-reaction{
+    display:inline-block;
+    margin-left:7px;
+    padding:3px 7px;
+    border-radius:999px;
+    font-size:11px;
+    font-weight:900;
+    white-space:nowrap;
+    vertical-align:2px;
+}
+.news-reaction-bull{background:#123f31;color:#35e39b}
+.news-reaction-bear{background:#4b1f2a;color:#ff6f84}
+.news-reaction-mixed{background:#44391b;color:#ffd34f}
+.news-reaction-pending{background:#173047;color:#9ab0c6}
 .news-time{font-size:12px;color:#9eb5c9;margin-top:3px}
 .news-count{
     font-size:12px;
@@ -525,6 +539,15 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
             <div class="news-left">
                 <div class="news-title">
                     <span class="news-chip">{{ n['currency'] }}</span>{{ n['event_name'] }}
+                    {% if n.get('reaction') == 'BULLISH' %}
+                    <span class="news-reaction news-reaction-bull">▲ BULLISH</span>
+                    {% elif n.get('reaction') == 'BEARISH' %}
+                    <span class="news-reaction news-reaction-bear">▼ BEARISH</span>
+                    {% elif n.get('reaction') == 'MIXED' %}
+                    <span class="news-reaction news-reaction-mixed">↔ MIXED</span>
+                    {% elif n.get('reaction') == 'PENDING' and n.get('released') %}
+                    <span class="news-reaction news-reaction-pending">… READING</span>
+                    {% endif %}
                 </div>
                 <div class="news-time">{{ n['perth_time'] }} Perth</div>
                 {% if n.get('affected_pairs') %}
@@ -543,7 +566,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
         </div>
         {% endfor %}
         <div class="small" style="margin-top:8px">
-            Information only. EdoSignal does not block your setup. Use the affected-pair line to decide whether to hold a new entry before major news.
+            Information only. EdoSignal does not block your setup. After release, ▲/▼ shows the actual currency reaction across your saved FX pairs — not whether the news number itself was good or bad.
         </div>
     {% else %}
         <div class="small">No cached high-impact event is currently approaching for your saved markets.</div>
@@ -1297,6 +1320,17 @@ def init_db():
         """)
 
         c.execute("""
+        CREATE TABLE IF NOT EXISTS economic_news_reactions(
+            event_id TEXT PRIMARY KEY,
+            reaction TEXT NOT NULL DEFAULT 'PENDING',
+            avg_move_pct REAL,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            stage_minutes INTEGER NOT NULL DEFAULT 0,
+            updated TEXT NOT NULL
+        )
+        """)
+
+        c.execute("""
         CREATE TABLE IF NOT EXISTS weekly_spike_state(
             grp TEXT NOT NULL,
             symbol TEXT NOT NULL,
@@ -1624,6 +1658,199 @@ def economic_news_warning_monitor():
         time.sleep(60)
 
 
+
+def saved_fx_pairs_for_currency(currency, max_items=4):
+    """Return up to four saved FOREX pairs containing the event currency."""
+    currency = str(currency or "").upper().strip()
+    found = []
+    try:
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT symbol FROM favorites WHERE grp='FOREX' ORDER BY symbol"
+            ).fetchall()
+        for row in rows:
+            symbol = str(row["symbol"] or "").upper().strip()
+            s = normalize_pair_symbol(symbol)
+            if len(s) >= 6 and currency in (s[:3], s[3:6]):
+                found.append(symbol)
+    except Exception as e:
+        print("news reaction saved-pairs error", e)
+    return found[:max_items]
+
+
+def oriented_currency_move_pct(symbol, currency, event_dt_utc, stage_minutes):
+    """
+    Positive result means the event currency strengthened.
+    Negative means it weakened.
+    """
+    candles, err = get_ohlc(symbol, "15min", outputsize=40, grp="FOREX")
+    if err or not candles:
+        return None
+
+    closed = fully_closed_candles(candles, "15min")
+    if len(closed) < 2:
+        return None
+
+    event_dt_utc = event_dt_utc.astimezone(timezone.utc)
+    cutoff = event_dt_utc + timedelta(minutes=stage_minutes)
+
+    before = None
+    after = None
+
+    for c in closed:
+        start = parse_candle_utc(c.get("datetime", ""))
+        if start is None:
+            continue
+        end = start + timedelta(minutes=15)
+
+        if end <= event_dt_utc:
+            before = c
+        if end <= cutoff:
+            after = c
+
+    if before is None or after is None:
+        return None
+
+    before_close = float(before["close"])
+    after_close = float(after["close"])
+    if before_close <= 0:
+        return None
+
+    pair_move_pct = ((after_close - before_close) / before_close) * 100.0
+    s = normalize_pair_symbol(symbol)
+    if len(s) < 6:
+        return None
+
+    base, quote = s[:3], s[3:6]
+    if currency == base:
+        return pair_move_pct
+    if currency == quote:
+        return -pair_move_pct
+    return None
+
+
+def calculate_news_reaction(event_id, event_time_utc, currency, stage_minutes):
+    """
+    Actual market reaction across saved FX pairs.
+
+    >= +0.03% average -> BULLISH
+    <= -0.03% average -> BEARISH
+    otherwise -> MIXED
+    """
+    try:
+        event_dt = datetime.fromisoformat(event_time_utc)
+        if event_dt.tzinfo is None:
+            event_dt = event_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False
+
+    moves = []
+    for symbol in saved_fx_pairs_for_currency(currency, max_items=4):
+        move = oriented_currency_move_pct(
+            symbol, str(currency).upper(), event_dt, stage_minutes
+        )
+        if move is not None:
+            moves.append(move)
+
+    if not moves:
+        return False
+
+    avg_move = sum(moves) / len(moves)
+    positive = sum(1 for x in moves if x > 0)
+    negative = sum(1 for x in moves if x < 0)
+
+    if avg_move >= 0.03 and positive >= negative:
+        reaction = "BULLISH"
+    elif avg_move <= -0.03 and negative >= positive:
+        reaction = "BEARISH"
+    else:
+        reaction = "MIXED"
+
+    with db_conn() as c:
+        c.execute(
+            """
+            INSERT INTO economic_news_reactions(
+                event_id,reaction,avg_move_pct,sample_count,stage_minutes,updated
+            )
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                reaction=excluded.reaction,
+                avg_move_pct=excluded.avg_move_pct,
+                sample_count=excluded.sample_count,
+                stage_minutes=excluded.stage_minutes,
+                updated=excluded.updated
+            """,
+            (
+                event_id, reaction, avg_move, len(moves),
+                stage_minutes, datetime.utcnow().isoformat()
+            )
+        )
+        c.commit()
+
+    print("news reaction", currency, stage_minutes, reaction, avg_move, len(moves))
+    return True
+
+
+def economic_news_reaction_monitor():
+    """
+    First reaction reading about 15 minutes after release.
+    Final update about 30 minutes after release.
+    """
+    time.sleep(50)
+
+    while True:
+        try:
+            if manual_api_priority_active():
+                time.sleep(20)
+                continue
+
+            now_utc = datetime.now(timezone.utc)
+
+            with db_conn() as c:
+                rows = c.execute(
+                    """
+                    SELECT n.event_id,n.event_time_utc,n.currency,
+                           COALESCE(r.stage_minutes,0) AS stage_minutes
+                    FROM economic_news n
+                    LEFT JOIN economic_news_reactions r ON r.event_id=n.event_id
+                    WHERE n.event_time_utc <= ?
+                      AND n.event_time_utc >= ?
+                    ORDER BY n.event_time_utc ASC
+                    """,
+                    (
+                        (now_utc - timedelta(minutes=15)).isoformat(),
+                        (now_utc - timedelta(hours=2)).isoformat(),
+                    )
+                ).fetchall()
+
+            for row in rows:
+                event_dt = datetime.fromisoformat(row["event_time_utc"])
+                if event_dt.tzinfo is None:
+                    event_dt = event_dt.replace(tzinfo=timezone.utc)
+
+                age_min = (now_utc - event_dt).total_seconds() / 60.0
+                stage = int(row["stage_minutes"] or 0)
+
+                if age_min >= 15 and stage < 15:
+                    calculate_news_reaction(
+                        row["event_id"], row["event_time_utc"],
+                        row["currency"], 15
+                    )
+                elif age_min >= 30 and stage < 30:
+                    calculate_news_reaction(
+                        row["event_id"], row["event_time_utc"],
+                        row["currency"], 30
+                    )
+
+                time.sleep(4)
+
+        except Exception as e:
+            print("economic news reaction monitor error", e)
+
+        time.sleep(60)
+
+
+
 def news_warning_level(minutes_until):
     if minutes_until < -60:
         return "past"
@@ -1692,14 +1919,17 @@ def cached_home_news(limit=6):
         with db_conn() as c:
             rows = c.execute(
                 """
-                SELECT event_time_utc,currency,event_name,importance
-                FROM economic_news
-                WHERE event_time_utc >= ?
-                ORDER BY event_time_utc ASC
+                SELECT n.event_id,n.event_time_utc,n.currency,n.event_name,n.importance,
+                       COALESCE(r.reaction,'PENDING') AS reaction,
+                       r.avg_move_pct,r.sample_count,r.stage_minutes
+                FROM economic_news n
+                LEFT JOIN economic_news_reactions r ON r.event_id=n.event_id
+                WHERE n.event_time_utc >= ?
+                ORDER BY n.event_time_utc ASC
                 LIMIT ?
                 """,
                 (
-                    (now_utc - timedelta(minutes=30)).isoformat(),
+                    (now_utc - timedelta(minutes=75)).isoformat(),
                     int(limit),
                 ),
             ).fetchall()
@@ -1740,6 +1970,11 @@ def cached_home_news(limit=6):
                 "level": news_warning_level(minutes_until),
                 "affected_pairs": affected_pairs,
                 "event_time_ms": int(event_dt.timestamp() * 1000),
+                "reaction": row["reaction"] or "PENDING",
+                "reaction_move_pct": row["avg_move_pct"],
+                "reaction_samples": row["sample_count"] or 0,
+                "reaction_stage": row["stage_minutes"] or 0,
+                "released": minutes_until <= 0,
             })
 
         except Exception:
@@ -5032,6 +5267,11 @@ threading.Thread(
 
 threading.Thread(
     target=economic_news_warning_monitor,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=economic_news_reaction_monitor,
     daemon=True
 ).start()
 
