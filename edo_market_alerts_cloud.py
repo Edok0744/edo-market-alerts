@@ -2366,48 +2366,115 @@ def avg_body(candles, end=None, length=20):
 
 def confirmation_at(candles, i):
     """
-    Legacy confirmation helper retained for older secondary logic.
-    Main Trend Pullback signals no longer require the 50% penetration rule.
+    Edo NORMAL Trend Pullback confirmation.
+
+    This is deliberately separate from the S/R gap-and-retest setup.
+
+    NORMAL pullback rule:
+      - previous candle and confirmation candle must be opposite colours
+      - confirmation candle must be fully closed by the caller
+      - NO 50% body-penetration requirement
+
+    The minimum 2 same-colour pullback candles are checked separately by
+    detect_trend_pullback().
     """
     if i <= 0 or i >= len(candles):
         return None
 
-    prev = candles[i-1]
+    prev = candles[i - 1]
     curr = candles[i]
+
     prev_colour = candle_colour(prev)
     curr_colour = candle_colour(curr)
-    body = abs(prev["close"] - prev["open"])
 
+    if prev_colour == "red" and curr_colour == "green":
+        return {
+            "direction": "bullish",
+            "index": i,
+            "date": curr.get("datetime", ""),
+            "close": float(curr["close"]),
+        }
+
+    if prev_colour == "green" and curr_colour == "red":
+        return {
+            "direction": "bearish",
+            "index": i,
+            "date": curr.get("datetime", ""),
+            "close": float(curr["close"]),
+        }
+
+    return None
+
+
+def sr_confirmation_at(candles, i):
+    """
+    Edo S/R GAP-AND-RETEST confirmation — 50% RULE APPLIES HERE ONLY.
+
+    Bearish resistance retest:
+      - previous candle is green
+      - next fully closed candle is red
+      - red candle closes below the 50% midpoint of the previous green body
+
+    Bullish support retest:
+      - previous candle is red
+      - next fully closed candle is green
+      - green candle closes above the 50% midpoint of the previous red body
+
+    This helper is NOT used by the normal minimum-2-candle pullback setup.
+    """
+    if i <= 0 or i >= len(candles):
+        return None
+
+    prev = candles[i - 1]
+    curr = candles[i]
+
+    prev_colour = candle_colour(prev)
+    curr_colour = candle_colour(curr)
+
+    body = abs(float(prev["close"]) - float(prev["open"]))
     if body <= 0:
         return None
 
-    midpoint = (prev["open"] + prev["close"]) / 2.0
+    midpoint = (float(prev["open"]) + float(prev["close"])) / 2.0
 
-    if prev_colour == "red" and curr_colour == "green" and curr["close"] > midpoint:
-        penetration = ((curr["close"] - prev["close"]) / body) * 100.0
-        if penetration >= 50.0:
+    if prev_colour == "red" and curr_colour == "green":
+        penetration = ((float(curr["close"]) - float(prev["close"])) / body) * 100.0
+        if float(curr["close"]) > midpoint and penetration >= 50.0:
             return {
                 "direction": "bullish",
                 "index": i,
                 "penetration": penetration,
                 "date": curr.get("datetime", ""),
-                "close": curr["close"],
+                "close": float(curr["close"]),
                 "previous_midpoint": midpoint,
             }
 
-    if prev_colour == "green" and curr_colour == "red" and curr["close"] < midpoint:
-        penetration = ((prev["close"] - curr["close"]) / body) * 100.0
-        if penetration >= 50.0:
+    if prev_colour == "green" and curr_colour == "red":
+        penetration = ((float(prev["close"]) - float(curr["close"])) / body) * 100.0
+        if float(curr["close"]) < midpoint and penetration >= 50.0:
             return {
                 "direction": "bearish",
                 "index": i,
                 "penetration": penetration,
                 "date": curr.get("datetime", ""),
-                "close": curr["close"],
+                "close": float(curr["close"]),
                 "previous_midpoint": midpoint,
             }
 
     return None
+
+
+def recent_sr_confirmations(candles, lookback=7):
+    """Newest-first 50% confirmations used ONLY for S/R gap-and-retest."""
+    found = []
+    first = max(1, len(candles) - lookback)
+
+    for i in range(first, len(candles)):
+        c = sr_confirmation_at(candles, i)
+        if c:
+            found.append(c)
+
+    return list(reversed(found))
 
 
 def recent_confirmations(candles, lookback=6):
@@ -2487,7 +2554,7 @@ def previous_target(candles, direction, before_index, search_back=60):
 
 def detect_bounce_retest(candles, conf):
     """
-    Edo Bounce / Retest Zone rule.
+    Edo S/R Gap-and-Retest trading rule — the 50% confirmation rule applies here only.
 
     A valid setup needs an ESTABLISHED support/resistance area first:
 
@@ -2622,7 +2689,7 @@ def detect_bounce_retest(candles, conf):
     score += min(2.0, max(0.0, conf["penetration"] - 50.0) / 25.0)
 
     return {
-        "name": "BOUNCE / RETEST SETUP",
+        "name": "S/R GAP RETEST SETUP",
         "direction": direction,
         "confirmed": True,
         "score": score,
@@ -2993,10 +3060,10 @@ def describe_setup(p):
     css = "buy" if bullish else "sell"
     direction_word = "Bullish" if bullish else "Bearish"
 
-    if p["name"] == "BOUNCE / RETEST SETUP":
+    if p["name"] == "S/R GAP RETEST SETUP":
         weak_text = " Weakness was also detected in the retest candles." if p["weak_retest"] else ""
         detail = (
-            f"{direction_word} Bounce/Retest confirmation on {p['confirmation_date']}. "
+            f"{direction_word} S/R Gap-Retest confirmation on {p['confirmation_date']}. "
             f"Price first established a wick-defined support/resistance zone, moved clearly away, "
             f"then returned to RETEST the same zone after {p['separation']} candles. "
             f"The opposite-colour confirmation candle fully closed away from the zone and "
@@ -3649,26 +3716,30 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         return None, f"Not enough fully closed {interval} candle history returned."
 
     found = []
-    confirmations = recent_confirmations(closed_candles, lookback=7)
 
-    for conf in confirmations:
-        # Edo original trading rule:
-        # 2+ same-colour fully CLOSED pullback candles, then an opposite-colour
-        # fully CLOSED opposite-colour confirmation candle after
-        # the BODY of the immediately previous candle.
+    # A) NORMAL Edo trend pullback:
+    #    minimum 2 same-colour fully CLOSED pullback candles,
+    #    followed by an opposite-colour fully CLOSED confirmation.
+    #    NO 50% rule applies to this setup.
+    for conf in recent_confirmations(closed_candles, lookback=7):
         pullback = detect_trend_pullback(
             closed_candles,
             conf,
-            allow_sr_exception=(interval in ("8h", "1day"))
+            allow_sr_exception=False
         )
         if pullback:
             found.append(pullback)
 
-    # 8H, Daily and Weekly: separate SUPPORT/RESISTANCE WATCH alerts.
-    # These are not trading-pattern signals and do not replace Edo's
-    # original 2+ candle + opposite-colour closed confirmation rule.
+    # B) Edo S/R GAP-AND-RETEST setup:
+    #    established high/low on the left -> price moves clearly away ->
+    #    later retest of the same zone -> opposite-colour CLOSED confirmation.
+    #    The 50% previous-body rule applies ONLY to this setup.
+    #    Active on 8H, Daily and Weekly.
     if interval in CORE_PATTERN_INTERVALS:
-        found.extend(detect_support_resistance_signal(closed_candles))
+        for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
+            sr_setup = detect_bounce_retest(closed_candles, sr_conf)
+            if sr_setup:
+                found.append(sr_setup)
 
     # Avoid duplicate descriptions of the same setup/direction/confirmation.
     unique = {}
@@ -3679,18 +3750,14 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = list(unique.values())
 
-    # Edo trading rule: Trend Pullback is the trading setup.
-    # Separate S/R reaction WATCH alerts are allowed on 8H + 1D + 1W.
+    # 4H carries only the normal Trend Pullback setup.
+    # The separate S/R Gap-Retest setup is intentionally limited to
+    # 8H, Daily and Weekly via CORE_PATTERN_INTERVALS.
     if interval not in CORE_PATTERN_INTERVALS:
         found = [
             p for p in found
             if p.get("name") == "TREND PULLBACK SETUP"
         ]
-
-    # 8H / Daily: allow Edo's second separated S/R reaction exception while
-    # a new trend is developing. The normal 2+ / opposite-colour closed-candle rule
-    # still has to pass first.
-    found = apply_edo_8h_daily_context_rule(closed_candles, interval, found)
 
     # 4H remains strong-trend-only. 8H normally uses the strong-trend filter,
     # but an approved second-S/R-reaction exception may bypass it.
@@ -3799,16 +3866,15 @@ def pattern_signal_family(p):
     Group signals that mean the same thing to Edo so only one phone push
     of that type is sent for the same pair/direction on the same Perth day.
 
-    In particular:
-      SUPPORT RETEST / BOUNCE WATCH
-      RESISTANCE RETEST / REJECTION WATCH
-      BOUNCE / RETEST SETUP
-    are one BOUNCE_RETEST family.
+    Strategy families:
+      TREND PULLBACK = normal minimum-2-candle setup, NO 50% rule.
+      S/R GAP RETEST = separated historical support/resistance retest,
+                       WITH the 50% confirmation rule.
     """
     name = str(p.get("name", "")).upper()
 
-    if p.get("context") == "support_resistance":
-        return "SUPPORT_RESISTANCE_REACTION"
+    if "S/R GAP RETEST" in name:
+        return "SR_GAP_RETEST"
     if "TREND PULLBACK" in name:
         return "TREND_PULLBACK"
     if "RANGE" in name and "REVERSAL" in name:
@@ -3824,8 +3890,8 @@ def pattern_push_priority(p):
     """
     name = str(p.get("name", "")).upper()
 
-    if p.get("context") == "support_resistance":
-        return 20
+    if "S/R GAP RETEST" in name:
+        return 25
     if "TREND PULLBACK" in name:
         return 20
     if "RANGE" in name and "REVERSAL" in name:
@@ -3994,16 +4060,16 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         else:
             trend_line = ""
 
-        if p.get("context") == "support_resistance":
+        if p.get("name") == "S/R GAP RETEST SETUP":
             zone_word = "SUPPORT" if p["direction"] == "bullish" else "RESISTANCE"
-            reaction_word = "BOUNCE" if p["direction"] == "bullish" else "REJECTION"
             push_body = (
-                f"Newest fully CLOSED {tf_label} candle has RETESTED an established {zone_word} zone "
-                f"({p['level']:.5f}) and shown a {reaction_word} away from it. "
-                f"The zone has {p.get('touches', 2)} prior swing touches and price previously moved "
-                f"clearly away before this retest. Local structure: "
-                f"{str(p.get('trend','mixed')).upper()}. Valid in bullish, bearish and "
-                f"range-bound markets. Review the chart before trading."
+                f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
+                f"({confirmation_date}). "
+                f"Established {zone_word} on the left, price moved clearly away, "
+                f"then returned after separation to retest the same zone. "
+                f"The opposite-colour confirmation closed {p.get('penetration', 0):.0f}% "
+                f"through the previous candle body. "
+                f"{direction_word} possibility. Review the chart before trading."
             )
         else:
             push_body = (
@@ -4021,7 +4087,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     """
-    Collect Edo Trend Pullback setups plus separate S/R WATCH alerts from fully closed candles only.
+    Collect Edo's two trading setups from fully closed candles only: normal Trend Pullback (no 50%) and S/R Gap-Retest (50% rule).
 
     Returns:
       setups, latest_closed_date, error
@@ -4040,19 +4106,22 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     latest_closed_date = closed_candles[-1].get("datetime", "")
     found = []
 
+    # A) NORMAL minimum-2-candle Trend Pullback — NO 50% rule.
     for conf in recent_confirmations(closed_candles, lookback=7):
-        # Edo original trading rule only. Bounce/Retest is NOT a trading signal.
         pullback = detect_trend_pullback(
             closed_candles,
             conf,
-            allow_sr_exception=(interval in ("8h", "1day"))
+            allow_sr_exception=False
         )
         if pullback:
             found.append(pullback)
 
-    # 8H, Daily and Weekly support/resistance proximity alerts.
+    # B) S/R GAP-AND-RETEST — 50% rule applies ONLY here.
     if interval in CORE_PATTERN_INTERVALS:
-        found.extend(detect_support_resistance_signal(closed_candles))
+        for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
+            sr_setup = detect_bounce_retest(closed_candles, sr_conf)
+            if sr_setup:
+                found.append(sr_setup)
 
     unique = {}
     for p in found:
@@ -4062,16 +4131,17 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     setups = list(unique.values())
 
-    # Edo rule: on 4H, ONLY Trend Pullback may notify.
+    # Edo rule: on 4H, ONLY the normal Trend Pullback may notify.
+    # S/R Gap-Retest is enabled only on 8H, Daily and Weekly.
     if interval not in CORE_PATTERN_INTERVALS:
         setups = [
             p for p in setups
             if p.get("name") == "TREND PULLBACK SETUP"
         ]
 
-    # 4H and 8H are continuation-only: require strong higher-timeframe alignment.
-    # Daily and Weekly Trend Pullback patterns remain unrestricted.
-    setups = apply_edo_8h_daily_context_rule(closed_candles, interval, setups)
+    # 4H and 8H normal Trend Pullback remains subject to the existing
+    # strong higher-timeframe trend filter. The separate S/R Gap-Retest
+    # setup is not forced through that continuation filter.
 
     if interval in ("4h", "8h"):
         setups, higher_tf_states, htf_error = apply_strong_trend_filter(
