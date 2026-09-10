@@ -14,6 +14,10 @@ FOREX_FACTORY_CALENDAR_URL = os.environ.get(
     'FOREX_FACTORY_CALENDAR_URL',
     'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
 )
+FOREX_FACTORY_CALENDAR_FALLBACK_URL = os.environ.get(
+    'FOREX_FACTORY_CALENDAR_FALLBACK_URL',
+    'https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json'
+)
 NEWS_REFRESH_SECONDS = int(os.environ.get('NEWS_REFRESH_SECONDS', '1800'))
 NEWS_WARNING_MINUTES = int(os.environ.get('NEWS_WARNING_MINUTES', '5'))
 NEWS_PUSH_SOUND = os.environ.get('NEWS_PUSH_SOUND', 'siren')
@@ -566,7 +570,14 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
             Information only. EdoSignal does not block your setup. Use the affected-pair line to decide whether to hold a new entry before major news.
         </div>
     {% else %}
+        {% if news_feed_unavailable %}
+        <div class="small" style="color:#f2c94c">
+            ⚠ News feed temporarily unavailable. Do not assume there is no High-Impact news.
+            Press Refresh again shortly.
+        </div>
+        {% else %}
         <div class="small">✅ No more High-Impact news today for your saved markets.</div>
+        {% endif %}
     {% endif %}
 {% else %}
     <div class="small">
@@ -1383,6 +1394,22 @@ def init_db():
         """)
 
         c.execute("""
+        CREATE TABLE IF NOT EXISTS economic_news_status(
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            last_attempt TEXT,
+            last_success TEXT,
+            last_error TEXT,
+            source_url TEXT
+        )
+        """)
+        c.execute("""
+        INSERT OR IGNORE INTO economic_news_status(
+            id,last_attempt,last_success,last_error,source_url
+        )
+        VALUES(1,'','','','')
+        """)
+
+        c.execute("""
         CREATE TABLE IF NOT EXISTS weekly_spike_state(
             grp TEXT NOT NULL,
             symbol TEXT NOT NULL,
@@ -1502,6 +1529,120 @@ def parse_ff_event_time(value):
         return None
 
 
+
+def _save_news_feed_status(success, error="", source_url=""):
+    """Persist Forex Factory feed health so HOME never confuses failure with no-news."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with db_conn() as c:
+            if success:
+                c.execute(
+                    """
+                    UPDATE economic_news_status
+                    SET last_attempt=?, last_success=?, last_error='', source_url=?
+                    WHERE id=1
+                    """,
+                    (now, now, source_url)
+                )
+            else:
+                c.execute(
+                    """
+                    UPDATE economic_news_status
+                    SET last_attempt=?, last_error=?, source_url=?
+                    WHERE id=1
+                    """,
+                    (now, str(error)[:500], source_url)
+                )
+            c.commit()
+    except Exception as e:
+        print("news feed status save error", e)
+
+
+def _get_news_feed_status():
+    try:
+        with db_conn() as c:
+            row = c.execute(
+                """
+                SELECT last_attempt,last_success,last_error,source_url
+                FROM economic_news_status
+                WHERE id=1
+                """
+            ).fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _download_forex_factory_calendar():
+    """
+    Fetch the weekly Forex Factory JSON with two public FairEconomy endpoints.
+
+    Railway/cloud hosts can occasionally get a transient block or edge failure
+    on one hostname, so EdoSignal tries the normal endpoint first and then the
+    CDN hostname. A cache-busting query string and normal browser headers are
+    used to avoid stale/error edge responses.
+    """
+    urls = []
+    for url in (
+        FOREX_FACTORY_CALENDAR_URL,
+        FOREX_FACTORY_CALENDAR_FALLBACK_URL,
+    ):
+        if url and url not in urls:
+            urls.append(url)
+
+    errors = []
+
+    for base_url in urls:
+        try:
+            separator = "&" if "?" in base_url else "?"
+            url = f"{base_url}{separator}edo_ts={int(time.time())}"
+
+            r = requests.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/140.0 Safari/537.36"
+                    ),
+                    "Accept": "application/json,text/plain,*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "Connection": "close",
+                },
+                timeout=20,
+                allow_redirects=True,
+            )
+
+            if r.status_code != 200:
+                errors.append(f"{base_url}: HTTP {r.status_code}")
+                continue
+
+            body = (r.text or "").strip()
+            if not body:
+                errors.append(f"{base_url}: empty response")
+                continue
+
+            # Guard against Cloudflare/HTML pages being returned with HTTP 200.
+            if body[0] not in "[{":
+                errors.append(f"{base_url}: non-JSON response")
+                continue
+
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                errors.append(f"{base_url}: JSON list empty/unusable")
+                continue
+
+            return data, base_url, None
+
+        except Exception as e:
+            errors.append(f"{base_url}: {type(e).__name__}: {e}")
+
+    return None, "", " | ".join(errors) if errors else "No Forex Factory URL available."
+
+
+
 def refresh_economic_news():
     """
     Refresh ALL supported HIGH-impact Forex Factory events into SQLite.
@@ -1513,19 +1654,11 @@ def refresh_economic_news():
     now_utc = datetime.now(timezone.utc)
 
     try:
-        r = requests.get(
-            FOREX_FACTORY_CALENDAR_URL,
-            headers={
-                "User-Agent": "Mozilla/5.0 EdoSignal/1.0",
-                "Accept": "application/json,text/plain,*/*",
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
+        data, source_url, fetch_error = _download_forex_factory_calendar()
 
-        if not isinstance(data, list):
-            return False, "Forex Factory calendar returned no usable event list."
+        if not data:
+            _save_news_feed_status(False, fetch_error or "No usable event list.", source_url)
+            return False, fetch_error or "Forex Factory calendar returned no usable event list."
 
         fetched = datetime.utcnow().isoformat()
         rows = []
@@ -1563,7 +1696,9 @@ def refresh_economic_news():
 
         # Never erase a good cache because of a temporary empty/bad feed.
         if not rows:
-            return False, "Forex Factory returned no usable upcoming High-impact rows; existing cache kept."
+            error = "Forex Factory returned no usable upcoming High-impact rows; existing cache kept."
+            _save_news_feed_status(False, error, source_url)
+            return False, error
 
         with db_conn() as c:
             c.execute("DELETE FROM economic_news")
@@ -1579,11 +1714,16 @@ def refresh_economic_news():
             )
             c.commit()
 
-        print(f"Forex Factory news cache refreshed: {len(rows)} High-impact event(s).")
+        _save_news_feed_status(True, "", source_url)
+        print(
+            f"Forex Factory news cache refreshed: {len(rows)} High-impact event(s) "
+            f"from {source_url}"
+        )
         return True, None
 
     except Exception as e:
         print("Forex Factory economic news refresh error", e)
+        _save_news_feed_status(False, str(e), "")
         return False, str(e)
 
 
@@ -5062,7 +5202,8 @@ def refresh_news_now():
 
         return jsonify(
             ok=True,
-            cached_high_impact_events=cached_count
+            cached_high_impact_events=cached_count,
+            source=_get_news_feed_status().get("source_url", "")
         ), 200
 
     except Exception as e:
@@ -5087,6 +5228,10 @@ def home():
     # News comes from SQLite cache only, so HOME remains fast.
     news_items = cached_home_news(limit=6)
     news_configured = True
+    news_feed_status = _get_news_feed_status()
+    news_feed_unavailable = bool(
+        not news_items and news_feed_status.get("last_error")
+    )
 
     try:
         with db_conn() as c:
@@ -5149,7 +5294,9 @@ def home():
         trend_statuses=trend_statuses,
         trend_snapshots=trend_snapshots,
         news_items=news_items,
-        news_configured=news_configured
+        news_configured=news_configured,
+        news_feed_status=news_feed_status,
+        news_feed_unavailable=news_feed_unavailable
     )
 
 
