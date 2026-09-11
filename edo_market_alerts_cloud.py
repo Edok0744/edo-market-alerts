@@ -2347,7 +2347,6 @@ PATTERN_TIMEFRAMES = [
 
 # Edo's exact signal timeframes.
 NORMAL_PULLBACK_INTERVALS = {"4h", "8h"}
-DAILY_2PLUS_INTERVALS = {"1day"}
 SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
 
 # Alias retained for older helper code.
@@ -2464,6 +2463,7 @@ def interval_seconds(interval):
         "2h": 2 * 60 * 60,
         "4h": 4 * 60 * 60,
         "8h": 8 * 60 * 60,
+        "12h": 12 * 60 * 60,
         "1day": 24 * 60 * 60,
         "1week": 7 * 24 * 60 * 60,
     }
@@ -3135,62 +3135,6 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False):
         "target": target,
     }
 
-
-def detect_daily_2plus_signal(candles, conf):
-    """
-    Edo DAILY 2+ CANDLE SIGNAL — independent from Trend Pullback and S/R Gap-Retest.
-
-    Rules:
-      - DAILY timeframe only (caller controls timeframe).
-      - Use fully CLOSED candles only.
-      - Minimum 2 consecutive candles of the same colour.
-      - Then the next fully CLOSED candle must be the opposite colour.
-      - 2, 3, 4, 5+ same-colour candles are allowed.
-      - NO trend-direction requirement.
-      - NO higher-timeframe trend filter.
-      - NO 50% body-penetration rule.
-      - NO S/R or gap/retest is required.
-
-    Examples:
-      2+ red closed candles -> green closed candle = bullish possibility.
-      2+ green closed candles -> red closed candle = bearish possibility.
-    """
-    i = conf["index"]
-    if i < 2:
-        return None
-
-    direction = conf["direction"]
-
-    if direction == "bullish":
-        run_colour = "red"
-    elif direction == "bearish":
-        run_colour = "green"
-    else:
-        return None
-
-    run_count, run_start = count_same_colour_before(candles, i, run_colour)
-    if run_count < 2:
-        return None
-
-    confirm_candle = candles[i]
-
-    return {
-        "name": "DAILY 2+ CANDLE SIGNAL",
-        "direction": direction,
-        "confirmed": True,
-        "score": 6.0 + min(3.0, (run_count - 2) * 0.75),
-        "confirmation_date": conf["date"],
-        "confirmation_close": float(confirm_candle["close"]),
-        "run_count": run_count,
-        "run_colour": run_colour,
-        "run_dates": [
-            candles[j].get("datetime", "")
-            for j in range(run_start, i)
-        ],
-        "context": "daily_2plus_no_trend",
-        "target": previous_target(candles, direction, run_start),
-    }
-
 def sr_second_reaction_exception(candles, setup):
     """
     Edo 8H / Daily early-trend exception.
@@ -3318,18 +3262,6 @@ def describe_setup(p):
             f"{zone_word.title()} zone: {p['level']:.5f} • "
             f"Latest close: {p['confirmation_close']:.5f}"
         )
-
-    elif p["name"] == "DAILY 2+ CANDLE SIGNAL":
-        run_dates = ", ".join(p.get("run_dates", []))
-        detail = (
-            f"{direction_word} Daily 2+ candle signal on {p['confirmation_date']}. "
-            f"{p['run_count']} consecutive {p['run_colour']} fully CLOSED Daily candles "
-            f"were followed by an opposite-colour fully CLOSED Daily confirmation candle. "
-            f"No trend direction is required. No higher-timeframe trend filter is required. "
-            f"No 50% body-penetration rule applies. No S/R gap-retest is required. "
-            f"Prior candle times: {run_dates or 'n/a'}."
-        )
-        level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
 
     elif p["name"] == "TREND PULLBACK SETUP":
         run_dates = ", ".join(p.get("run_dates", []))
@@ -3964,16 +3896,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             if pullback:
                 found.append(pullback)
 
-    # B) DAILY 2+ CANDLE SIGNAL — its OWN signal family.
-    #    Minimum 2 same-colour fully CLOSED Daily candles, then opposite-colour
-    #    fully CLOSED confirmation. NO trend direction. NO 50% rule. NO S/R required.
-    if interval in DAILY_2PLUS_INTERVALS:
-        for conf in recent_confirmations(closed_candles, lookback=9):
-            daily_signal = detect_daily_2plus_signal(closed_candles, conf)
-            if daily_signal:
-                found.append(daily_signal)
-
-    # C) Edo S/R GAP-AND-RETEST — 8H, Daily and Weekly.
+    # B) Edo S/R GAP-AND-RETEST — 8H, Daily and Weekly.
     #    Established high/low on the left -> clear move away / separation ->
     #    later retest of the same zone -> opposite-colour CLOSED confirmation.
     #    The 50% previous-candle BODY rule applies ONLY to this signal.
@@ -4000,12 +3923,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             p for p in found
             if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
-    elif interval == "1day":
-        found = [
-            p for p in found
-            if p.get("name") in ("DAILY 2+ CANDLE SIGNAL", "S/R GAP RETEST SETUP")
-        ]
-    elif interval == "1week":
+    elif interval in ("1day", "1week"):
         found = [p for p in found if p.get("name") == "S/R GAP RETEST SETUP"]
     else:
         found = []
@@ -4091,9 +4009,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             else:
                 summary = "No recent setup matches your candle-close pattern rules on this timeframe."
 
-    # Weekly Spike warning is enabled.
-    # It is separate from Edo's normal trading setups and remains WARNING ONLY.
-    weekly_spike = detect_weekly_spike(closed_candles) if interval == "1week" else None
+    # Weekly Spike disabled: Edo wants ONLY his requested trading signals.
+    weekly_spike = None
 
     data = {
         "price": closed_candles[-1]["close"],
@@ -4133,8 +4050,6 @@ def pattern_signal_family(p):
 
     if "S/R GAP RETEST" in name:
         return "SR_GAP_RETEST"
-    if "DAILY 2+ CANDLE" in name:
-        return "DAILY_2PLUS"
     if "TREND PULLBACK" in name:
         return "TREND_PULLBACK"
     if "RANGE" in name and "REVERSAL" in name:
@@ -4152,8 +4067,6 @@ def pattern_push_priority(p):
 
     if "S/R GAP RETEST" in name:
         return 25
-    if "DAILY 2+ CANDLE" in name:
-        return 20
     if "TREND PULLBACK" in name:
         return 20
     if "RANGE" in name and "REVERSAL" in name:
@@ -4333,15 +4246,6 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 f"through the previous candle body. "
                 f"{direction_word} possibility. Review the chart before trading."
             )
-        elif p.get("name") == "DAILY 2+ CANDLE SIGNAL":
-            push_body = (
-                f"DAILY 2+ CANDLE SIGNAL confirmed on the NEWEST CLOSED Daily candle "
-                f"({confirmation_date}). "
-                f"{p.get('run_count', 0)} consecutive {p.get('run_colour', '')} CLOSED Daily candles "
-                f"were followed by an opposite-colour CLOSED Daily candle. "
-                f"No trend direction required. No 50% rule. No S/R gap-retest required. "
-                f"{direction_word} possibility. Review the chart before trading."
-            )
         else:
             push_body = (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
@@ -4358,11 +4262,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     """
-    Collect Edo's trading setups from fully closed candles only:
-      - 4H/8H Trend Pullback (trend filtered, no 50%)
-      - Daily 2+ Candle Signal (no trend direction, no 50%, independent)
-      - 8H/Daily/Weekly S/R Gap-Retest (50% rule)
-    Weekly Spike is monitored separately as a warning.
+    Collect Edo's two trading setups from fully closed candles only: normal Trend Pullback (no 50%) and S/R Gap-Retest (50% rule).
 
     Returns:
       setups, latest_closed_date, error
@@ -4392,14 +4292,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             if pullback:
                 found.append(pullback)
 
-    # B) DAILY 2+ CANDLE SIGNAL — independent, NO trend direction, NO 50%.
-    if interval in DAILY_2PLUS_INTERVALS:
-        for conf in recent_confirmations(closed_candles, lookback=9):
-            daily_signal = detect_daily_2plus_signal(closed_candles, conf)
-            if daily_signal:
-                found.append(daily_signal)
-
-    # C) S/R GAP-AND-RETEST — 8H, Daily and Weekly, WITH 50% rule.
+    # B) S/R GAP-AND-RETEST — 8H, Daily and Weekly, WITH 50% rule.
     if interval in SR_GAP_RETEST_INTERVALS:
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
@@ -4414,7 +4307,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     setups = list(unique.values())
 
-    # Hard whitelist for automatic trading-pattern notifications. Weekly Spike is handled separately as a warning.
+    # Hard whitelist for automatic phone notifications.
     if interval == "4h":
         setups = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
     elif interval == "8h":
@@ -4422,12 +4315,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             p for p in setups
             if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
-    elif interval == "1day":
-        setups = [
-            p for p in setups
-            if p.get("name") in ("DAILY 2+ CANDLE SIGNAL", "S/R GAP RETEST SETUP")
-        ]
-    elif interval == "1week":
+    elif interval in ("1day", "1week"):
         setups = [p for p in setups if p.get("name") == "S/R GAP RETEST SETUP"]
     else:
         setups = []
@@ -4963,47 +4851,44 @@ def _aggregate_4h_to_12h(candles_4h):
     """
     Build synthetic 12H candles from Twelve Data 4H candles.
 
-    Twelve Data does not provide a native 12h interval on this plan.
-    We combine 3 consecutive 4H candles into one 12H candle, aligned to
-    00:00-12:00 and 12:00-24:00 using the timestamps returned by Twelve Data.
+    A valid 12H candle must contain the expected three consecutive 4H starts:
+      00:00, 04:00, 08:00  -> 00:00-12:00
+      12:00, 16:00, 20:00  -> 12:00-24:00
 
-    The newest synthetic 12H candle may still be forming, which is fine because
-    last_closed_candle() always ignores the newest candle for signal decisions.
+    This prevents an incomplete Forex/weekend bucket from being mistaken for a
+    completed 12H candle. The newest 3-part bucket can still contain a forming
+    final 4H candle; fully_closed_candles(..., "12h") handles that safely.
     """
     buckets = {}
 
     for c in candles_4h:
-        dt_text = c.get("datetime", "")
-        try:
-            dt = datetime.strptime(dt_text, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
+        dt = parse_candle_utc(c.get("datetime", ""))
+        if dt is None:
             continue
 
         bucket_hour = 0 if dt.hour < 12 else 12
         bucket_key = dt.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
-
-        if bucket_key not in buckets:
-            buckets[bucket_key] = []
-        buckets[bucket_key].append(c)
+        buckets.setdefault(bucket_key, []).append((dt, c))
 
     synthetic = []
 
     for bucket_key in sorted(buckets):
-        group = sorted(buckets[bucket_key], key=lambda x: x["datetime"])
+        group = sorted(buckets[bucket_key], key=lambda item: item[0])
+        expected_hours = {bucket_key.hour, bucket_key.hour + 4, bucket_key.hour + 8}
+        actual_hours = {dt.hour for dt, _ in group}
 
-        # A complete 12H candle contains exactly three 4H candles.
-        # Keep an incomplete newest bucket too, so last_closed_candle()
-        # can safely skip it if it is still forming.
-        if len(group) < 1:
+        # Only build a 12H candle from all three expected 4H parts.
+        if len(group) != 3 or actual_hours != expected_hours:
             continue
 
+        parts = [c for _, c in group]
         synthetic.append({
             "datetime": bucket_key.strftime("%Y-%m-%d %H:%M:%S"),
-            "open": group[0]["open"],
-            "high": max(x["high"] for x in group),
-            "low": min(x["low"] for x in group),
-            "close": group[-1]["close"],
-            "_parts": len(group),
+            "open": parts[0]["open"],
+            "high": max(x["high"] for x in parts),
+            "low": min(x["low"] for x in parts),
+            "close": parts[-1]["close"],
+            "_parts": 3,
         })
 
     return synthetic
@@ -5034,9 +4919,7 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
 
         candles_12h = _aggregate_4h_to_12h(candles_4h)
 
-        # We need at least two synthetic candles because last_closed_candle()
-        # deliberately ignores the newest one.
-        if len(candles_12h) < 2:
+        if len(candles_12h) < 1:
             return None, "Not enough 4H candle history to build completed 12H candles."
 
         return candles_12h[-outputsize:], None
@@ -5758,6 +5641,8 @@ threading.Thread(
     daemon=True
 ).start()
 
+# Weekly Spike warning is one of Edo's intended signals.
+# It is a warning only and uses fully closed Weekly candles.
 threading.Thread(
     target=weekly_spike_monitor,
     daemon=True
