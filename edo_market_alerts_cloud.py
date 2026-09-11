@@ -3604,9 +3604,10 @@ def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
       require 8H + 12H + 1D all aligned with the setup direction.
 
     8H continuation setup:
-      require 12H + 1D + 1W all aligned with the setup direction.
+      no higher-timeframe filter is used; this branch is retained only for
+      compatibility and is not called by the active 8H signal flow.
 
-    Daily and Weekly Trend Pullback patterns are NOT blocked by this filter.
+    Daily and Weekly normal Trend Pullback patterns are disabled elsewhere.
     No indicators are used; Bullish = close > open, Bearish = close < open.
     """
     if interval == "4h":
@@ -3648,15 +3649,16 @@ def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
 
 def apply_strong_trend_filter(symbol, grp, interval, setups):
     """
-    4H and 8H Trend Pullback signals are continuation-only signals.
+    4H Trend Pullback signals are continuation-only signals.
 
-    A bullish setup is allowed only when all required CLOSED higher
-    timeframes are Bullish. A bearish setup is allowed only when they
+    A bullish 4H setup is allowed only when all required CLOSED higher
+    timeframes are Bullish. A bearish 4H setup is allowed only when they
     are all Bearish.
 
-    Daily and Weekly setups remain unrestricted by this strong-trend filter.
+    8H Trend Pullback is intentionally NOT filtered by higher-timeframe trend.
+    Daily and Weekly normal Trend Pullback signals are disabled elsewhere.
     """
-    if interval not in ("4h", "8h"):
+    if interval != "4h":
         return setups, None, None
 
     higher_direction, states, error = strong_higher_timeframe_trend(
@@ -3928,10 +3930,12 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     else:
         found = []
 
-    # 4H remains strong-trend-only. 8H normally uses the strong-trend filter,
-    # but an approved second-S/R-reaction exception may bypass it.
+    # Edo rule: ONLY the 4H normal Trend Pullback requires strong higher-timeframe
+    # trend alignment. The 8H normal Trend Pullback is pure candle-sequence logic:
+    # minimum 2 same-colour pullback candles, then the first opposite-colour
+    # fully CLOSED confirmation candle. No higher-timeframe trend filter on 8H.
     higher_tf_states = None
-    if interval in ("4h", "8h"):
+    if interval == "4h":
         normal_found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
         other_found = [p for p in found if p.get("name") != "TREND PULLBACK SETUP"]
 
@@ -3995,12 +3999,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                     "rejection_reason",
                     "Pattern detected, but rejected because the confirmation candle moved too far into historical support/resistance."
                 )
-            elif interval in ("4h", "8h") and higher_tf_states:
+            elif interval == "4h" and higher_tf_states:
                 state_text = " | ".join(f"{k} {v}" for k, v in higher_tf_states.items())
-                if interval == "4h":
-                    rule_text = "8H + 12H + 1D"
-                else:
-                    rule_text = "12H + 1D + 1W"
+                rule_text = "8H + 12H + 1D"
                 summary = (
                     f"No {interval.upper()} setup passed the strong higher-timeframe filter. "
                     f"For this alert, {rule_text} must all agree with the setup direction. "
@@ -4320,11 +4321,11 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     else:
         setups = []
 
-    # 4H and 8H normal Trend Pullback remains subject to the existing
-    # strong higher-timeframe trend filter. The separate S/R Gap-Retest
-    # setup is not forced through that continuation filter.
+    # Edo rule: ONLY 4H normal Trend Pullback uses the strong higher-timeframe
+    # trend filter. 8H normal Trend Pullback must NOT be blocked by trend alignment.
+    # The separate S/R Gap-Retest setup is also independent of this filter.
 
-    if interval in ("4h", "8h"):
+    if interval == "4h":
         normal_setups = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
         other_setups = [p for p in setups if p.get("name") != "TREND PULLBACK SETUP"]
 
