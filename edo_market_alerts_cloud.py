@@ -16,7 +16,11 @@ FOREX_FACTORY_CALENDAR_URL = os.environ.get(
 )
 FOREX_FACTORY_CALENDAR_FALLBACK_URL = os.environ.get(
     'FOREX_FACTORY_CALENDAR_FALLBACK_URL',
-    'https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json'
+    'https://www.forexfactory.com/ffcal_week_this.xml'
+)
+FOREX_FACTORY_CALENDAR_SECONDARY_JSON_URL = os.environ.get(
+    'FOREX_FACTORY_CALENDAR_SECONDARY_JSON_URL',
+    'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
 )
 NEWS_REFRESH_SECONDS = int(os.environ.get('NEWS_REFRESH_SECONDS', '1800'))
 NEWS_WARNING_MINUTES = int(os.environ.get('NEWS_WARNING_MINUTES', '5'))
@@ -1244,6 +1248,22 @@ def db_conn():
     return c
 
 
+
+def _ensure_column(conn, table_name, column_name, column_sql):
+    """
+    Add a missing SQLite column safely on existing Railway databases.
+    SQLite CREATE TABLE IF NOT EXISTS does not add new columns to an old table,
+    so EdoSignal performs a tiny migration at startup.
+    """
+    cols = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    existing = {row[1] for row in cols}
+    if column_name not in existing:
+        conn.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
+        )
+
+
+
 def init_db():
     with db_conn() as c:
         # WAL allows the home page to READ saved data while background
@@ -1392,6 +1412,14 @@ def init_db():
             updated TEXT
         )
         """)
+
+        # Existing Railway databases may already have this table from an older
+        # version with fewer columns. Add any missing columns automatically.
+        _ensure_column(c, "economic_news_reactions", "reaction_15", "TEXT")
+        _ensure_column(c, "economic_news_reactions", "score_15", "REAL")
+        _ensure_column(c, "economic_news_reactions", "reaction_30", "TEXT")
+        _ensure_column(c, "economic_news_reactions", "score_30", "REAL")
+        _ensure_column(c, "economic_news_reactions", "updated", "TEXT")
 
         c.execute("""
         CREATE TABLE IF NOT EXISTS economic_news_status(
@@ -1575,24 +1603,32 @@ def _get_news_feed_status():
 
 def _download_forex_factory_calendar():
     """
-    Fetch the weekly Forex Factory JSON with two public FairEconomy endpoints.
+    Fetch this week's Forex Factory calendar.
 
-    Railway/cloud hosts can occasionally get a transient block or edge failure
-    on one hostname, so EdoSignal tries the normal endpoint first and then the
-    CDN hostname. A cache-busting query string and normal browser headers are
-    used to avoid stale/error edge responses.
+    Railway has shown DNS failures for some FairEconomy CDN hostnames.
+    EdoSignal therefore tries:
+      1) FairEconomy JSON
+      2) Forex Factory weekly XML directly
+
+    Returns:
+      (events_list, source_url, error_text)
+
+    The returned event objects are normalized to the same keys expected by
+    refresh_economic_news():
+      title, country, date, impact
     """
-    urls = []
-    for url in (
-        FOREX_FACTORY_CALENDAR_URL,
-        FOREX_FACTORY_CALENDAR_FALLBACK_URL,
-    ):
-        if url and url not in urls:
-            urls.append(url)
-
     errors = []
 
-    for base_url in urls:
+    # ---------- 1) FairEconomy JSON ----------
+    json_urls = []
+    for base_url in (
+        FOREX_FACTORY_CALENDAR_URL,
+        FOREX_FACTORY_CALENDAR_SECONDARY_JSON_URL,
+    ):
+        if base_url and base_url not in json_urls:
+            json_urls.append(base_url)
+
+    for base_url in json_urls:
         try:
             separator = "&" if "?" in base_url else "?"
             url = f"{base_url}{separator}edo_ts={int(time.time())}"
@@ -1624,22 +1660,109 @@ def _download_forex_factory_calendar():
                 errors.append(f"{base_url}: empty response")
                 continue
 
-            # Guard against Cloudflare/HTML pages being returned with HTTP 200.
             if body[0] not in "[{":
                 errors.append(f"{base_url}: non-JSON response")
                 continue
 
             data = r.json()
-            if not isinstance(data, list) or not data:
-                errors.append(f"{base_url}: JSON list empty/unusable")
-                continue
+            if isinstance(data, list) and data:
+                return data, base_url, None
 
-            return data, base_url, None
+            errors.append(f"{base_url}: JSON list empty/unusable")
 
         except Exception as e:
             errors.append(f"{base_url}: {type(e).__name__}: {e}")
 
-    return None, "", " | ".join(errors) if errors else "No Forex Factory URL available."
+    # ---------- 2) Direct Forex Factory XML ----------
+    xml_url = FOREX_FACTORY_CALENDAR_FALLBACK_URL
+    if xml_url:
+        try:
+            from xml.etree import ElementTree as ET
+
+            separator = "&" if "?" in xml_url else "?"
+            url = f"{xml_url}{separator}edo_ts={int(time.time())}"
+
+            r = requests.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/140.0 Safari/537.36"
+                    ),
+                    "Accept": "application/xml,text/xml,text/plain,*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "Connection": "close",
+                },
+                timeout=20,
+                allow_redirects=True,
+            )
+
+            if r.status_code != 200:
+                errors.append(f"{xml_url}: HTTP {r.status_code}")
+            else:
+                root = ET.fromstring(r.content)
+                normalized = []
+
+                for event in root.findall(".//event"):
+                    def _txt(tag):
+                        node = event.find(tag)
+                        return (node.text or "").strip() if node is not None and node.text else ""
+
+                    title = _txt("title")
+                    country = _txt("country").upper()
+                    impact = _txt("impact")
+                    date_str = _txt("date")
+                    time_str = _txt("time")
+
+                    if not title or not country or not date_str:
+                        continue
+
+                    # Forex Factory XML date/time is displayed in site's selected
+                    # timezone. For the public weekly feed, common format is:
+                    # 09-11-2026 + 8:30pm
+                    # We interpret this as America/New_York event time because
+                    # Forex Factory economic release times are keyed to New York
+                    # session time and convert to UTC here.
+                    dt_local = None
+                    for fmt in ("%m-%d-%Y %I:%M%p", "%m-%d-%Y %H:%M"):
+                        try:
+                            dt_local = datetime.strptime(
+                                f"{date_str} {time_str}".strip(),
+                                fmt
+                            )
+                            break
+                        except Exception:
+                            pass
+
+                    if dt_local is None:
+                        continue
+
+                    try:
+                        ny = ZoneInfo("America/New_York")
+                        dt_local = dt_local.replace(tzinfo=ny)
+                        dt_utc = dt_local.astimezone(timezone.utc)
+                    except Exception:
+                        dt_utc = dt_local.replace(tzinfo=timezone.utc)
+
+                    normalized.append({
+                        "title": title,
+                        "country": country,
+                        "impact": impact,
+                        "date": dt_utc.isoformat(),
+                    })
+
+                if normalized:
+                    return normalized, xml_url, None
+
+                errors.append(f"{xml_url}: XML contained no usable events")
+
+        except Exception as e:
+            errors.append(f"{xml_url}: {type(e).__name__}: {e}")
+
+    return None, "", " | ".join(errors) if errors else "No calendar source available."
 
 
 
