@@ -3623,7 +3623,7 @@ def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
             candles, err = get_candles(symbol, "12h", outputsize=6, grp=grp)
             if err:
                 return None, states, err
-            closed = last_closed_candle(candles, interval)
+            closed = last_closed_candle(candles, "12h")
         else:
             candles, err = get_ohlc(symbol, tf_interval, outputsize=60, grp=grp)
             if err:
@@ -4849,41 +4849,66 @@ def twelve_symbol(symbol, grp=None):
 
 def _aggregate_4h_to_12h(candles_4h):
     """
-    Build synthetic 12H candles from Twelve Data 4H candles.
+    Build synthetic 12H candles from 3 consecutive 4H candles.
 
-    A valid 12H candle must contain the expected three consecutive 4H starts:
-      00:00, 04:00, 08:00  -> 00:00-12:00
-      12:00, 16:00, 20:00  -> 12:00-24:00
+    Important: Twelve Data can anchor 4H candles at different UTC hours for
+    different markets (for example 00/04/08... or 01/05/09...).  Therefore
+    we must not assume every market starts its 4H candles at 00:00 UTC.
 
-    This prevents an incomplete Forex/weekend bucket from being mistaken for a
-    completed 12H candle. The newest 3-part bucket can still contain a forming
-    final 4H candle; fully_closed_candles(..., "12h") handles that safely.
+    This function detects the market's 4H phase from the returned timestamps,
+    groups into two 12H blocks per day using that phase, and only keeps blocks
+    that contain all three consecutive 4H parts.
     """
-    buckets = {}
+    from collections import Counter
+    from datetime import timedelta
 
-    for c in candles_4h:
+    parsed = []
+    for c in candles_4h or []:
         dt = parse_candle_utc(c.get("datetime", ""))
-        if dt is None:
-            continue
+        if dt is not None:
+            parsed.append((dt, c))
 
-        bucket_hour = 0 if dt.hour < 12 else 12
-        bucket_key = dt.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
-        buckets.setdefault(bucket_key, []).append((dt, c))
+    if not parsed:
+        return []
+
+    parsed.sort(key=lambda item: item[0])
+
+    # Detect the UTC start-hour phase of the 4H series.
+    # Examples: 00/04/08... -> phase 0, 01/05/09... -> phase 1.
+    phase_counts = Counter(dt.hour % 4 for dt, _ in parsed)
+    phase = phase_counts.most_common(1)[0][0]
+
+    buckets = {}
+    for dt, c in parsed:
+        shifted = dt - timedelta(hours=phase)
+        bucket_hour = 0 if shifted.hour < 12 else 12
+        bucket_shifted = shifted.replace(
+            hour=bucket_hour, minute=0, second=0, microsecond=0
+        )
+        bucket_start = bucket_shifted + timedelta(hours=phase)
+        buckets.setdefault(bucket_start, []).append((dt, c))
 
     synthetic = []
+    for bucket_start in sorted(buckets):
+        group = sorted(buckets[bucket_start], key=lambda item: item[0])
 
-    for bucket_key in sorted(buckets):
-        group = sorted(buckets[bucket_key], key=lambda item: item[0])
-        expected_hours = {bucket_key.hour, bucket_key.hour + 4, bucket_key.hour + 8}
-        actual_hours = {dt.hour for dt, _ in group}
+        if len(group) != 3:
+            continue
 
-        # Only build a 12H candle from all three expected 4H parts.
-        if len(group) != 3 or actual_hours != expected_hours:
+        expected = [
+            bucket_start,
+            bucket_start + timedelta(hours=4),
+            bucket_start + timedelta(hours=8),
+        ]
+        actual = [dt for dt, _ in group]
+
+        # Keep only a real 3 x 4H sequence; reject gaps/missing candles.
+        if actual != expected:
             continue
 
         parts = [c for _, c in group]
         synthetic.append({
-            "datetime": bucket_key.strftime("%Y-%m-%d %H:%M:%S"),
+            "datetime": bucket_start.strftime("%Y-%m-%d %H:%M:%S"),
             "open": parts[0]["open"],
             "high": max(x["high"] for x in parts),
             "low": min(x["low"] for x in parts),
