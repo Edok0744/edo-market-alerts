@@ -2214,11 +2214,14 @@ def cached_home_news(limit=6):
 
             affected_pairs = saved_markets_for_news_currency(row["currency"])
 
-            # The cache now contains all High-impact currencies.
-            # Only display events that affect at least one saved market.
-            if not affected_pairs:
-                continue
-
+            # IMPORTANT:
+            # Always display the valid High-Impact event from the Forex Factory
+            # cache. The saved-pair lookup is informational only.
+            #
+            # Previously, if the saved-pair match returned an empty list for any
+            # reason, the whole news event was hidden. That caused EdoSignal to
+            # say "No more High-Impact news today" even though USD CPI was still
+            # coming later the same day.
             items.append({
                 "event_id": row["event_id"],
                 "currency": row["currency"],
@@ -2229,6 +2232,11 @@ def cached_home_news(limit=6):
                 "countdown": countdown,
                 "level": news_warning_level(minutes_until),
                 "affected_pairs": affected_pairs,
+                "affected_pairs_text": (
+                    ", ".join(affected_pairs)
+                    if affected_pairs
+                    else "No saved-pair match"
+                ),
                 "event_time_ms": int(event_dt.timestamp() * 1000),
             })
 
