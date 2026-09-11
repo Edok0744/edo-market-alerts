@@ -425,6 +425,8 @@ h2{font-size:18px}
 .news-reaction.mixed{color:#f2c94c;background:#4a4020}
 .news-outcomes{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
 .news-outcome-label{font-size:11px;color:#9eb5c9;font-weight:800;margin-right:2px}
+.news-pair-outcome-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:5px;font-size:12px}
+.news-pair-symbol{min-width:72px;color:#e8f2ff;font-weight:900}
 
 .news-chip{
     display:inline-block;
@@ -555,9 +557,12 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
                 <div class="news-outcomes js-news-outcome-group"
                      data-event-id="{{ n['event_id'] }}"
                      data-event-ms="{{ n['event_time_ms'] }}">
-                    <span class="news-outcome-label">Outcome:</span>
-                    <span class="news-reaction reading js-news-reaction-15">15M ...</span>
-                    <span class="news-reaction reading js-news-reaction-30">30M ...</span>
+                    <span class="news-outcome-label">Pair outcomes:</span>
+                    <div class="js-news-pair-outcomes" style="width:100%">
+                        <div class="news-pair-outcome-row">
+                            <strong>Waiting for 15M / 30M market reaction...</strong>
+                        </div>
+                    </div>
                 </div>
                 <div class="news-time">{{ n['perth_time'] }} Perth</div>
                 {% if n.get('affected_pairs') %}
@@ -836,21 +841,53 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
     function renderReactionGroup(groupNode, item) {
         const eventMs = Number(groupNode.dataset.eventMs || 0);
         const ageMin = eventMs ? ((Date.now() - eventMs) / 60000) : 0;
-        const n15 = groupNode.querySelector('.js-news-reaction-15');
-        const n30 = groupNode.querySelector('.js-news-reaction-30');
+        const holder = groupNode.querySelector('.js-news-pair-outcomes');
+        if (!holder) return;
 
-        paintReactionBadge(
-            n15,
-            item.reaction_15 || '',
-            '15M',
-            ageMin < 15 ? 'READING' : 'CHECKING'
-        );
-        paintReactionBadge(
-            n30,
-            item.reaction_30 || '',
-            '30M',
-            ageMin < 30 ? 'WAIT' : 'CHECKING'
-        );
+        const pairs = Array.isArray(item.pairs) ? item.pairs : [];
+        holder.innerHTML = '';
+
+        if (!pairs.length) {
+            const waitRow = document.createElement('div');
+            waitRow.className = 'news-pair-outcome-row';
+            waitRow.textContent = ageMin < 15
+                ? 'Waiting for 15M / 30M market reaction...'
+                : 'Checking affected saved pairs...';
+            holder.appendChild(waitRow);
+            return;
+        }
+
+        pairs.forEach(function(pair) {
+            const row = document.createElement('div');
+            row.className = 'news-pair-outcome-row';
+
+            const symbol = document.createElement('span');
+            symbol.className = 'news-pair-symbol';
+            symbol.textContent = pair.symbol || '';
+
+            const b15 = document.createElement('span');
+            b15.className = 'news-reaction reading';
+            paintReactionBadge(
+                b15,
+                pair.reaction_15 || '',
+                '15M',
+                ageMin < 15 ? 'READING' : 'CHECKING'
+            );
+
+            const b30 = document.createElement('span');
+            b30.className = 'news-reaction reading';
+            paintReactionBadge(
+                b30,
+                pair.reaction_30 || '',
+                '30M',
+                ageMin < 30 ? 'WAIT' : 'CHECKING'
+            );
+
+            row.appendChild(symbol);
+            row.appendChild(b15);
+            row.appendChild(b30);
+            holder.appendChild(row);
+        });
     }
 
     async function refreshNewsReactions() {
@@ -1408,6 +1445,21 @@ def init_db():
         )
         """)
 
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS economic_news_pair_reactions(
+            event_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            grp TEXT NOT NULL,
+            display_symbol TEXT NOT NULL,
+            reaction_15 TEXT,
+            score_15 REAL,
+            reaction_30 TEXT,
+            score_30 REAL,
+            updated TEXT,
+            PRIMARY KEY(event_id, symbol, grp)
+        )
+        """)
+
         # Keep older persistent Railway databases compatible with the
         # 15m / 30m news-reaction feature. CREATE TABLE IF NOT EXISTS does
         # not add columns to an already existing table, so migrate safely.
@@ -1915,8 +1967,95 @@ NEWS_REACTION_BASKETS = {
     "NZD": [("NZD/USD",  1), ("NZD/JPY",  1), ("EUR/NZD", -1)],
 }
 
-NEWS_REACTION_MIN_MOVE_15 = 0.0005   # 0.05%
-NEWS_REACTION_MIN_MOVE_30 = 0.0008   # 0.08%
+NEWS_REACTION_MIN_MOVE_15 = 0.0005   # legacy basket threshold
+NEWS_REACTION_MIN_MOVE_30 = 0.0008   # legacy basket threshold
+
+# Pair-specific news outcome threshold. The user wants the actual affected
+# market direction, not a majority vote across unrelated USD/EUR crosses.
+# Only a nearly flat move is labelled MIXED.
+NEWS_PAIR_MIN_MOVE = 0.0001  # 0.01%
+
+
+def _saved_news_markets(currency):
+    """Return saved affected markets with raw symbol/group + display symbol."""
+    currency = str(currency).upper().strip()
+    out = []
+    try:
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT symbol, grp FROM favorites "
+                "WHERE grp IN ('FOREX','CRYPTO','CFD') ORDER BY grp,symbol"
+            ).fetchall()
+
+        seen = set()
+        for row in rows:
+            symbol = str(row["symbol"])
+            grp = str(row["grp"]).upper()
+            if currency not in currencies_for_market(symbol, grp):
+                continue
+
+            display_symbol = symbol.upper()
+            if grp == "FOREX":
+                compact = normalize_pair_symbol(display_symbol)
+                if len(compact) >= 6:
+                    display_symbol = f"{compact[:3]}/{compact[3:6]}"
+
+            key = (symbol.upper(), grp)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "symbol": symbol,
+                "grp": grp,
+                "display_symbol": display_symbol,
+            })
+    except Exception as e:
+        print("saved news markets error", e)
+    return out
+
+
+def _news_pair_reaction(symbol, grp, event_dt, minutes_after):
+    """Actual price direction of one affected saved market after the release."""
+    candles, error = get_ohlc(symbol, "1min", outputsize=120, grp=grp)
+    if not candles:
+        return None, None
+
+    before = _price_close_at_or_before(candles, event_dt)
+    after = _price_close_at_or_before(
+        candles, event_dt + timedelta(minutes=int(minutes_after))
+    )
+    if before is None or after is None or before == 0:
+        return None, None
+
+    move = (after - before) / before
+    if move >= NEWS_PAIR_MIN_MOVE:
+        return "BULLISH", move
+    if move <= -NEWS_PAIR_MIN_MOVE:
+        return "BEARISH", move
+    return "MIXED", move
+
+
+def _save_news_pair_reaction(event_id, market, minutes_after, reaction, score):
+    col = "reaction_15" if int(minutes_after) == 15 else "reaction_30"
+    score_col = "score_15" if int(minutes_after) == 15 else "score_30"
+    with db_conn() as c:
+        c.execute(
+            f"""
+            INSERT INTO economic_news_pair_reactions(
+                event_id,symbol,grp,display_symbol,{col},{score_col},updated
+            ) VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(event_id,symbol,grp) DO UPDATE SET
+                display_symbol=excluded.display_symbol,
+                {col}=excluded.{col},
+                {score_col}=excluded.{score_col},
+                updated=excluded.updated
+            """,
+            (
+                event_id, market["symbol"], market["grp"], market["display_symbol"],
+                reaction, score, datetime.utcnow().isoformat()
+            )
+        )
+        c.commit()
 
 
 def _price_close_at_or_before(candles, target_utc):
@@ -2080,6 +2219,41 @@ def economic_news_reaction_monitor():
                             if not row["reaction_30"]:
                                 _save_news_reaction(row["event_id"], 30, reaction, score)
 
+                # Pair-specific outcomes: each affected SAVED market gets its own
+                # actual 15m/30m price direction. This is what the home page shows.
+                # Simultaneous events (e.g. four USD CPI releases) share the same
+                # market calculation and the result is copied to each event id.
+                markets = _saved_news_markets(currency)
+                for market in markets:
+                    with db_conn() as c:
+                        existing = c.execute(
+                            """
+                            SELECT reaction_15,reaction_30
+                            FROM economic_news_pair_reactions
+                            WHERE event_id=? AND symbol=? AND grp=?
+                            """,
+                            (group_rows[0]["event_id"], market["symbol"], market["grp"])
+                        ).fetchone()
+
+                    pair_need_15 = age_minutes >= 15 and (not existing or not existing["reaction_15"])
+                    pair_need_30 = age_minutes >= 30 and (not existing or not existing["reaction_30"])
+
+                    if pair_need_15:
+                        pr, ps = _news_pair_reaction(
+                            market["symbol"], market["grp"], event_dt, 15
+                        )
+                        if pr:
+                            for row in group_rows:
+                                _save_news_pair_reaction(row["event_id"], market, 15, pr, ps)
+
+                    if pair_need_30:
+                        pr, ps = _news_pair_reaction(
+                            market["symbol"], market["grp"], event_dt, 30
+                        )
+                        if pr:
+                            for row in group_rows:
+                                _save_news_pair_reaction(row["event_id"], market, 30, pr, ps)
+
         except Exception as e:
             print("economic news reaction monitor error", e)
 
@@ -2128,7 +2302,32 @@ def news_reaction_payload():
                 "reaction_30": r30 or "",
                 "score_15": row["score_15"],
                 "score_30": row["score_30"],
+                "pairs": [],
             }
+
+        if result:
+            placeholders = ",".join("?" for _ in result)
+            with db_conn() as c:
+                pair_rows = c.execute(
+                    f"""
+                    SELECT event_id,display_symbol,reaction_15,score_15,reaction_30,score_30
+                    FROM economic_news_pair_reactions
+                    WHERE event_id IN ({placeholders})
+                    ORDER BY display_symbol
+                    """,
+                    tuple(result.keys())
+                ).fetchall()
+
+            for pr in pair_rows:
+                if pr["event_id"] not in result:
+                    continue
+                result[pr["event_id"]]["pairs"].append({
+                    "symbol": pr["display_symbol"],
+                    "reaction_15": pr["reaction_15"] or "",
+                    "reaction_30": pr["reaction_30"] or "",
+                    "score_15": pr["score_15"],
+                    "score_30": pr["score_30"],
+                })
 
         return result
 
