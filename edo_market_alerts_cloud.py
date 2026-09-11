@@ -423,6 +423,8 @@ h2{font-size:18px}
 .news-reaction.bullish{color:#72f0a0;background:#173e2a}
 .news-reaction.bearish{color:#ff7d8d;background:#4a1d28}
 .news-reaction.mixed{color:#f2c94c;background:#4a4020}
+.news-outcomes{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.news-outcome-label{font-size:11px;color:#9eb5c9;font-weight:800;margin-right:2px}
 
 .news-chip{
     display:inline-block;
@@ -546,9 +548,16 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
             <div class="news-left">
                 <div class="news-title">
                     <span class="news-chip">{{ n['currency'] }}</span>{{ n['event_name'] }}
-                    <span class="news-reaction reading js-news-reaction"
-                          data-event-id="{{ n['event_id'] }}"
-                          data-event-ms="{{ n['event_time_ms'] }}">... READING</span>
+                </div>
+                {% if n.get('event_names') and n['event_names']|length > 1 %}
+                <div class="news-time">{{ n['event_names'] | join(' • ') }}</div>
+                {% endif %}
+                <div class="news-outcomes js-news-outcome-group"
+                     data-event-id="{{ n['event_id'] }}"
+                     data-event-ms="{{ n['event_time_ms'] }}">
+                    <span class="news-outcome-label">Outcome:</span>
+                    <span class="news-reaction reading js-news-reaction-15">15M ...</span>
+                    <span class="news-reaction reading js-news-reaction-30">30M ...</span>
                 </div>
                 <div class="news-time">{{ n['perth_time'] }} Perth</div>
                 {% if n.get('affected_pairs') %}
@@ -805,35 +814,43 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
     setInterval(updateNewsCountdowns, 1000);
 
 
-    function renderReactionBadge(node, item) {
-        if (!node || !item) return;
-
+    function paintReactionBadge(node, status, stage, waitingText) {
+        if (!node) return;
         node.classList.remove('reading', 'bullish', 'bearish', 'mixed');
-
-        const status = item.status || 'READING';
-        const stage = item.stage || '';
 
         if (status === 'BULLISH') {
             node.classList.add('bullish');
-            node.textContent = (stage ? stage + ' ' : '') + '▲ BULLISH' +
-                (item.confirmed ? ' ✓' : '');
+            node.textContent = stage + ' ▲ BULLISH';
         } else if (status === 'BEARISH') {
             node.classList.add('bearish');
-            node.textContent = (stage ? stage + ' ' : '') + '▼ BEARISH' +
-                (item.confirmed ? ' ✓' : '');
+            node.textContent = stage + ' ▼ BEARISH';
         } else if (status === 'MIXED') {
             node.classList.add('mixed');
-            node.textContent = (stage ? stage + ' ' : '') + '↔ MIXED';
+            node.textContent = stage + ' ↔ MIXED';
         } else {
             node.classList.add('reading');
-            const eventMs = Number(node.dataset.eventMs || 0);
-            const ageMin = eventMs ? ((Date.now() - eventMs) / 60000) : 0;
-            if (ageMin >= 0 && ageMin < 15) {
-                node.textContent = '... READING';
-            } else {
-                node.textContent = '... CHECKING';
-            }
+            node.textContent = stage + ' ' + waitingText;
         }
+    }
+
+    function renderReactionGroup(groupNode, item) {
+        const eventMs = Number(groupNode.dataset.eventMs || 0);
+        const ageMin = eventMs ? ((Date.now() - eventMs) / 60000) : 0;
+        const n15 = groupNode.querySelector('.js-news-reaction-15');
+        const n30 = groupNode.querySelector('.js-news-reaction-30');
+
+        paintReactionBadge(
+            n15,
+            item.reaction_15 || '',
+            '15M',
+            ageMin < 15 ? 'READING' : 'CHECKING'
+        );
+        paintReactionBadge(
+            n30,
+            item.reaction_30 || '',
+            '30M',
+            ageMin < 30 ? 'WAIT' : 'CHECKING'
+        );
     }
 
     async function refreshNewsReactions() {
@@ -845,14 +862,12 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
 
             const payload = await response.json();
 
-            document.querySelectorAll('.js-news-reaction').forEach(function(node) {
-                const eventId = node.dataset.eventId || '';
-                if (payload[eventId]) {
-                    renderReactionBadge(node, payload[eventId]);
-                }
+            document.querySelectorAll('.js-news-outcome-group').forEach(function(groupNode) {
+                const eventId = groupNode.dataset.eventId || '';
+                renderReactionGroup(groupNode, payload[eventId] || {});
             });
         } catch (e) {
-            // Keep the last visible reading if the tiny status request fails.
+            // Keep the last visible outcome if the tiny status request fails.
         }
     }
 
@@ -1392,6 +1407,21 @@ def init_db():
             updated TEXT
         )
         """)
+
+        # Keep older persistent Railway databases compatible with the
+        # 15m / 30m news-reaction feature. CREATE TABLE IF NOT EXISTS does
+        # not add columns to an already existing table, so migrate safely.
+        for _col, _type in (
+            ("reaction_15", "TEXT"),
+            ("score_15", "REAL"),
+            ("reaction_30", "TEXT"),
+            ("score_30", "REAL"),
+            ("updated", "TEXT"),
+        ):
+            try:
+                c.execute(f"ALTER TABLE economic_news_reactions ADD COLUMN {_col} {_type}")
+            except sqlite3.OperationalError:
+                pass
 
         c.execute("""
         CREATE TABLE IF NOT EXISTS economic_news_status(
@@ -2094,6 +2124,10 @@ def news_reaction_payload():
                 "status": status,
                 "stage": stage,
                 "confirmed": confirmed,
+                "reaction_15": r15 or "",
+                "reaction_30": r30 or "",
+                "score_15": row["score_15"],
+                "score_30": row["score_30"],
             }
 
         return result
@@ -2181,7 +2215,7 @@ def cached_home_news(limit=6):
                 LIMIT ?
                 """,
                 (
-                    (now_utc - timedelta(minutes=30)).isoformat(),
+                    (now_utc - timedelta(hours=2)).isoformat(),
                     max(40, int(limit) * 8),
                 ),
             ).fetchall()
@@ -2191,8 +2225,17 @@ def cached_home_news(limit=6):
 
     items = []
 
+    # Combine simultaneous High-impact releases for the same currency into one
+    # visible outcome block. Example: four USD CPI releases at 20:30 display as
+    # one USD group, because the market reaction is the combined USD outcome.
+    grouped = {}
     for row in rows:
+        key = (str(row["currency"]).upper(), row["event_time_utc"])
+        grouped.setdefault(key, []).append(row)
+
+    for (_currency, _event_time), group_rows in grouped.items():
         try:
+            row = group_rows[0]
             event_dt = datetime.fromisoformat(row["event_time_utc"])
             if event_dt.tzinfo is None:
                 event_dt = event_dt.replace(tzinfo=timezone.utc)
@@ -2201,7 +2244,10 @@ def cached_home_news(limit=6):
                 (event_dt.astimezone(timezone.utc) - now_utc).total_seconds() / 60
             )
 
-            if minutes_until < 0:
+            if minutes_until < -1:
+                mins_ago = abs(minutes_until)
+                countdown = f"released {mins_ago} min ago"
+            elif minutes_until < 0:
                 countdown = "NOW / just released"
             elif minutes_until < 60:
                 countdown = f"in {minutes_until} min"
@@ -2213,19 +2259,20 @@ def cached_home_news(limit=6):
                 countdown = f"in {minutes_until // (24*60)} day(s)"
 
             affected_pairs = saved_markets_for_news_currency(row["currency"])
+            event_names = [str(r["event_name"]) for r in group_rows]
+            event_name = (
+                event_names[0]
+                if len(event_names) == 1
+                else f"{len(event_names)} High-Impact events"
+            )
 
-            # IMPORTANT:
-            # Always display the valid High-Impact event from the Forex Factory
-            # cache. The saved-pair lookup is informational only.
-            #
-            # Previously, if the saved-pair match returned an empty list for any
-            # reason, the whole news event was hidden. That caused EdoSignal to
-            # say "No more High-Impact news today" even though USD CPI was still
-            # coming later the same day.
             items.append({
+                # Every same-time/currency event gets the same calculated
+                # reaction, so using the first event id is sufficient for UI.
                 "event_id": row["event_id"],
                 "currency": row["currency"],
-                "event_name": row["event_name"],
+                "event_name": event_name,
+                "event_names": event_names,
                 "reaction_15": row["reaction_15"],
                 "reaction_30": row["reaction_30"],
                 "perth_time": event_dt.astimezone(perth).strftime("%a %d %b • %H:%M"),
