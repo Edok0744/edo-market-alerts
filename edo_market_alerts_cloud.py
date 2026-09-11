@@ -2337,8 +2337,12 @@ PATTERN_TIMEFRAMES = [
     {"label": "1W", "value": "1week"},
 ]
 
-# Only Trend Pullback is active below 8H.
-CORE_PATTERN_INTERVALS = {"8h", "1day", "1week"}
+# Edo's exact signal timeframes.
+NORMAL_PULLBACK_INTERVALS = {"4h", "8h"}
+SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
+
+# Alias retained for older helper code.
+CORE_PATTERN_INTERVALS = SR_GAP_RETEST_INTERVALS
 
 
 def get_ohlc(symbol, interval, outputsize=140, grp=None):
@@ -3869,25 +3873,25 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = []
 
-    # A) NORMAL Edo trend pullback:
-    #    minimum 2 same-colour fully CLOSED pullback candles,
-    #    followed by an opposite-colour fully CLOSED confirmation.
-    #    NO 50% rule applies to this setup.
-    for conf in recent_confirmations(closed_candles, lookback=7):
-        pullback = detect_trend_pullback(
-            closed_candles,
-            conf,
-            allow_sr_exception=False
-        )
-        if pullback:
-            found.append(pullback)
+    # A) NORMAL Edo Trend Pullback — 4H and 8H ONLY.
+    #    Minimum 2 same-colour fully CLOSED pullback candles,
+    #    then an opposite-colour fully CLOSED confirmation.
+    #    NO 50% rule applies to this signal.
+    if interval in NORMAL_PULLBACK_INTERVALS:
+        for conf in recent_confirmations(closed_candles, lookback=7):
+            pullback = detect_trend_pullback(
+                closed_candles,
+                conf,
+                allow_sr_exception=False
+            )
+            if pullback:
+                found.append(pullback)
 
-    # B) Edo S/R GAP-AND-RETEST setup:
-    #    established high/low on the left -> price moves clearly away ->
+    # B) Edo S/R GAP-AND-RETEST — 8H, Daily and Weekly.
+    #    Established high/low on the left -> clear move away / separation ->
     #    later retest of the same zone -> opposite-colour CLOSED confirmation.
-    #    The 50% previous-body rule applies ONLY to this setup.
-    #    Active on 8H, Daily and Weekly.
-    if interval in CORE_PATTERN_INTERVALS:
+    #    The 50% previous-candle BODY rule applies ONLY to this signal.
+    if interval in SR_GAP_RETEST_INTERVALS:
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
@@ -3902,24 +3906,33 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = list(unique.values())
 
-    # 4H carries only the normal Trend Pullback setup.
-    # The separate S/R Gap-Retest setup is intentionally limited to
-    # 8H, Daily and Weekly via CORE_PATTERN_INTERVALS.
-    if interval not in CORE_PATTERN_INTERVALS:
+    # Hard whitelist: ONLY Edo's requested signals.
+    if interval == "4h":
+        found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
+    elif interval == "8h":
         found = [
             p for p in found
-            if p.get("name") == "TREND PULLBACK SETUP"
+            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
+    elif interval in ("1day", "1week"):
+        found = [p for p in found if p.get("name") == "S/R GAP RETEST SETUP"]
+    else:
+        found = []
 
     # 4H remains strong-trend-only. 8H normally uses the strong-trend filter,
     # but an approved second-S/R-reaction exception may bypass it.
     higher_tf_states = None
     if interval in ("4h", "8h"):
-        found, higher_tf_states, htf_error = apply_strong_trend_filter(
-            symbol, grp, interval, found
+        normal_found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
+        other_found = [p for p in found if p.get("name") != "TREND PULLBACK SETUP"]
+
+        normal_found, higher_tf_states, htf_error = apply_strong_trend_filter(
+            symbol, grp, interval, normal_found
         )
         if htf_error:
             return None, htf_error
+
+        found = normal_found + other_found
 
     # Edo filter: do not chase a valid 4H/8H confirmation candle if it has
     # already shot into the next important historical S/R level.
@@ -3987,7 +4000,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             else:
                 summary = "No recent setup matches your candle-close pattern rules on this timeframe."
 
-    weekly_spike = detect_weekly_spike(closed_candles) if interval == "1week" else None
+    # Weekly Spike disabled: Edo wants ONLY his requested trading signals.
+    weekly_spike = None
 
     data = {
         "price": closed_candles[-1]["close"],
@@ -4258,18 +4272,19 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     latest_closed_date = closed_candles[-1].get("datetime", "")
     found = []
 
-    # A) NORMAL minimum-2-candle Trend Pullback — NO 50% rule.
-    for conf in recent_confirmations(closed_candles, lookback=7):
-        pullback = detect_trend_pullback(
-            closed_candles,
-            conf,
-            allow_sr_exception=False
-        )
-        if pullback:
-            found.append(pullback)
+    # A) NORMAL Trend Pullback — 4H and 8H ONLY, NO 50% rule.
+    if interval in NORMAL_PULLBACK_INTERVALS:
+        for conf in recent_confirmations(closed_candles, lookback=7):
+            pullback = detect_trend_pullback(
+                closed_candles,
+                conf,
+                allow_sr_exception=False
+            )
+            if pullback:
+                found.append(pullback)
 
-    # B) S/R GAP-AND-RETEST — 50% rule applies ONLY here.
-    if interval in CORE_PATTERN_INTERVALS:
+    # B) S/R GAP-AND-RETEST — 8H, Daily and Weekly, WITH 50% rule.
+    if interval in SR_GAP_RETEST_INTERVALS:
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
@@ -4283,24 +4298,34 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     setups = list(unique.values())
 
-    # Edo rule: on 4H, ONLY the normal Trend Pullback may notify.
-    # S/R Gap-Retest is enabled only on 8H, Daily and Weekly.
-    if interval not in CORE_PATTERN_INTERVALS:
+    # Hard whitelist for automatic phone notifications.
+    if interval == "4h":
+        setups = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
+    elif interval == "8h":
         setups = [
             p for p in setups
-            if p.get("name") == "TREND PULLBACK SETUP"
+            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
+    elif interval in ("1day", "1week"):
+        setups = [p for p in setups if p.get("name") == "S/R GAP RETEST SETUP"]
+    else:
+        setups = []
 
     # 4H and 8H normal Trend Pullback remains subject to the existing
     # strong higher-timeframe trend filter. The separate S/R Gap-Retest
     # setup is not forced through that continuation filter.
 
     if interval in ("4h", "8h"):
-        setups, higher_tf_states, htf_error = apply_strong_trend_filter(
-            symbol, grp, interval, setups
+        normal_setups = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
+        other_setups = [p for p in setups if p.get("name") != "TREND PULLBACK SETUP"]
+
+        normal_setups, higher_tf_states, htf_error = apply_strong_trend_filter(
+            symbol, grp, interval, normal_setups
         )
         if htf_error:
             return None, latest_closed_date, htf_error
+
+        setups = normal_setups + other_setups
 
     # Reject overextended 4H/8H confirmations that have already arrived at
     # the next important historical S/R level. Rejected setups do NOT Push.
@@ -4321,8 +4346,8 @@ def pattern_signal_monitor():
     Grow-55 background pattern scheduler.
 
     Goal:
-      - get 4H/8H strong-trend continuation notifications reasonably soon after a candle closes
-      - keep Daily/Weekly current
+      - scan 4H/8H for Edo's normal Trend Pullback
+      - scan 8H/Daily/Weekly for Edo's S/R Gap-Retest
       - NEVER crowd out manual Trend / Signal page requests
 
     Protection:
@@ -5612,10 +5637,8 @@ threading.Thread(
     daemon=True
 ).start()
 
-threading.Thread(
-    target=weekly_spike_monitor,
-    daemon=True
-).start()
+# Weekly Spike monitor disabled.
+# Edo wants only Trend Pullback and S/R Gap-Retest trading signals.
 
 threading.Thread(
     target=economic_news_monitor,
