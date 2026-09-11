@@ -2970,12 +2970,17 @@ def detect_bounce_retest(candles, conf):
     IMPORTANT:
       * Historical HIGH = RESISTANCE only -> bearish/SELL confirmation only.
       * Historical LOW  = SUPPORT only    -> bullish/BUY confirmation only.
-      * The 50% previous-body rule applies ONLY to this S/R setup.
+      * The second touch must retrace at least 50% of the move-away distance
+        back toward the original S/R level. It may return all the way to, or
+        slightly through, the original level.
+      * The opposite-colour confirmation must also satisfy the separate 50%
+        previous-candle BODY rule from sr_confirmation_at().
+      * Reject the setup if the confirmation candle itself has already shot
+        to/near the previous structural target (old high for BUY, old low for
+        SELL). There must still be useful room after confirmation.
 
-    This deliberately rejects a bullish signal at an old resistance/high and
-    rejects a bearish signal at an old support/low.  The old level must also be
-    a meaningful swing extreme, price must move clearly away, then return from
-    the correct side and confirm away from the zone on a fully closed candle.
+    These 50% rules apply ONLY to this S/R setup. They are not used by the
+    normal minimum-2-candle Trend Pullback setup.
     """
     i = conf["index"]
     direction = conf["direction"]
@@ -2987,7 +2992,7 @@ def detect_bounce_retest(candles, conf):
     if ar <= 0:
         return None
 
-    # The retest must be immediately before/around the confirmation candle.
+    # The second touch must be immediately before/around the confirmation.
     touch_start = max(3, i - 4)
     touch_end = i + 1
     touch_slice = candles[touch_start:touch_end]
@@ -3002,6 +3007,7 @@ def detect_bounce_retest(candles, conf):
         swings = swing_points(candles[:touch_start], "low")
         level_source = "historical swing low / support"
         confirm_close = float(candles[i]["close"])
+        confirm_extreme = float(candles[i]["high"])
     else:
         # SELL can come ONLY from established RESISTANCE (historical swing HIGH).
         rel_touch_i = max(range(len(touch_slice)), key=lambda k: touch_slice[k]["high"])
@@ -3010,9 +3016,10 @@ def detect_bounce_retest(candles, conf):
         swings = swing_points(candles[:touch_start], "high")
         level_source = "historical swing high / resistance"
         confirm_close = float(candles[i]["close"])
+        confirm_extreme = float(candles[i]["low"])
 
-    # Same-zone tolerance: tight enough not to turn an old high into support
-    # (or an old low into resistance), but allows normal wick variation.
+    # Same-zone tolerance allows ordinary wick variation while preserving the
+    # distinction between support and resistance.
     zone_tolerance = max(ar * 0.45, abs(retest_price) * 0.0015)
 
     candidates = []
@@ -3023,12 +3030,13 @@ def detect_bounce_retest(candles, conf):
 
         if separation < 8 or separation > 120:
             continue
+
+        # The second touch must still be in the same broad S/R area. The new
+        # 50%-depth test below determines how deeply price returned toward it.
         if abs(old_price - retest_price) > zone_tolerance:
             continue
 
-        # Require the original level to be a meaningful swing extreme, not a
-        # minor internal pivot.  This is what keeps a previous HIGH as
-        # resistance and a previous LOW as support.
+        # Original level must be a meaningful swing extreme, not a minor pivot.
         left = max(0, old_i - 6)
         right = min(touch_start, old_i + 7)
         neighbourhood = candles[left:right]
@@ -3044,58 +3052,83 @@ def detect_bounce_retest(candles, conf):
             if old_price < neighbourhood_extreme - ar * 0.15:
                 continue
 
-        between = candles[old_i + 1:touch_start]
+        between = candles[old_i + 1:retest_index]
         if not between:
             continue
 
+        # Price must first move materially AWAY from the original S/R level.
+        # Then the second touch must retrace at least 50% of that move back
+        # toward the original level. A full return is valid too.
         if direction == "bullish":
-            # After first SUPPORT touch, price must move materially UP.
-            moved_away = max(float(c["high"]) for c in between) - max(old_price, retest_price)
+            departure_extreme = max(float(c["high"]) for c in between)
+            move_distance = departure_extreme - old_price
+            moved_away = move_distance
+            if move_distance < ar * 2.0:
+                continue
+            retest_depth_pct = ((departure_extreme - retest_price) / move_distance) * 100.0
         else:
-            # After first RESISTANCE touch, price must move materially DOWN.
-            moved_away = min(old_price, retest_price) - min(float(c["low"]) for c in between)
+            departure_extreme = min(float(c["low"]) for c in between)
+            move_distance = old_price - departure_extreme
+            moved_away = move_distance
+            if move_distance < ar * 2.0:
+                continue
+            retest_depth_pct = ((retest_price - departure_extreme) / move_distance) * 100.0
 
-        if moved_away < ar * 2.0:
+        if retest_depth_pct < 50.0:
             continue
 
         zone_centre = (old_price + retest_price) / 2.0
 
-        # Before the retest, price must approach the level from the correct side.
+        # Before the second touch, price must approach the level from the
+        # correct side, then confirmation must close back away from the zone.
         approach_start = max(old_i + 1, retest_index - 4)
         approach = candles[approach_start:retest_index]
         if not approach:
             continue
 
         if direction == "bullish":
-            # Support is retested from ABOVE, then bullish candle closes away/up.
             if max(float(c["close"]) for c in approach) <= zone_centre + ar * 0.20:
                 continue
             if confirm_close <= zone_centre:
                 continue
         else:
-            # Resistance is retested from BELOW, then bearish candle closes away/down.
             if min(float(c["close"]) for c in approach) >= zone_centre - ar * 0.20:
                 continue
             if confirm_close >= zone_centre:
                 continue
 
+        # Confirmation must not consume the whole trade in one candle. Use
+        # structure that existed BEFORE the confirmation/retest as the target.
+        target = previous_target(candles, direction, retest_index)
+        target_near_tol = ar * 0.35
+        if target is not None:
+            target = float(target)
+            if direction == "bullish":
+                if target > zone_centre and confirm_extreme >= target - target_near_tol:
+                    continue
+            else:
+                if target < zone_centre and confirm_extreme <= target + target_near_tol:
+                    continue
+
         closeness = 1.0 - min(1.0, abs(old_price - retest_price) / zone_tolerance)
-        candidates.append((old_i, old_price, separation, closeness, moved_away, zone_centre))
+        candidates.append((
+            old_i, old_price, separation, closeness, moved_away,
+            zone_centre, retest_depth_pct, departure_extreme, target
+        ))
 
     if not candidates:
         return None
 
-    old_i, old_price, separation, closeness, moved_away, zone_centre = max(
-        candidates,
-        key=lambda x: (x[3], x[2])
-    )
-
-    target = previous_target(candles, direction, i)
+    (
+        old_i, old_price, separation, closeness, moved_away,
+        zone_centre, retest_depth_pct, departure_extreme, target
+    ) = max(candidates, key=lambda x: (x[3], x[2]))
 
     score = 6.0
     score += min(3.0, separation / 15.0)
     score += closeness * 2.0
     score += min(2.0, max(0.0, conf["penetration"] - 50.0) / 25.0)
+    score += min(1.5, max(0.0, retest_depth_pct - 50.0) / 35.0)
 
     return {
         "name": "S/R GAP RETEST SETUP",
@@ -3105,6 +3138,8 @@ def detect_bounce_retest(candles, conf):
         "confirmation_date": conf["date"],
         "confirmation_close": conf["close"],
         "penetration": conf["penetration"],
+        "retest_depth_pct": retest_depth_pct,
+        "departure_extreme": departure_extreme,
         "level": zone_centre,
         "old_level": old_price,
         "retest_price": retest_price,
@@ -3474,8 +3509,9 @@ def describe_setup(p):
             f"{direction_word} S/R Gap-Retest confirmation on {p['confirmation_date']}. "
             f"Price first established a wick-defined support/resistance zone, moved clearly away, "
             f"then returned to RETEST the same zone after {p['separation']} candles. "
-            f"The opposite-colour confirmation candle fully closed away from the zone and "
-            f"{p['penetration']:.0f}% through the previous candle BODY."
+            f"The second touch retraced {p.get('retest_depth_pct', 0):.0f}% back toward the original S/R level "
+            f"(minimum 50% required). The opposite-colour confirmation candle fully closed away from the zone and "
+            f"{p['penetration']:.0f}% through the previous candle BODY (minimum 50% required)."
         )
 
         level_text = (
@@ -4486,6 +4522,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 f"({confirmation_date}). "
                 f"Established {zone_word} on the left, price moved clearly away, "
                 f"then returned after separation to retest the same zone. "
+                f"Second-touch depth: {p.get('retest_depth_pct', 0):.0f}% back toward the original level. "
                 f"The opposite-colour confirmation closed {p.get('penetration', 0):.0f}% "
                 f"through the previous candle body. "
                 f"{direction_word} possibility. Review the chart before trading."
