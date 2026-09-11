@@ -16,11 +16,7 @@ FOREX_FACTORY_CALENDAR_URL = os.environ.get(
 )
 FOREX_FACTORY_CALENDAR_FALLBACK_URL = os.environ.get(
     'FOREX_FACTORY_CALENDAR_FALLBACK_URL',
-    'https://www.forexfactory.com/ffcal_week_this.xml'
-)
-FOREX_FACTORY_CALENDAR_SECONDARY_JSON_URL = os.environ.get(
-    'FOREX_FACTORY_CALENDAR_SECONDARY_JSON_URL',
-    'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
+    'https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json'
 )
 NEWS_REFRESH_SECONDS = int(os.environ.get('NEWS_REFRESH_SECONDS', '1800'))
 NEWS_WARNING_MINUTES = int(os.environ.get('NEWS_WARNING_MINUTES', '5'))
@@ -1248,22 +1244,6 @@ def db_conn():
     return c
 
 
-
-def _ensure_column(conn, table_name, column_name, column_sql):
-    """
-    Add a missing SQLite column safely on existing Railway databases.
-    SQLite CREATE TABLE IF NOT EXISTS does not add new columns to an old table,
-    so EdoSignal performs a tiny migration at startup.
-    """
-    cols = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    existing = {row[1] for row in cols}
-    if column_name not in existing:
-        conn.execute(
-            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
-        )
-
-
-
 def init_db():
     with db_conn() as c:
         # WAL allows the home page to READ saved data while background
@@ -1412,14 +1392,6 @@ def init_db():
             updated TEXT
         )
         """)
-
-        # Existing Railway databases may already have this table from an older
-        # version with fewer columns. Add any missing columns automatically.
-        _ensure_column(c, "economic_news_reactions", "reaction_15", "TEXT")
-        _ensure_column(c, "economic_news_reactions", "score_15", "REAL")
-        _ensure_column(c, "economic_news_reactions", "reaction_30", "TEXT")
-        _ensure_column(c, "economic_news_reactions", "score_30", "REAL")
-        _ensure_column(c, "economic_news_reactions", "updated", "TEXT")
 
         c.execute("""
         CREATE TABLE IF NOT EXISTS economic_news_status(
@@ -1603,32 +1575,24 @@ def _get_news_feed_status():
 
 def _download_forex_factory_calendar():
     """
-    Fetch this week's Forex Factory calendar.
+    Fetch the weekly Forex Factory JSON with two public FairEconomy endpoints.
 
-    Railway has shown DNS failures for some FairEconomy CDN hostnames.
-    EdoSignal therefore tries:
-      1) FairEconomy JSON
-      2) Forex Factory weekly XML directly
-
-    Returns:
-      (events_list, source_url, error_text)
-
-    The returned event objects are normalized to the same keys expected by
-    refresh_economic_news():
-      title, country, date, impact
+    Railway/cloud hosts can occasionally get a transient block or edge failure
+    on one hostname, so EdoSignal tries the normal endpoint first and then the
+    CDN hostname. A cache-busting query string and normal browser headers are
+    used to avoid stale/error edge responses.
     """
+    urls = []
+    for url in (
+        FOREX_FACTORY_CALENDAR_URL,
+        FOREX_FACTORY_CALENDAR_FALLBACK_URL,
+    ):
+        if url and url not in urls:
+            urls.append(url)
+
     errors = []
 
-    # ---------- 1) FairEconomy JSON ----------
-    json_urls = []
-    for base_url in (
-        FOREX_FACTORY_CALENDAR_URL,
-        FOREX_FACTORY_CALENDAR_SECONDARY_JSON_URL,
-    ):
-        if base_url and base_url not in json_urls:
-            json_urls.append(base_url)
-
-    for base_url in json_urls:
+    for base_url in urls:
         try:
             separator = "&" if "?" in base_url else "?"
             url = f"{base_url}{separator}edo_ts={int(time.time())}"
@@ -1660,109 +1624,22 @@ def _download_forex_factory_calendar():
                 errors.append(f"{base_url}: empty response")
                 continue
 
+            # Guard against Cloudflare/HTML pages being returned with HTTP 200.
             if body[0] not in "[{":
                 errors.append(f"{base_url}: non-JSON response")
                 continue
 
             data = r.json()
-            if isinstance(data, list) and data:
-                return data, base_url, None
+            if not isinstance(data, list) or not data:
+                errors.append(f"{base_url}: JSON list empty/unusable")
+                continue
 
-            errors.append(f"{base_url}: JSON list empty/unusable")
+            return data, base_url, None
 
         except Exception as e:
             errors.append(f"{base_url}: {type(e).__name__}: {e}")
 
-    # ---------- 2) Direct Forex Factory XML ----------
-    xml_url = FOREX_FACTORY_CALENDAR_FALLBACK_URL
-    if xml_url:
-        try:
-            from xml.etree import ElementTree as ET
-
-            separator = "&" if "?" in xml_url else "?"
-            url = f"{xml_url}{separator}edo_ts={int(time.time())}"
-
-            r = requests.get(
-                url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/140.0 Safari/537.36"
-                    ),
-                    "Accept": "application/xml,text/xml,text/plain,*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Cache-Control": "no-cache",
-                    "Pragma": "no-cache",
-                    "Connection": "close",
-                },
-                timeout=20,
-                allow_redirects=True,
-            )
-
-            if r.status_code != 200:
-                errors.append(f"{xml_url}: HTTP {r.status_code}")
-            else:
-                root = ET.fromstring(r.content)
-                normalized = []
-
-                for event in root.findall(".//event"):
-                    def _txt(tag):
-                        node = event.find(tag)
-                        return (node.text or "").strip() if node is not None and node.text else ""
-
-                    title = _txt("title")
-                    country = _txt("country").upper()
-                    impact = _txt("impact")
-                    date_str = _txt("date")
-                    time_str = _txt("time")
-
-                    if not title or not country or not date_str:
-                        continue
-
-                    # Forex Factory XML date/time is displayed in site's selected
-                    # timezone. For the public weekly feed, common format is:
-                    # 09-11-2026 + 8:30pm
-                    # We interpret this as America/New_York event time because
-                    # Forex Factory economic release times are keyed to New York
-                    # session time and convert to UTC here.
-                    dt_local = None
-                    for fmt in ("%m-%d-%Y %I:%M%p", "%m-%d-%Y %H:%M"):
-                        try:
-                            dt_local = datetime.strptime(
-                                f"{date_str} {time_str}".strip(),
-                                fmt
-                            )
-                            break
-                        except Exception:
-                            pass
-
-                    if dt_local is None:
-                        continue
-
-                    try:
-                        ny = ZoneInfo("America/New_York")
-                        dt_local = dt_local.replace(tzinfo=ny)
-                        dt_utc = dt_local.astimezone(timezone.utc)
-                    except Exception:
-                        dt_utc = dt_local.replace(tzinfo=timezone.utc)
-
-                    normalized.append({
-                        "title": title,
-                        "country": country,
-                        "impact": impact,
-                        "date": dt_utc.isoformat(),
-                    })
-
-                if normalized:
-                    return normalized, xml_url, None
-
-                errors.append(f"{xml_url}: XML contained no usable events")
-
-        except Exception as e:
-            errors.append(f"{xml_url}: {type(e).__name__}: {e}")
-
-    return None, "", " | ".join(errors) if errors else "No calendar source available."
+    return None, "", " | ".join(errors) if errors else "No Forex Factory URL available."
 
 
 
@@ -2470,6 +2347,7 @@ PATTERN_TIMEFRAMES = [
 
 # Edo's exact signal timeframes.
 NORMAL_PULLBACK_INTERVALS = {"4h", "8h"}
+DAILY_2PLUS_INTERVALS = {"1day"}
 SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
 
 # Alias retained for older helper code.
@@ -3257,6 +3135,62 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False):
         "target": target,
     }
 
+
+def detect_daily_2plus_signal(candles, conf):
+    """
+    Edo DAILY 2+ CANDLE SIGNAL — independent from Trend Pullback and S/R Gap-Retest.
+
+    Rules:
+      - DAILY timeframe only (caller controls timeframe).
+      - Use fully CLOSED candles only.
+      - Minimum 2 consecutive candles of the same colour.
+      - Then the next fully CLOSED candle must be the opposite colour.
+      - 2, 3, 4, 5+ same-colour candles are allowed.
+      - NO trend-direction requirement.
+      - NO higher-timeframe trend filter.
+      - NO 50% body-penetration rule.
+      - NO S/R or gap/retest is required.
+
+    Examples:
+      2+ red closed candles -> green closed candle = bullish possibility.
+      2+ green closed candles -> red closed candle = bearish possibility.
+    """
+    i = conf["index"]
+    if i < 2:
+        return None
+
+    direction = conf["direction"]
+
+    if direction == "bullish":
+        run_colour = "red"
+    elif direction == "bearish":
+        run_colour = "green"
+    else:
+        return None
+
+    run_count, run_start = count_same_colour_before(candles, i, run_colour)
+    if run_count < 2:
+        return None
+
+    confirm_candle = candles[i]
+
+    return {
+        "name": "DAILY 2+ CANDLE SIGNAL",
+        "direction": direction,
+        "confirmed": True,
+        "score": 6.0 + min(3.0, (run_count - 2) * 0.75),
+        "confirmation_date": conf["date"],
+        "confirmation_close": float(confirm_candle["close"]),
+        "run_count": run_count,
+        "run_colour": run_colour,
+        "run_dates": [
+            candles[j].get("datetime", "")
+            for j in range(run_start, i)
+        ],
+        "context": "daily_2plus_no_trend",
+        "target": previous_target(candles, direction, run_start),
+    }
+
 def sr_second_reaction_exception(candles, setup):
     """
     Edo 8H / Daily early-trend exception.
@@ -3384,6 +3318,18 @@ def describe_setup(p):
             f"{zone_word.title()} zone: {p['level']:.5f} • "
             f"Latest close: {p['confirmation_close']:.5f}"
         )
+
+    elif p["name"] == "DAILY 2+ CANDLE SIGNAL":
+        run_dates = ", ".join(p.get("run_dates", []))
+        detail = (
+            f"{direction_word} Daily 2+ candle signal on {p['confirmation_date']}. "
+            f"{p['run_count']} consecutive {p['run_colour']} fully CLOSED Daily candles "
+            f"were followed by an opposite-colour fully CLOSED Daily confirmation candle. "
+            f"No trend direction is required. No higher-timeframe trend filter is required. "
+            f"No 50% body-penetration rule applies. No S/R gap-retest is required. "
+            f"Prior candle times: {run_dates or 'n/a'}."
+        )
+        level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
 
     elif p["name"] == "TREND PULLBACK SETUP":
         run_dates = ", ".join(p.get("run_dates", []))
@@ -4018,7 +3964,16 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             if pullback:
                 found.append(pullback)
 
-    # B) Edo S/R GAP-AND-RETEST — 8H, Daily and Weekly.
+    # B) DAILY 2+ CANDLE SIGNAL — its OWN signal family.
+    #    Minimum 2 same-colour fully CLOSED Daily candles, then opposite-colour
+    #    fully CLOSED confirmation. NO trend direction. NO 50% rule. NO S/R required.
+    if interval in DAILY_2PLUS_INTERVALS:
+        for conf in recent_confirmations(closed_candles, lookback=9):
+            daily_signal = detect_daily_2plus_signal(closed_candles, conf)
+            if daily_signal:
+                found.append(daily_signal)
+
+    # C) Edo S/R GAP-AND-RETEST — 8H, Daily and Weekly.
     #    Established high/low on the left -> clear move away / separation ->
     #    later retest of the same zone -> opposite-colour CLOSED confirmation.
     #    The 50% previous-candle BODY rule applies ONLY to this signal.
@@ -4045,7 +4000,12 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             p for p in found
             if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
-    elif interval in ("1day", "1week"):
+    elif interval == "1day":
+        found = [
+            p for p in found
+            if p.get("name") in ("DAILY 2+ CANDLE SIGNAL", "S/R GAP RETEST SETUP")
+        ]
+    elif interval == "1week":
         found = [p for p in found if p.get("name") == "S/R GAP RETEST SETUP"]
     else:
         found = []
@@ -4131,8 +4091,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             else:
                 summary = "No recent setup matches your candle-close pattern rules on this timeframe."
 
-    # Weekly Spike disabled: Edo wants ONLY his requested trading signals.
-    weekly_spike = None
+    # Weekly Spike warning is enabled.
+    # It is separate from Edo's normal trading setups and remains WARNING ONLY.
+    weekly_spike = detect_weekly_spike(closed_candles) if interval == "1week" else None
 
     data = {
         "price": closed_candles[-1]["close"],
@@ -4172,6 +4133,8 @@ def pattern_signal_family(p):
 
     if "S/R GAP RETEST" in name:
         return "SR_GAP_RETEST"
+    if "DAILY 2+ CANDLE" in name:
+        return "DAILY_2PLUS"
     if "TREND PULLBACK" in name:
         return "TREND_PULLBACK"
     if "RANGE" in name and "REVERSAL" in name:
@@ -4189,6 +4152,8 @@ def pattern_push_priority(p):
 
     if "S/R GAP RETEST" in name:
         return 25
+    if "DAILY 2+ CANDLE" in name:
+        return 20
     if "TREND PULLBACK" in name:
         return 20
     if "RANGE" in name and "REVERSAL" in name:
@@ -4368,6 +4333,15 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 f"through the previous candle body. "
                 f"{direction_word} possibility. Review the chart before trading."
             )
+        elif p.get("name") == "DAILY 2+ CANDLE SIGNAL":
+            push_body = (
+                f"DAILY 2+ CANDLE SIGNAL confirmed on the NEWEST CLOSED Daily candle "
+                f"({confirmation_date}). "
+                f"{p.get('run_count', 0)} consecutive {p.get('run_colour', '')} CLOSED Daily candles "
+                f"were followed by an opposite-colour CLOSED Daily candle. "
+                f"No trend direction required. No 50% rule. No S/R gap-retest required. "
+                f"{direction_word} possibility. Review the chart before trading."
+            )
         else:
             push_body = (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
@@ -4384,7 +4358,11 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     """
-    Collect Edo's two trading setups from fully closed candles only: normal Trend Pullback (no 50%) and S/R Gap-Retest (50% rule).
+    Collect Edo's trading setups from fully closed candles only:
+      - 4H/8H Trend Pullback (trend filtered, no 50%)
+      - Daily 2+ Candle Signal (no trend direction, no 50%, independent)
+      - 8H/Daily/Weekly S/R Gap-Retest (50% rule)
+    Weekly Spike is monitored separately as a warning.
 
     Returns:
       setups, latest_closed_date, error
@@ -4414,7 +4392,14 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             if pullback:
                 found.append(pullback)
 
-    # B) S/R GAP-AND-RETEST — 8H, Daily and Weekly, WITH 50% rule.
+    # B) DAILY 2+ CANDLE SIGNAL — independent, NO trend direction, NO 50%.
+    if interval in DAILY_2PLUS_INTERVALS:
+        for conf in recent_confirmations(closed_candles, lookback=9):
+            daily_signal = detect_daily_2plus_signal(closed_candles, conf)
+            if daily_signal:
+                found.append(daily_signal)
+
+    # C) S/R GAP-AND-RETEST — 8H, Daily and Weekly, WITH 50% rule.
     if interval in SR_GAP_RETEST_INTERVALS:
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
@@ -4429,7 +4414,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     setups = list(unique.values())
 
-    # Hard whitelist for automatic phone notifications.
+    # Hard whitelist for automatic trading-pattern notifications. Weekly Spike is handled separately as a warning.
     if interval == "4h":
         setups = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
     elif interval == "8h":
@@ -4437,7 +4422,12 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             p for p in setups
             if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
-    elif interval in ("1day", "1week"):
+    elif interval == "1day":
+        setups = [
+            p for p in setups
+            if p.get("name") in ("DAILY 2+ CANDLE SIGNAL", "S/R GAP RETEST SETUP")
+        ]
+    elif interval == "1week":
         setups = [p for p in setups if p.get("name") == "S/R GAP RETEST SETUP"]
     else:
         setups = []
@@ -5768,8 +5758,10 @@ threading.Thread(
     daemon=True
 ).start()
 
-# Weekly Spike monitor disabled.
-# Edo wants only Trend Pullback and S/R Gap-Retest trading signals.
+threading.Thread(
+    target=weekly_spike_monitor,
+    daemon=True
+).start()
 
 threading.Thread(
     target=economic_news_monitor,
