@@ -5114,8 +5114,15 @@ def build_full_alignment(symbol, grp=None):
 
 
 def save_trend_status(symbol, status):
-    """Save trend status and return the previous saved status."""
+    """
+    Atomically save trend status and return the previously stored status.
+
+    BEGIN IMMEDIATE serialises competing Railway/Gunicorn workers so two
+    workers cannot both read the same old state and send the same FULL TREND
+    Pushover twice.
+    """
     with db_conn() as c:
+        c.execute("BEGIN IMMEDIATE")
         row = c.execute(
             "SELECT status FROM trend_status WHERE symbol=?",
             (symbol,)
@@ -5161,6 +5168,14 @@ def active_trend_monitor():
 
                 symbol, grp = markets[index]
                 index = (index + 1) % len(markets)
+
+                # Weekend safety: spot Forex is closed. Do not calculate or
+                # push FULL TREND states from stale Friday candles. Crypto
+                # remains active 24/7 and CFDs are left unchanged.
+                if str(grp).upper() == "FOREX" and forex_weekend_closed():
+                    print("forex weekend full-trend monitor suppressed", symbol)
+                    time.sleep(1)
+                    continue
 
                 status, error = build_full_alignment(symbol, grp)
 
@@ -5645,6 +5660,13 @@ def monitor():
                 ).fetchall()
                 price_cache = {}
                 for a in rows:
+
+                    # Weekend safety: do not read stale Forex quotes and do
+                    # not trigger armed Forex price alerts while the spot
+                    # market is closed. They resume automatically at reopen.
+                    if str(a['grp']).upper() == "FOREX" and forex_weekend_closed():
+                        print("forex weekend price alert suppressed", a['symbol'])
+                        continue
 
                     if a['symbol'] not in price_cache:
                         price_cache[a['symbol']] = latest_price(a['symbol'], a['grp'])
