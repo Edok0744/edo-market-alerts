@@ -2967,6 +2967,84 @@ def previous_target(candles, direction, before_index, search_back=60):
     return None
 
 
+def sr_structure_targets(candles, direction, before_index, entry_price, search_back=120, min_separation=None):
+    """
+    Edo S/R Gap-Retest targets ONLY.
+
+    Preferred method:
+      Target 1 = first meaningful previous swing in the trade direction.
+      Take Profit = next stronger/farther structural swing.
+
+    If price history does not provide clean structural levels, the caller may
+    add calculated fallback targets from the setup's own move-away distance.
+    These targets are NOT used for Trend Pullback or Weekly Spike.
+    """
+    start = max(0, before_index - search_back)
+    part = candles[start:before_index + 1]
+    if len(part) < 5:
+        return None, None
+
+    if min_separation is None:
+        local_ar = avg_range(candles, before_index + 1, 20)
+        min_separation = max(local_ar * 0.60, abs(float(entry_price)) * 0.0005)
+
+    if direction == "bullish":
+        pts = swing_points(part, "high")
+        levels = sorted({float(v) for _, v in pts if float(v) > float(entry_price)})
+        if not levels:
+            return None, None
+        target1 = levels[0]
+        farther = [v for v in levels[1:] if v >= target1 + min_separation]
+        take_profit = max(farther) if farther else None
+        return target1, take_profit
+
+    pts = swing_points(part, "low")
+    levels = sorted({float(v) for _, v in pts if float(v) < float(entry_price)}, reverse=True)
+    if not levels:
+        return None, None
+    target1 = levels[0]
+    farther = [v for v in levels[1:] if v <= target1 - min_separation]
+    take_profit = min(farther) if farther else None
+    return target1, take_profit
+
+
+def sr_calculated_targets(direction, entry_price, zone_centre, departure_extreme, local_ar):
+    """Fallback targets for S/R Gap-Retest when structure is unclear.
+
+    They are based only on price action from the current setup:
+      * the distance price previously travelled away from the S/R zone, and
+      * recent average candle range as a minimum practical distance.
+
+    Target 1 is conservative; Take Profit is the fuller measured-move target.
+    """
+    entry = float(entry_price)
+    zone = float(zone_centre)
+    departure = float(departure_extreme)
+    ar = max(float(local_ar or 0.0), abs(entry) * 0.0005)
+
+    if direction == "bullish":
+        setup_move = max(departure - zone, ar * 2.0)
+        t1_dist = max(setup_move * 0.50, ar * 1.50)
+        tp_dist = max(setup_move * 0.90, ar * 3.00)
+        target1 = entry + t1_dist
+        take_profit = entry + tp_dist
+    else:
+        setup_move = max(zone - departure, ar * 2.0)
+        t1_dist = max(setup_move * 0.50, ar * 1.50)
+        tp_dist = max(setup_move * 0.90, ar * 3.00)
+        target1 = entry - t1_dist
+        take_profit = entry - tp_dist
+
+    # Always keep Take Profit meaningfully farther than Target 1.
+    min_gap = max(ar * 0.75, abs(entry) * 0.0005)
+    if direction == "bullish" and take_profit < target1 + min_gap:
+        take_profit = target1 + min_gap
+    elif direction == "bearish" and take_profit > target1 - min_gap:
+        take_profit = target1 - min_gap
+
+    return target1, take_profit
+
+
 def detect_bounce_retest(candles, conf):
     """
     Edo S/R Gap-and-Retest trading rule.
@@ -3101,23 +3179,42 @@ def detect_bounce_retest(candles, conf):
             if confirm_close >= zone_centre:
                 continue
 
-        # Confirmation must not consume the whole trade in one candle. Use
-        # structure that existed BEFORE the confirmation/retest as the target.
-        target = previous_target(candles, direction, retest_index)
+        # Confirmation must not consume the whole trade in one candle.
+        # For Edo's S/R Gap-Retest ONLY, calculate two structure targets:
+        # T1 = nearest previous swing; Take Profit = farther major swing.
+        target1, take_profit = sr_structure_targets(
+            candles, direction, retest_index, confirm_close, search_back=120
+        )
+        target1_source = "structural" if target1 is not None else None
+        take_profit_source = "structural" if take_profit is not None else None
+
+        # If the market does not provide clear swing levels, still give Edo a
+        # realistic price-action target rather than leaving the setup blank.
+        calc_t1, calc_tp = sr_calculated_targets(
+            direction, confirm_close, zone_centre, departure_extreme, ar
+        )
+        if target1 is None:
+            target1 = calc_t1
+            target1_source = "calculated"
+        if take_profit is None:
+            take_profit = calc_tp
+            take_profit_source = "calculated"
+
         target_near_tol = ar * 0.35
-        if target is not None:
-            target = float(target)
-            if direction == "bullish":
-                if target > zone_centre and confirm_extreme >= target - target_near_tol:
-                    continue
-            else:
-                if target < zone_centre and confirm_extreme <= target + target_near_tol:
-                    continue
+        target1 = float(target1)
+        if direction == "bullish":
+            if target1 > zone_centre and confirm_extreme >= target1 - target_near_tol:
+                continue
+        else:
+            if target1 < zone_centre and confirm_extreme <= target1 + target_near_tol:
+                continue
+
+        take_profit = float(take_profit)
 
         closeness = 1.0 - min(1.0, abs(old_price - retest_price) / zone_tolerance)
         candidates.append((
             old_i, old_price, separation, closeness, moved_away,
-            zone_centre, retest_depth_pct, departure_extreme, target
+            zone_centre, retest_depth_pct, departure_extreme, target1, take_profit
         ))
 
     if not candidates:
@@ -3125,7 +3222,7 @@ def detect_bounce_retest(candles, conf):
 
     (
         old_i, old_price, separation, closeness, moved_away,
-        zone_centre, retest_depth_pct, departure_extreme, target
+        zone_centre, retest_depth_pct, departure_extreme, target1, take_profit
     ) = max(candidates, key=lambda x: (x[3], x[2]))
 
     score = 6.0
@@ -3152,7 +3249,12 @@ def detect_bounce_retest(candles, conf):
         "old_date": candles[old_i].get("datetime", ""),
         "separation": separation,
         "weak_retest": False,
-        "target": target,
+        # Targets belong ONLY to S/R Gap-Retest.
+        "target": target1,  # backward-compatible alias for Target 1
+        "target1": target1,
+        "target1_source": target1_source,
+        "take_profit": take_profit,
+        "take_profit_source": take_profit_source,
     }
 
 def count_same_colour_before(candles, i, colour):
@@ -3524,6 +3626,12 @@ def describe_setup(p):
             f"Second {p['level_source']} test: {p['retest_price']:.5f} on {p['retest_date']} • "
             f"Confirmation close: {p['confirmation_close']:.5f}"
         )
+        if p.get("target1") is not None:
+            src = p.get("target1_source", "structural")
+            level_text += f" • Target 1: {p['target1']:.5f} ({src})"
+        if p.get("take_profit") is not None:
+            src = p.get("take_profit_source", "structural")
+            level_text += f" • Take Profit: {p['take_profit']:.5f} ({src})"
 
     elif p["name"] in (
         "SUPPORT RETEST / BOUNCE WATCH",
@@ -3576,10 +3684,6 @@ def describe_setup(p):
         )
 
         level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
-
-    if p.get("target") is not None:
-        target_word = "previous structural high" if bullish else "previous structural low"
-        level_text += f" • Review target ({target_word}): {p['target']:.5f}"
 
     return {
         "name": p["name"],
@@ -4624,6 +4728,13 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
         if p.get("name") == "S/R GAP RETEST SETUP":
             zone_word = "SUPPORT" if p["direction"] == "bullish" else "RESISTANCE"
+            target_lines = ""
+            if p.get("target1") is not None:
+                src = p.get("target1_source", "structural")
+                target_lines += f" Target 1: {p['target1']:.5f} ({src})."
+            if p.get("take_profit") is not None:
+                src = p.get("take_profit_source", "structural")
+                target_lines += f" Take Profit: {p['take_profit']:.5f} ({src})."
             push_body = (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
                 f"({confirmation_date}). "
@@ -4632,7 +4743,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 f"Second-touch depth: {p.get('retest_depth_pct', 0):.0f}% back toward the original level. "
                 f"The opposite-colour confirmation closed {p.get('penetration', 0):.0f}% "
                 f"through the previous candle body. "
-                f"{direction_word} possibility. Review the chart before trading."
+                f"{direction_word} possibility.{target_lines} Review the chart before trading."
             )
         else:
             push_body = (
