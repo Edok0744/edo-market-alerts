@@ -1179,7 +1179,7 @@ a{text-decoration:none}
 <body>
 <div class="wrap">
     <h1>⚡ {{ symbol }} EDO SETUP SIGNAL</h1>
-    <div class="small">{{ group }} • Your price-action method • Trend Pullback: 4H / 8H / 1D / 1W • Other patterns: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
+    <div class="small">{{ group }} • Your price-action method • Trend Pullback: 4H / 8H / 1D • S/R Gap-Retest: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
 
     <div class="tfrow">
         {% for tf in timeframes %}
@@ -2592,7 +2592,7 @@ PATTERN_TIMEFRAMES = [
 ]
 
 # Edo's exact signal timeframes.
-NORMAL_PULLBACK_INTERVALS = {"4h", "8h"}
+NORMAL_PULLBACK_INTERVALS = {"4h", "8h", "1day"}
 SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
 
 # Alias retained for older helper code.
@@ -3886,7 +3886,8 @@ def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
       no higher-timeframe filter is used; this branch is retained only for
       compatibility and is not called by the active 8H signal flow.
 
-    Daily and Weekly normal Trend Pullback patterns are disabled elsewhere.
+    Daily normal Trend Pullback is allowed without a higher-timeframe filter.
+    Weekly normal Trend Pullback remains disabled.
     No indicators are used; Bullish = close > open, Bearish = close < open.
     """
     if interval == "4h":
@@ -3935,7 +3936,8 @@ def apply_strong_trend_filter(symbol, grp, interval, setups):
     are all Bearish.
 
     8H Trend Pullback is intentionally NOT filtered by higher-timeframe trend.
-    Daily and Weekly normal Trend Pullback signals are disabled elsewhere.
+    Daily Trend Pullback is intentionally NOT filtered by higher-timeframe trend.
+    Weekly normal Trend Pullback remains disabled elsewhere.
     """
     if interval != "4h":
         return setups, None, None
@@ -4163,7 +4165,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = []
 
-    # A) NORMAL Edo Trend Pullback — 4H and 8H ONLY.
+    # A) NORMAL Edo Trend Pullback — 4H, 8H and Daily.
     #    Minimum 2 same-colour fully CLOSED pullback candles,
     #    then an opposite-colour fully CLOSED confirmation.
     #    NO 50% rule applies to this signal.
@@ -4204,15 +4206,21 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             p for p in found
             if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
-    elif interval in ("1day", "1week"):
+    elif interval == "1day":
+        found = [
+            p for p in found
+            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
+        ]
+    elif interval == "1week":
         found = [p for p in found if p.get("name") == "S/R GAP RETEST SETUP"]
     else:
         found = []
 
     # Edo rule: ONLY the 4H normal Trend Pullback requires strong higher-timeframe
-    # trend alignment. The 8H normal Trend Pullback is pure candle-sequence logic:
-    # minimum 2 same-colour pullback candles, then the first opposite-colour
-    # fully CLOSED confirmation candle. No higher-timeframe trend filter on 8H.
+    # trend alignment. The 8H and Daily normal Trend Pullbacks are pure
+    # candle-sequence logic: minimum 2 same-colour pullback candles, then the
+    # first opposite-colour fully CLOSED confirmation candle. No higher-timeframe
+    # trend filter on 8H or Daily.
     higher_tf_states = None
     if interval == "4h":
         normal_found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
@@ -4543,7 +4551,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     """
-    Collect Edo's two trading setups from fully closed candles only: normal Trend Pullback (no 50%) and S/R Gap-Retest (50% rule).
+    Collect Edo's trading setups from fully closed candles only: normal Trend Pullback (4H/8H/Daily, no 50%) and S/R Gap-Retest (8H/Daily/Weekly, 50% rules).
 
     Returns:
       setups, latest_closed_date, error
@@ -4562,7 +4570,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     latest_closed_date = closed_candles[-1].get("datetime", "")
     found = []
 
-    # A) NORMAL Trend Pullback — 4H and 8H ONLY, NO 50% rule.
+    # A) NORMAL Trend Pullback — 4H, 8H and Daily, NO 50% rule.
     if interval in NORMAL_PULLBACK_INTERVALS:
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
@@ -4596,14 +4604,19 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             p for p in setups
             if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
-    elif interval in ("1day", "1week"):
+    elif interval == "1day":
+        setups = [
+            p for p in setups
+            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
+        ]
+    elif interval == "1week":
         setups = [p for p in setups if p.get("name") == "S/R GAP RETEST SETUP"]
     else:
         setups = []
 
     # Edo rule: ONLY 4H normal Trend Pullback uses the strong higher-timeframe
-    # trend filter. 8H normal Trend Pullback must NOT be blocked by trend alignment.
-    # The separate S/R Gap-Retest setup is also independent of this filter.
+    # trend filter. 8H and Daily normal Trend Pullbacks must NOT be blocked by
+    # trend alignment. The separate S/R Gap-Retest setup is also independent.
 
     if interval == "4h":
         normal_setups = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
@@ -4636,7 +4649,7 @@ def pattern_signal_monitor():
     Grow-55 background pattern scheduler.
 
     Goal:
-      - scan 4H/8H for Edo's normal Trend Pullback
+      - scan 4H/8H/Daily for Edo's normal Trend Pullback
       - scan 8H/Daily/Weekly for Edo's S/R Gap-Retest
       - NEVER crowd out manual Trend / Signal page requests
 
