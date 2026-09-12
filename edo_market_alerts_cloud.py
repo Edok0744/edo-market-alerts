@@ -6,6 +6,10 @@ import requests
 
 APP = Flask(__name__)
 
+# Used to prevent a Railway restart/redeploy from replaying an already-closed
+# historical candle as a brand-new phone signal.
+PROCESS_STARTED_UTC = datetime.now(timezone.utc)
+
 DB = os.environ.get('EDO_DB', 'edo_market_alerts.db')
 TWELVE_KEY = os.environ.get('TWELVE_DATA_API_KEY', '')
 PUSHOVER_APP_TOKEN = os.environ.get('PUSHOVER_APP_TOKEN', '')
@@ -4408,12 +4412,107 @@ def reserve_daily_pattern_push(grp, symbol, p):
         return False
 
 
+def forex_weekend_closed(now_utc=None):
+    """
+    True while the normal spot-Forex weekend session is closed.
+
+    Forex closes at about 5pm New York Friday and reopens about 5pm
+    New York Sunday. Using America/New_York automatically follows DST.
+    Crypto is never affected by this helper.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+
+    ny = now_utc.astimezone(ZoneInfo("America/New_York"))
+    weekday = ny.weekday()  # Monday=0 ... Sunday=6
+    minutes = ny.hour * 60 + ny.minute
+    close_minutes = 17 * 60
+
+    if weekday == 4 and minutes >= close_minutes:  # Friday after 17:00 NY
+        return True
+    if weekday == 5:  # Saturday
+        return True
+    if weekday == 6 and minutes < close_minutes:  # Sunday before 17:00 NY
+        return True
+    return False
+
+
+def pattern_candle_close_utc(candle_start, interval):
+    """Return the UTC close time for a candle-start timestamp when possible."""
+    try:
+        start = parse_candle_utc(candle_start)
+        if start is None:
+            return None
+        seconds = interval_seconds(interval)
+        if not seconds:
+            return None
+        return start + timedelta(seconds=seconds)
+    except Exception:
+        return None
+
+
+def _save_pattern_monitor_baseline(grp, symbol, interval, latest_closed_date):
+    """Advance the persistent monitor state without generating a phone push."""
+    with db_conn() as c:
+        c.execute(
+            """
+            INSERT INTO pattern_monitor_state(
+                grp, symbol, interval, last_closed_date, updated
+            ) VALUES(?,?,?,?,?)
+            ON CONFLICT(grp, symbol, interval) DO UPDATE SET
+                last_closed_date=excluded.last_closed_date,
+                updated=excluded.updated
+            """,
+            (
+                grp,
+                symbol,
+                interval,
+                latest_closed_date,
+                datetime.utcnow().isoformat(),
+            )
+        )
+        c.commit()
+
+
 def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, grp="FOREX"):
     """
-    Persist the last processed CLOSED candle in SQLite so restarts/redeploys
-    do not suppress the next genuine signal. Historical candles are not replayed.
+    Notify only for a genuinely NEW fully closed candle.
+
+    Safety rules:
+      * A Railway restart/redeploy must never replay a candle that had already
+        closed before this Python process started.
+      * FOREX pattern pushes are not sent during the weekend market closure.
+        The newest closed candle is baselined instead, so it cannot replay on
+        Saturday/Sunday or when the market reopens.
+      * CRYPTO remains 24/7.
     """
     if not latest_closed_date:
+        return
+
+    # Never turn an old candle into a "new" push just because Railway restarted.
+    close_utc = pattern_candle_close_utc(latest_closed_date, interval)
+    if close_utc is not None and close_utc <= PROCESS_STARTED_UTC:
+        _save_pattern_monitor_baseline(
+            grp, symbol, interval, latest_closed_date
+        )
+        print(
+            "pattern baseline after restart",
+            grp, symbol, interval, latest_closed_date
+        )
+        return
+
+    # Edo rule: no delayed Forex pattern alerts over the closed weekend.
+    # Advance the state silently so Friday candles cannot replay on Saturday,
+    # Sunday, or after the Sunday reopen.
+    if str(grp).upper() == "FOREX" and forex_weekend_closed():
+        _save_pattern_monitor_baseline(
+            grp, symbol, interval, latest_closed_date
+        )
+        print(
+            "forex weekend pattern push suppressed/baselined",
+            symbol, interval, latest_closed_date
+        )
         return
 
     with db_conn() as c:
