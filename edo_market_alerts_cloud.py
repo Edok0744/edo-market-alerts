@@ -3045,11 +3045,106 @@ def sr_calculated_targets(direction, entry_price, zone_centre, departure_extreme
     return target1, take_profit
 
 
+def sr_gap_structure_is_messy(candles, old_i, retest_index, zone_centre, ar, direction):
+    """Return True when an S/R gap-retest is too choppy to trust on this timeframe.
+
+    Edo rule: if the gap/separation is messy, do not force a lower-timeframe
+    signal. Let the normal higher-timeframe scanners (8H -> Daily -> Weekly)
+    look for the same structure in a cleaner form.
+
+    A clean separation should: 
+      * establish a run of candles clearly away from the S/R zone, and
+      * avoid repeatedly revisiting/crossing the zone before the final retest.
+    """
+    if retest_index - old_i < 8 or ar <= 0:
+        return True
+
+    # Ignore the candles immediately surrounding the original touch and the
+    # final retest. We are judging the quality of the separation in between.
+    start = old_i + 2
+    end = max(start, retest_index - 2)
+    middle = candles[start:end]
+    if len(middle) < 4:
+        return True
+
+    away_distance = ar * 0.55
+    zone_band = ar * 0.45
+
+    # Require at least three consecutive closes clearly away from the zone.
+    best_run = run = 0
+    for c in middle:
+        close = float(c["close"])
+        if direction == "bullish":
+            away = close >= zone_centre + away_distance
+        else:
+            away = close <= zone_centre - away_distance
+        if away:
+            run += 1
+            best_run = max(best_run, run)
+        else:
+            run = 0
+
+    if best_run < 3:
+        return True
+
+    # After price has clearly departed, repeated returns into the same zone
+    # mean the lower timeframe is too noisy. Count separate revisit clusters,
+    # not every individual candle in one cluster.
+    departed = False
+    revisit_clusters = 0
+    in_revisit = False
+    side_flips = 0
+    previous_side = None
+
+    for c in middle:
+        close = float(c["close"])
+        low = float(c["low"])
+        high = float(c["high"])
+
+        if direction == "bullish":
+            clearly_away = close >= zone_centre + away_distance
+        else:
+            clearly_away = close <= zone_centre - away_distance
+
+        if clearly_away:
+            departed = True
+
+        if not departed:
+            continue
+
+        overlaps_zone = low <= zone_centre + zone_band and high >= zone_centre - zone_band
+        if overlaps_zone and not in_revisit:
+            revisit_clusters += 1
+            in_revisit = True
+        elif not overlaps_zone:
+            in_revisit = False
+
+        if close > zone_centre + zone_band:
+            side = 1
+        elif close < zone_centre - zone_band:
+            side = -1
+        else:
+            side = 0
+
+        if side and previous_side and side != previous_side:
+            side_flips += 1
+        if side:
+            previous_side = side
+
+    # One ordinary revisit before the final retest can happen. Multiple
+    # separate revisits or repeated side-flips are the messy structures Edo
+    # wants promoted to a higher timeframe instead of signalled here.
+    return revisit_clusters >= 2 or side_flips >= 3
+
+
 def detect_bounce_retest(candles, conf):
     """
     Edo S/R Gap-and-Retest trading rule.
 
     IMPORTANT:
+      * If the lower-timeframe gap/separation is too messy, reject it on that
+        timeframe and let the next higher scanner (8H -> Daily -> Weekly)
+        provide the cleaner structural signal instead.
       * Historical HIGH = RESISTANCE only -> bearish/SELL confirmation only.
       * Historical LOW  = SUPPORT only    -> bullish/BUY confirmation only.
       * The second touch must retrace at least 50% of the move-away distance
@@ -3160,6 +3255,15 @@ def detect_bounce_retest(candles, conf):
             continue
 
         zone_centre = (old_price + retest_price) / 2.0
+
+        # Edo higher-timeframe clarity rule: if this timeframe is too choppy,
+        # do not force a gap-retest signal here. The 8H, Daily and Weekly
+        # scanners already run independently, so the setup can be recognised
+        # on the next higher timeframe when its structure is cleaner.
+        if sr_gap_structure_is_messy(
+            candles, old_i, retest_index, zone_centre, ar, direction
+        ):
+            continue
 
         # Before the second touch, price must approach the level from the
         # correct side, then confirmation must close back away from the zone.
@@ -4288,6 +4392,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                 found.append(pullback)
 
     # B) Edo S/R GAP-AND-RETEST — 8H, Daily and Weekly.
+    #    If the structure is messy on a lower timeframe, it is suppressed there
+    #    so the independently scanned higher timeframe can provide a cleaner setup.
     #    Established high/low on the left -> clear move away / separation ->
     #    later retest of the same zone -> opposite-colour CLOSED confirmation.
     #    The 50% previous-candle BODY rule applies ONLY to this signal.
@@ -4792,6 +4898,8 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
                 found.append(pullback)
 
     # B) S/R GAP-AND-RETEST — 8H, Daily and Weekly, WITH 50% rule.
+    #    Messy lower-timeframe structures are suppressed so Daily/Weekly can
+    #    supply the cleaner version of the same price structure.
     if interval in SR_GAP_RETEST_INTERVALS:
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
