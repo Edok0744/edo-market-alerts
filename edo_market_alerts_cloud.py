@@ -1057,6 +1057,7 @@ a{text-decoration:none}
 .bear{color:#ff6b7d}
 .mixed{color:#f2c94c}
 .summary{font-size:23px;font-weight:900;margin-top:16px}
+.since{margin-top:7px;font-size:13px;color:#a9bfd2;font-weight:700}
 .error{color:#ff8a96;font-weight:700}
 @media(max-width:600px){
     .trend-grid{grid-template-columns:1fr}
@@ -1086,6 +1087,10 @@ a{text-decoration:none}
         <div class="summary {{ summary_css }}">
             {{ summary_icon }} {{ summary }}
         </div>
+
+        {% if full_trend_since and summary in ('FULL BULLISH', 'FULL BEARISH') %}
+        <div class="since">{{ summary }} since: {{ full_trend_since }}</div>
+        {% endif %}
 
         {% if detail %}
         <div class="small" style="margin-top:8px">{{ detail }}</div>
@@ -5556,28 +5561,35 @@ def save_trend_status(symbol, status):
     """
     Atomically save trend status and return the previously stored status.
 
+    The `updated` timestamp is now the time the CURRENT trend state began,
+    not the time of the latest background check.  If the state is unchanged
+    we preserve the existing timestamp so the Trend page can display
+    "FULL BULLISH since ..." / "FULL BEARISH since ...".
+
     BEGIN IMMEDIATE serialises competing Railway/Gunicorn workers so two
     workers cannot both read the same old state and send the same FULL TREND
     Pushover twice.
     """
+    now_iso = datetime.utcnow().isoformat()
     with db_conn() as c:
         c.execute("BEGIN IMMEDIATE")
         row = c.execute(
-            "SELECT status FROM trend_status WHERE symbol=?",
+            "SELECT status, updated FROM trend_status WHERE symbol=?",
             (symbol,)
         ).fetchone()
         previous = row["status"] if row else None
 
-        c.execute(
-            """
-            INSERT INTO trend_status(symbol,status,updated)
-            VALUES(?,?,?)
-            ON CONFLICT(symbol) DO UPDATE SET
-                status=excluded.status,
-                updated=excluded.updated
-            """,
-            (symbol, status, datetime.utcnow().isoformat())
-        )
+        if row is None:
+            c.execute(
+                "INSERT INTO trend_status(symbol,status,updated) VALUES(?,?,?)",
+                (symbol, status, now_iso)
+            )
+        elif previous != status:
+            c.execute(
+                "UPDATE trend_status SET status=?, updated=? WHERE symbol=?",
+                (status, now_iso, symbol)
+            )
+        # If unchanged, leave `updated` untouched: it records when this state began.
         c.commit()
 
     return previous
@@ -5595,8 +5607,17 @@ def active_trend_monitor():
                 continue
 
             with db_conn() as c:
+                # FULL TREND is an independent feature. Monitor all saved
+                # favourites, not only symbols whose price alert was already
+                # triggered. Keep triggered-alert symbols too in case a user
+                # later removes a favourite while an alert is still active.
                 rows = c.execute(
-                    "SELECT DISTINCT symbol, grp FROM alerts WHERE triggered=1 ORDER BY symbol"
+                    """
+                    SELECT symbol, grp FROM favorites
+                    UNION
+                    SELECT symbol, grp FROM alerts WHERE triggered=1
+                    ORDER BY symbol
+                    """
                 ).fetchall()
 
             markets = [(r["symbol"], r["grp"]) for r in rows]
@@ -5609,8 +5630,9 @@ def active_trend_monitor():
                 index = (index + 1) % len(markets)
 
                 # Weekend safety: spot Forex is closed. Do not calculate or
-                # push FULL TREND states from stale Friday candles. Crypto
-                # remains active 24/7 and CFDs are left unchanged.
+                # push FULL TREND states from stale Friday candles. Crypto is
+                # intentionally NOT blocked here and remains active 24/7,
+                # including Saturday and Sunday. CFDs are left unchanged.
                 if str(grp).upper() == "FOREX" and forex_weekend_closed():
                     print("forex weekend full-trend monitor suppressed", symbol)
                     time.sleep(1)
@@ -5637,7 +5659,9 @@ def active_trend_monitor():
         except Exception as e:
             print("active trend monitor error", e)
 
-        time.sleep(300)
+        # One market per minute keeps API use modest while making FULL TREND
+        # notifications much more responsive across all saved favourites.
+        time.sleep(60)
 
 
 TREND_INTERVALS = [
@@ -6511,6 +6535,32 @@ def trend(i):
 
     scan, error = build_trend_scan(f['symbol'], f['grp'])
 
+    # The background monitor stores when the current FULL TREND state began.
+    # If the manual Trend page discovers a changed state before the background
+    # loop gets to this market, record it here as well (without sending a push).
+    full_trend_since = ''
+    if not error:
+        current_full = scan['summary'] if scan['summary'] in ('FULL BULLISH', 'FULL BEARISH') else ''
+        with db_conn() as c:
+            row = c.execute(
+                'SELECT status, updated FROM trend_status WHERE symbol=?',
+                (f['symbol'],)
+            ).fetchone()
+        stored_status = row['status'] if row else None
+        if stored_status != current_full:
+            save_trend_status(f['symbol'], current_full)
+            with db_conn() as c:
+                row = c.execute(
+                    'SELECT status, updated FROM trend_status WHERE symbol=?',
+                    (f['symbol'],)
+                ).fetchone()
+        if row and row['status'] == current_full and current_full:
+            try:
+                dt = datetime.fromisoformat(row['updated'])
+                full_trend_since = dt.strftime('%Y-%m-%d %H:%M UTC')
+            except Exception:
+                full_trend_since = str(row['updated'] or '')
+
     if error:
         return render_template_string(
             TREND_HTML,
@@ -6521,6 +6571,7 @@ def trend(i):
             summary_icon='',
             summary_css='mixed',
             detail='',
+            full_trend_since='',
             error=error
         )
 
@@ -6533,6 +6584,7 @@ def trend(i):
         summary_icon=scan['summary_icon'],
         summary_css=scan['summary_css'],
         detail=scan['detail'],
+        full_trend_since=full_trend_since,
         error=''
     )
 
