@@ -1183,7 +1183,7 @@ a{text-decoration:none}
 <body>
 <div class="wrap">
     <h1>⚡ {{ symbol }} EDO SETUP SIGNAL</h1>
-    <div class="small">{{ group }} • Your price-action method • Trend Pullback: 4H / 8H / 1D • S/R Gap-Retest: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
+    <div class="small">{{ group }} • Your price-action method • Trend Pullback: 4H / 8H / 1D • consecutive adjacent 2+ candles • clean retracement required • S/R Gap-Retest: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
 
     <div class="tfrow">
         {% for tf in timeframes %}
@@ -2596,7 +2596,7 @@ PATTERN_TIMEFRAMES = [
 ]
 
 # Edo's exact signal timeframes.
-NORMAL_PULLBACK_INTERVALS = {"4h", "8h", "1day"}
+NORMAL_PULLBACK_INTERVALS = {"4h", "8h", "1day", "1week"}
 SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
 
 # Alias retained for older helper code.
@@ -2967,13 +2967,17 @@ def previous_target(candles, direction, before_index, search_back=60):
     return None
 
 
-def sr_structure_targets(candles, direction, before_index, entry_price, search_back=120, min_separation=None):
+def sr_structure_targets(candles, direction, before_index, entry_price, search_back=80, min_separation=None):
     """
     Edo S/R Gap-Retest targets ONLY.
 
-    Preferred method:
-      Target 1 = first meaningful previous swing in the trade direction.
-      Take Profit = next stronger/farther structural swing.
+    Preferred method (Edo rule):
+      Target 1 = nearest MEANINGFUL previous swing in the trade direction.
+      Take Profit = the NEXT meaningful structural swing beyond Target 1.
+
+    Important: do not jump to an ancient/extreme high or low when two nearer,
+    clear swing points exist. Minor one-candle noise is filtered out by using
+    wider swing confirmation and a minimum prominence/distance test.
 
     If price history does not provide clean structural levels, the caller may
     add calculated fallback targets from the setup's own move-away distance.
@@ -2981,30 +2985,61 @@ def sr_structure_targets(candles, direction, before_index, entry_price, search_b
     """
     start = max(0, before_index - search_back)
     part = candles[start:before_index + 1]
-    if len(part) < 5:
+    if len(part) < 7:
         return None, None
 
+    entry = float(entry_price)
+    local_ar = avg_range(candles, before_index + 1, 20)
+    local_ar = max(float(local_ar or 0.0), abs(entry) * 0.0005)
+
     if min_separation is None:
-        local_ar = avg_range(candles, before_index + 1, 20)
-        min_separation = max(local_ar * 0.60, abs(float(entry_price)) * 0.0005)
+        # Keep T1/TP meaningfully separated from each other.
+        min_separation = max(local_ar * 0.75, abs(entry) * 0.0005)
+
+    # Wider pivot width removes many small noisy swings that Edo would not use
+    # visually as a target.  A swing must also stand out from nearby candles.
+    def meaningful_points(kind):
+        pts = swing_points(part, kind, left=3, right=3)
+        out = []
+        key = "high" if kind == "high" else "low"
+        for i, value in pts:
+            v = float(value)
+            lo = max(0, i - 3)
+            hi = min(len(part), i + 4)
+            nearby = part[lo:hi]
+            if not nearby:
+                continue
+            if kind == "high":
+                base = min(float(c["low"]) for c in nearby)
+                prominence = v - base
+            else:
+                cap = max(float(c["high"]) for c in nearby)
+                prominence = cap - v
+            if prominence >= local_ar * 0.70:
+                out.append((i, v))
+        return out
 
     if direction == "bullish":
-        pts = swing_points(part, "high")
-        levels = sorted({float(v) for _, v in pts if float(v) > float(entry_price)})
+        pts = meaningful_points("high")
+        # Ignore tiny nearby levels. Edo wants the first proper structural high.
+        min_target_distance = max(local_ar * 1.00, abs(entry) * 0.00075)
+        levels = sorted({v for _, v in pts if v >= entry + min_target_distance})
         if not levels:
             return None, None
         target1 = levels[0]
         farther = [v for v in levels[1:] if v >= target1 + min_separation]
-        take_profit = max(farther) if farther else None
+        # Take Profit is the NEXT meaningful level, not the farthest old extreme.
+        take_profit = farther[0] if farther else None
         return target1, take_profit
 
-    pts = swing_points(part, "low")
-    levels = sorted({float(v) for _, v in pts if float(v) < float(entry_price)}, reverse=True)
+    pts = meaningful_points("low")
+    min_target_distance = max(local_ar * 1.00, abs(entry) * 0.00075)
+    levels = sorted({v for _, v in pts if v <= entry - min_target_distance}, reverse=True)
     if not levels:
         return None, None
     target1 = levels[0]
     farther = [v for v in levels[1:] if v <= target1 - min_separation]
-    take_profit = min(farther) if farther else None
+    take_profit = farther[0] if farther else None
     return target1, take_profit
 
 
@@ -3362,14 +3397,52 @@ def detect_bounce_retest(candles, conf):
     }
 
 def count_same_colour_before(candles, i, colour):
+    """Count ONLY the uninterrupted same-colour run immediately before i.
+
+    Edo rule: the pullback candles must be directly adjacent to the confirmation.
+    We never search farther back through mixed candles to manufacture a 2+ run.
+    A doji/mixed/other-colour candle ends the run immediately.
+    """
+    if i <= 0 or i > len(candles):
+        return 0, i
+
     count = 0
     j = i - 1
-
-    while j >= 0 and candle_colour(candles[j]) == colour:
+    while j >= 0:
+        c = candle_colour(candles[j])
+        if c != colour:
+            break
         count += 1
         j -= 1
 
     return count, j + 1
+
+
+def exact_adjacent_pullback_run(candles, run_start, confirm_index, run_colour):
+    """Hard guard for Edo's minimum-2 candle setup.
+
+    Every candle from run_start up to, but not including, the confirmation must
+    be the required pullback colour and must be consecutive. The confirmation
+    must be the very next candle and the opposite colour. This deliberately
+    rejects separated red/green candles that only look like a run when older
+    candles are searched farther back.
+    """
+    if run_start < 0 or confirm_index <= run_start or confirm_index >= len(candles):
+        return False
+
+    run = candles[run_start:confirm_index]
+    if len(run) < 2:
+        return False
+    if any(candle_colour(c) != run_colour for c in run):
+        return False
+
+    confirm_colour = candle_colour(candles[confirm_index])
+    expected_confirm = "red" if run_colour == "green" else "green"
+    if confirm_colour != expected_confirm:
+        return False
+
+    # The candle directly before confirmation must belong to the run.
+    return candle_colour(candles[confirm_index - 1]) == run_colour
 
 
 
@@ -3551,19 +3624,105 @@ def detect_support_resistance_signal(candles):
     return found
 
 
-def detect_trend_pullback(candles, conf, allow_sr_exception=False):
+def clean_pullback_run(candles, run_start, confirm_index, run_colour):
+    """
+    Edo clean-pullback quality filter for the normal 2+ candle signal.
+
+    Purpose: reject tiny/overlapping same-colour candles sitting in congestion
+    while keeping obvious 2, 3, 4+ candle retracements. This is price-action
+    only; it does NOT add a 50% confirmation rule and uses no indicators.
+
+    A clean run must:
+      - make real net progress in the pullback direction;
+      - have most closes continue in that direction instead of overlapping back;
+      - have enough total body/progress compared with recent candle size.
+    """
+    if run_start < 0 or confirm_index <= run_start:
+        return False, "invalid pullback run"
+
+    run = candles[run_start:confirm_index]
+    if len(run) < 2:
+        return False, "fewer than 2 pullback candles"
+
+    recent_range = avg_range(candles, end=run_start, length=20)
+    recent_body = avg_body(candles, end=run_start, length=20)
+    if recent_range <= 0:
+        recent_range = avg_range(candles, end=confirm_index, length=20)
+    if recent_body <= 0:
+        recent_body = avg_body(candles, end=confirm_index, length=20)
+
+    first_open = float(run[0]["open"])
+    last_close = float(run[-1]["close"])
+    net_progress = (last_close - first_open) if run_colour == "green" else (first_open - last_close)
+    total_body = sum(abs(float(c["close"]) - float(c["open"])) for c in run)
+
+    # The run must actually travel a meaningful distance. Two tiny candles in a
+    # sideways cluster should not qualify just because their colours match.
+    min_progress = max(recent_range * 0.70, recent_body * 1.10)
+    if net_progress < min_progress:
+        return False, f"pullback too small/choppy (progress {net_progress:.6g})"
+
+    # Directional efficiency rejects runs whose same-colour bodies largely
+    # overlap/cancel each other. A clean pullback should retain a good portion
+    # of its body movement as net progress.
+    efficiency = net_progress / total_body if total_body > 0 else 0.0
+    if efficiency < 0.55:
+        return False, f"pullback candles overlap too much (efficiency {efficiency:.0%})"
+
+    # Reject heavy candle-range overlap/congestion. A visually clean pullback
+    # should not have nearly all candles sitting on top of each other.
+    if len(run) >= 2:
+        overlap_ratios = []
+        for a, b in zip(run, run[1:]):
+            a_lo, a_hi = float(a["low"]), float(a["high"])
+            b_lo, b_hi = float(b["low"]), float(b["high"])
+            overlap = max(0.0, min(a_hi, b_hi) - max(a_lo, b_lo))
+            smaller = min(max(a_hi - a_lo, 0.0), max(b_hi - b_lo, 0.0))
+            if smaller > 0:
+                overlap_ratios.append(overlap / smaller)
+        if overlap_ratios and (sum(overlap_ratios) / len(overlap_ratios)) > 0.72:
+            return False, "pullback is too congested/overlapping"
+
+    # Most closes must continue to make progress in the pullback direction.
+    progressive_steps = 0
+    comparisons = 0
+    for a, b in zip(run, run[1:]):
+        comparisons += 1
+        if run_colour == "green" and float(b["close"]) > float(a["close"]):
+            progressive_steps += 1
+        elif run_colour == "red" and float(b["close"]) < float(a["close"]):
+            progressive_steps += 1
+
+    if comparisons:
+        required_steps = max(1, (comparisons + 1) // 2)
+        if progressive_steps < required_steps:
+            return False, "pullback closes are too sideways/overlapping"
+
+    # Avoid qualifying a run made almost entirely from doji-sized bodies.
+    avg_run_body = total_body / len(run)
+    if recent_body > 0 and avg_run_body < recent_body * 0.55:
+        return False, "pullback candles are too small relative to recent price action"
+
+    return True, ""
+
+
+def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local_trend=True):
     """
     Edo Trend Pullback rule — NO 50% penetration requirement.
 
     BEARISH trend / possible SELL:
       1) Minimum 2 consecutive bullish fully CLOSED candles pull upward.
       2) Next fully CLOSED candle is bearish.
-      3) No minimum body-penetration percentage is required.
+      3) Pullback candles must form a clean, meaningful retracement rather than
+         tiny overlapping congestion.
+      4) No minimum body-penetration percentage is required.
 
     BULLISH trend / possible BUY:
       1) Minimum 2 consecutive bearish fully CLOSED candles pull downward.
       2) Next fully CLOSED candle is bullish.
-      3) No minimum body-penetration percentage is required.
+      3) Pullback candles must form a clean, meaningful retracement rather than
+         tiny overlapping congestion.
+      4) No minimum body-penetration percentage is required.
 
     No forming candle may trigger a signal.
     """
@@ -3592,12 +3751,26 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False):
     else:
         return None
 
+    # Hard adjacency rule: only an uninterrupted 2+ run immediately before
+    # the confirmation is valid. Never join separated same-colour candles.
+    if not exact_adjacent_pullback_run(candles, run_start, i, run_colour):
+        return None
+
+    clean_ok, clean_reason = clean_pullback_run(
+        candles, run_start, i, run_colour
+    )
+    if not clean_ok:
+        return None
+
     trend = local_structure_trend(candles, run_start)
 
-    # Normal rule: setup direction must agree with established local structure.
-    # 8H / Daily may keep the candidate only while evaluating Edo's genuine
-    # SECOND S/R REACTION WITH GAP early/developing-trend exception.
-    if trend != required_trend and not allow_sr_exception:
+    # 4H uses established trend context and then also passes the separate
+    # strong higher-timeframe alignment filter later in the signal flow.
+    #
+    # 8H / Daily / Weekly use Edo's higher-timeframe S/R context rule instead:
+    # the clean 2+ candle sequence must occur at/near meaningful support or
+    # resistance, so local-trend agreement is not required here.
+    if require_local_trend and trend != required_trend and not allow_sr_exception:
         return None
 
     score = 6.0 + min(3.0, (run_count - 2) * 0.75)
@@ -3612,6 +3785,8 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False):
         "confirmation_close": confirm_close,
         "run_count": run_count,
         "run_colour": run_colour,
+        "run_start": run_start,
+        "confirmation_index": i,
         "run_dates": [
             candles[j].get("datetime", "")
             for j in range(run_start, i)
@@ -3622,6 +3797,89 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False):
         "context": "trend",
         "target": target,
     }
+
+
+def trend_pullback_near_structural_sr(candles, setup, interval):
+    """
+    Edo 8H / Daily / Weekly Trend Pullback context rule.
+
+    4H is handled separately by the strong higher-timeframe trend filter and
+    does NOT require support/resistance proximity.
+
+    For higher-timeframe Trend Pullbacks:
+      * bullish confirmation must occur at/near meaningful SUPPORT;
+      * bearish confirmation must occur at/near meaningful RESISTANCE.
+
+    The S/R area comes from prior structural swing wicks. The pullback can
+    touch the area with the pullback candles or the confirmation candle.
+    No 50% rule is introduced here.
+    """
+    if not candles or not setup:
+        return False, None, None
+
+    direction = setup.get("direction")
+    i = setup.get("confirmation_index")
+    run_start = setup.get("run_start")
+
+    if not isinstance(i, int) or not isinstance(run_start, int):
+        return False, None, None
+    if i <= 2 or run_start <= 2:
+        return False, None, None
+
+    ar = avg_range(candles, i + 1, 20)
+    if ar <= 0:
+        return False, None, None
+
+    # Treat support/resistance as an AREA, not one exact price.
+    zone_tolerance = max(
+        ar * 0.85,
+        abs(float(candles[i]["close"])) * 0.0015
+    )
+
+    search_start = max(0, run_start - 100)
+    history = candles[search_start:run_start]
+    if len(history) < 6:
+        return False, None, None
+
+    reaction_slice = candles[run_start:i + 1]
+
+    if direction == "bullish":
+        touch_price = min(float(c["low"]) for c in reaction_slice)
+        swings = swing_points(history, "low", left=2, right=2)
+        sr_kind = "support"
+    elif direction == "bearish":
+        touch_price = max(float(c["high"]) for c in reaction_slice)
+        swings = swing_points(history, "high", left=2, right=2)
+        sr_kind = "resistance"
+    else:
+        return False, None, None
+
+    candidates = []
+    for local_i, level in swings:
+        full_i = search_start + local_i
+        separation = run_start - full_i
+        if separation < 3:
+            continue
+
+        distance = abs(float(level) - touch_price)
+        if distance <= zone_tolerance:
+            # Prefer the closest meaningful level, then the more recent swing.
+            candidates.append((distance, -full_i, float(level)))
+
+    if not candidates:
+        return False, None, None
+
+    candidates.sort()
+    distance, _, level = candidates[0]
+
+    setup["sr_context_ok"] = True
+    setup["sr_kind"] = sr_kind
+    setup["sr_level"] = level
+    setup["sr_distance"] = distance
+    setup["sr_zone_tolerance"] = zone_tolerance
+
+    return True, sr_kind, level
+
 
 def sr_second_reaction_exception(candles, setup):
     """
@@ -4377,19 +4635,32 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = []
 
-    # A) NORMAL Edo Trend Pullback — 4H, 8H and Daily.
+    # A) NORMAL Edo Trend Pullback — 4H, 8H, Daily and Weekly.
     #    Minimum 2 same-colour fully CLOSED pullback candles,
     #    then an opposite-colour fully CLOSED confirmation.
     #    NO 50% rule applies to this signal.
+    #
+    #    4H: must pass the higher-timeframe trend filter; S/R is NOT required.
+    #    8H / Daily / Weekly: must be at/near meaningful S/R.
     if interval in NORMAL_PULLBACK_INTERVALS:
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
                 closed_candles,
                 conf,
-                allow_sr_exception=False
+                allow_sr_exception=False,
+                require_local_trend=(interval == "4h")
             )
-            if pullback:
-                found.append(pullback)
+            if not pullback:
+                continue
+
+            if interval in ("8h", "1day", "1week"):
+                near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
+                    closed_candles, pullback, interval
+                )
+                if not near_sr:
+                    continue
+
+            found.append(pullback)
 
     # B) Edo S/R GAP-AND-RETEST — 8H, Daily and Weekly.
     #    If the structure is messy on a lower timeframe, it is suppressed there
@@ -4426,15 +4697,18 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
     elif interval == "1week":
-        found = [p for p in found if p.get("name") == "S/R GAP RETEST SETUP"]
+        found = [
+            p for p in found
+            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
+        ]
     else:
         found = []
 
-    # Edo rule: ONLY the 4H normal Trend Pullback requires strong higher-timeframe
-    # trend alignment. The 8H and Daily normal Trend Pullbacks are pure
-    # candle-sequence logic: minimum 2 same-colour pullback candles, then the
-    # first opposite-colour fully CLOSED confirmation candle. No higher-timeframe
-    # trend filter on 8H or Daily.
+    # Edo rule:
+    #   4H Trend Pullback -> strong higher-timeframe trend alignment; S/R not required.
+    #   8H / Daily / Weekly Trend Pullback -> no 4H-style higher-timeframe trend
+    #   requirement, but the clean 2+ candle sequence must occur at/near
+    #   meaningful support/resistance.
     higher_tf_states = None
     if interval == "4h":
         normal_found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
@@ -4867,7 +5141,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     """
-    Collect Edo's trading setups from fully closed candles only: normal Trend Pullback (4H/8H/Daily, no 50%) and S/R Gap-Retest (8H/Daily/Weekly, 50% rules).
+    Collect Edo's trading setups from fully closed candles only: normal Trend Pullback (4H trend-filtered; 8H/Daily/Weekly near S/R, no 50%) and S/R Gap-Retest (8H/Daily/Weekly, 50% rules).
 
     Returns:
       setups, latest_closed_date, error
@@ -4886,16 +5160,28 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     latest_closed_date = closed_candles[-1].get("datetime", "")
     found = []
 
-    # A) NORMAL Trend Pullback — 4H, 8H and Daily, NO 50% rule.
+    # A) NORMAL Trend Pullback — 4H, 8H, Daily and Weekly, NO 50% rule.
+    #    4H needs higher-timeframe trend alignment and does NOT need S/R.
+    #    8H / Daily / Weekly must be at/near meaningful S/R.
     if interval in NORMAL_PULLBACK_INTERVALS:
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
                 closed_candles,
                 conf,
-                allow_sr_exception=False
+                allow_sr_exception=False,
+                require_local_trend=(interval == "4h")
             )
-            if pullback:
-                found.append(pullback)
+            if not pullback:
+                continue
+
+            if interval in ("8h", "1day", "1week"):
+                near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
+                    closed_candles, pullback, interval
+                )
+                if not near_sr:
+                    continue
+
+            found.append(pullback)
 
     # B) S/R GAP-AND-RETEST — 8H, Daily and Weekly, WITH 50% rule.
     #    Messy lower-timeframe structures are suppressed so Daily/Weekly can
@@ -4928,13 +5214,18 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
     elif interval == "1week":
-        setups = [p for p in setups if p.get("name") == "S/R GAP RETEST SETUP"]
+        setups = [
+            p for p in setups
+            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
+        ]
     else:
         setups = []
 
-    # Edo rule: ONLY 4H normal Trend Pullback uses the strong higher-timeframe
-    # trend filter. 8H and Daily normal Trend Pullbacks must NOT be blocked by
-    # trend alignment. The separate S/R Gap-Retest setup is also independent.
+    # Edo rule:
+    #   4H Trend Pullback -> strong higher-timeframe trend alignment; S/R not required.
+    #   8H / Daily / Weekly Trend Pullback -> must be near meaningful S/R and do
+    #   not use the 4H higher-timeframe alignment requirement.
+    # The separate S/R Gap-Retest setup remains independent.
 
     if interval == "4h":
         normal_setups = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
