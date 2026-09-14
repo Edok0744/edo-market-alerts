@@ -915,6 +915,46 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
     refreshNewsReactions();
     setInterval(refreshNewsReactions, 30000);
 
+    // iPhone Home Screen / PWA refresh fix.
+    // iOS can keep the standalone web app frozen in memory and show the old
+    // HTML when it is opened again. HOME is database/cache-only, so a reload
+    // here is safe and does not consume Twelve Data credits.
+    let edoHomeLoadedAt = Date.now();
+    let edoLastHiddenAt = 0;
+    let edoReloading = false;
+
+    function edoFreshHome(force) {
+        if (edoReloading || document.visibilityState !== 'visible') return;
+        const ageMs = Date.now() - edoHomeLoadedAt;
+        if (!force && ageMs < 30000) return;
+        edoReloading = true;
+        const u = new URL(window.location.href);
+        u.searchParams.set('_edo_refresh', Date.now().toString());
+        window.location.replace(u.toString());
+    }
+
+    // Safari/iOS fires pageshow when a frozen page is restored from its
+    // back-forward cache. Reload immediately when that happens.
+    window.addEventListener('pageshow', function (event) {
+        if (event.persisted) edoFreshHome(true);
+    });
+
+    // When the user taps the EdoMarketAlerts Home Screen icon after the app
+    // has been in the background, refresh the HOME screen automatically.
+    document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'hidden') {
+            edoLastHiddenAt = Date.now();
+            return;
+        }
+        const backgroundMs = edoLastHiddenAt ? Date.now() - edoLastHiddenAt : 0;
+        if (backgroundMs >= 5000 || Date.now() - edoHomeLoadedAt >= 30000) {
+            edoFreshHome(true);
+        }
+    });
+
+    // While HOME stays open, refresh the cached dashboard once per minute.
+    setInterval(function () { edoFreshHome(false); }, 60000);
+
     const refreshBtn = document.getElementById('news-refresh-btn');
     const refreshStatus = document.getElementById('news-refresh-status');
 
@@ -6191,6 +6231,17 @@ def refresh_news_now():
             ok=False,
             error="News refresh failed temporarily."
         ), 200
+
+
+@APP.after_request
+def edo_no_cache_dynamic_pages(response):
+    # Prevent iPhone Safari/Home Screen from serving a stale dashboard after
+    # the standalone app is reopened. Dynamic pages should always revalidate.
+    if request.path == '/' or request.path.startswith('/trend') or request.path.startswith('/signal'):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
 
 
 @APP.route('/')
