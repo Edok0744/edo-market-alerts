@@ -25,6 +25,26 @@ FOREX_FACTORY_CALENDAR_FALLBACK_URL = os.environ.get(
 NEWS_REFRESH_SECONDS = int(os.environ.get('NEWS_REFRESH_SECONDS', '1800'))
 NEWS_WARNING_MINUTES = int(os.environ.get('NEWS_WARNING_MINUTES', '5'))
 NEWS_PUSH_SOUND = os.environ.get('NEWS_PUSH_SOUND', 'siren')
+
+# Edo Major News filter: Forex Factory can label events High even when they
+# are not normally the kind of release Edo wants to stop new entries for.
+# Only these major event families are kept for the HOME warning/siren system.
+MAJOR_NEWS_KEYWORDS = (
+    "interest rate", "rate decision", "cash rate", "official bank rate",
+    "federal funds rate", "fed funds", "refinancing rate", "monetary policy",
+    "fomc", "ecb press conference", "boe press conference", "boc press conference",
+    "rba press conference", "rbnz press conference", "boj press conference",
+    "snb press conference", "press conference",
+    "cpi", "consumer price index", "inflation",
+    "non-farm", "nonfarm", "nfp", "employment change", "employment report",
+    "unemployment rate", "employment situation",
+    "gdp", "gross domestic product",
+)
+
+def is_edo_major_news(event_name):
+    name = str(event_name or "").strip().lower()
+    return any(key in name for key in MAJOR_NEWS_KEYWORDS)
+
 CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 
 # -------------------------------------------------
@@ -1804,6 +1824,13 @@ def refresh_economic_news():
                 continue
 
             event_name = str(item.get("title") or "High-impact economic event").strip()
+
+            # Edo only wants the genuinely major/very volatile releases.
+            # Less-important Forex Factory High events are ignored completely:
+            # no HOME HOLD warning and no 5-minute triple siren.
+            if not is_edo_major_news(event_name):
+                continue
+
             event_dt = parse_ff_event_time(item.get("date"))
             if event_dt is None:
                 continue
@@ -1820,7 +1847,7 @@ def refresh_economic_news():
                 "",
                 currency,
                 event_name,
-                "Forex Factory High Impact",
+                "Edo Major High Impact",
                 3,
                 fetched,
             ))
@@ -1847,7 +1874,7 @@ def refresh_economic_news():
 
         _save_news_feed_status(True, "", source_url)
         print(
-            f"Forex Factory news cache refreshed: {len(rows)} High-impact event(s) "
+            f"Forex Factory news cache refreshed: {len(rows)} Edo-major High-impact event(s) "
             f"from {source_url}"
         )
         return True, None
@@ -2804,6 +2831,50 @@ def fully_closed_candles(candles, interval, now_utc=None):
             closed.append(c)
 
     return closed
+
+
+def closed_candle_is_fresh(candle, interval, now_utc=None, grace_seconds=120):
+    """
+    Safety check for FULL TREND.
+
+    A FULL BULLISH/BEARISH state must never be built from a candle that is
+    one whole interval behind the newest completed candle. This can happen
+    briefly when an API/cache still contains pre-close data just after a
+    candle boundary.
+
+    We accept the newest closed candle only while its close time is no more
+    than one interval + a small API grace period behind current UTC time.
+    """
+    from datetime import timezone, timedelta
+
+    if not candle:
+        return False
+    seconds = interval_seconds(interval)
+    start = parse_candle_utc(candle.get("datetime", ""))
+    if not seconds or start is None:
+        return False
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    close_time = start + timedelta(seconds=seconds)
+    age = now_utc - close_time
+    return age.total_seconds() <= (seconds + grace_seconds)
+
+
+def clear_ohlc_cache_for_symbol(symbol, grp=None, intervals=None):
+    """Force the next FULL TREND read to use fresh market data."""
+    wanted = set(intervals or ())
+    symbol_key = symbol.upper().strip()
+    with _CACHE_LOCK:
+        for key in list(_OHLC_CACHE.keys()):
+            key_grp, key_symbol, key_interval = key
+            if key_symbol != symbol_key:
+                continue
+            if grp is not None and key_grp != (grp or ""):
+                continue
+            if wanted and key_interval not in wanted:
+                continue
+            _OHLC_CACHE.pop(key, None)
 
 
 def avg_range(candles, end=None, length=20):
@@ -5523,6 +5594,16 @@ def build_full_alignment(symbol, grp=None):
 
     signal_states = {}
 
+    # FULL TREND must be based on the market's newest genuinely CLOSED
+    # candles, not a cache created just before a candle boundary. 12H is
+    # synthetic from 4H, so refreshing 4H also refreshes the 12H source.
+    clear_ohlc_cache_for_symbol(
+        symbol, grp, intervals={"1h", "4h", "8h"}
+    )
+
+    from datetime import timezone
+    now_utc = datetime.now(timezone.utc)
+
     for label, interval in intervals.items():
         candles, err = get_candles(symbol, interval, outputsize=3, grp=grp)
         if err:
@@ -5531,6 +5612,13 @@ def build_full_alignment(symbol, grp=None):
         closed = last_closed_candle(candles, interval)
         if closed is None:
             return "", f"Not enough completed {label} candle data."
+
+        # If Twelve Data has not yet published the newest completed candle,
+        # do NOT fall back to the previous candle and create a false FULL
+        # BULLISH/BEARISH state. Wait for the next monitor pass instead.
+        if not closed_candle_is_fresh(closed, interval, now_utc=now_utc):
+            stamp = closed.get("datetime", "unknown")
+            return "", f"Waiting for fresh completed {label} candle data (latest {stamp})."
 
         signal_states[label] = analyse_candle(closed)
 
