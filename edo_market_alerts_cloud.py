@@ -690,7 +690,7 @@ No saved pairs yet. Enter a market above and press ⭐ SAVE PAIR.
 <select name="side"><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
 <select name="interval"><option value="1h">1H</option><option value="4h">4H</option><option value="8h">8H</option><option value="1day">Daily</option></select></div>
 <div class="row" style="margin-top:8px"><input name="stop_price" type="number" min="0" step="any" placeholder="Starting trailing stop PRICE" required><input name="note" type="text" placeholder="Note (optional)"><button class="trailing-btn">ARM TRAIL</button></div></form>
-{% if trailing_stops %}<div style="margin-top:14px">{% for t in trailing_stops %}<div class="market trailing-row"><div><span class="pill" style="background:#f28c1822;color:#ffb347">TRAIL</span> <b>{{t['symbol']}} • {{t['side']}} • {{ {'1h':'1H','4h':'4H','8h':'8H','1day':'Daily'}.get(t['interval'],t['interval']) }}</b><div class="small">{{ 'Price distance ' ~ t['distance_pips'] if t['distance_mode']=='PRICE' else 'OLD PIP TRAIL — delete and recreate' }} • Stop <span class="trailing-stop">{{t['stop_price']}}</span></div>{% if t['last_candle_time'] %}<div class="small">Last closed candle checked: {{t['last_candle_time']}}</div>{% endif %}{% if t['note'] %}<div class="small">📝 {{t['note']}}</div>{% endif %}</div><div style="text-align:right"><div class="status">{% if t['triggered'] %}🛑 HIT{% else %}<span class="trail-armed-dot"></span> ARMED{% endif %}</div><a href="/trailing/delete/{{t['id']}}"><button class="danger">Delete</button></a></div></div>{% endfor %}</div>{% endif %}
+{% if trailing_stops %}<div style="margin-top:14px">{% for t in trailing_stops %}<div class="market trailing-row"><div><span class="pill" style="background:#f28c1822;color:#ffb347">TRAIL</span> <b>{{t['symbol']}} • {{t['side']}} • {{ {'1h':'1H','4h':'4H','8h':'8H','1day':'Daily'}.get(t['interval'],t['interval']) }}</b><div class="small">{{ ('Price distance %.5f'|format(t['distance_pips'])) if t['distance_mode']=='PRICE' else 'OLD PIP TRAIL — delete and recreate' }} • Stop <span class="trailing-stop">{{t['stop_price']}}</span></div>{% if t['last_candle_time'] %}<div class="small">Last fully closed candle: {{t['last_candle_time']}} Perth</div>{% endif %}{% if t['note'] %}<div class="small">📝 {{t['note']}}</div>{% endif %}</div><div style="text-align:right"><div class="status">{% if t['triggered'] %}🛑 HIT{% else %}<span class="trail-armed-dot"></span> ARMED{% endif %}</div><a href="/trailing/delete/{{t['id']}}"><button class="danger">Delete</button></a></div></div>{% endfor %}</div>{% endif %}
 </div>
 
 <div class="card">
@@ -6093,6 +6093,17 @@ def format_closed_candle_perth(candle, interval):
     return perth_dt.strftime("%d %b • %H:%M")
 
 
+def format_closed_candle_close_perth(candle, interval):
+    """Show when the candle actually CLOSED, in Perth time, for trail checks."""
+    dt = parse_candle_utc(candle.get("datetime")) if candle else None
+    seconds = interval_seconds(interval)
+    if dt is None or not seconds:
+        return ""
+    close_dt = dt + timedelta(seconds=seconds)
+    perth_dt = close_dt.astimezone(ZoneInfo("Australia/Perth"))
+    return perth_dt.strftime("%d %b • %H:%M")
+
+
 def analyse_candle(candle):
     """
     Direct candlestick direction only.
@@ -6266,7 +6277,7 @@ def trailing_stop_monitor():
                     candle_start=str(candle.get('datetime',''))
                     if candle_start==(t['last_candle_start'] or ''): continue
                     close=float(candle['close']); old_stop=float(t['stop_price']); dist=(float(t['distance_pips']) if (t['distance_mode'] or 'PIPS')=='PRICE' else trailing_legacy_distance_value(t['symbol'],t['grp'],t['distance_pips'])); side=str(t['side']).upper()
-                    hit=(side=='BUY' and close<=old_stop) or (side=='SELL' and close>=old_stop); perth_time=format_closed_candle_perth(candle,t['interval'])
+                    hit=(side=='BUY' and close<=old_stop) or (side=='SELL' and close>=old_stop); perth_time=format_closed_candle_close_perth(candle,t['interval'])
                     if hit:
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET triggered=1,last_candle_start=?,last_candle_time=? WHERE id=?',(candle_start,perth_time,t['id'])); c.commit()
                         send_push(f"🟠 {t['symbol']} TRAILING STOP HIT", f"{side} candle-close trail hit.\nClosed candle: {perth_time} Perth\nCandle close: {close}\nTrail level: {old_stop}\nWicks/spikes were ignored.\nNote: {t['note'] or '-'}", sound="none")
