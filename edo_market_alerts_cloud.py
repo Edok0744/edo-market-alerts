@@ -1073,6 +1073,7 @@ a{text-decoration:none}
 }
 .trend-tf{font-size:12px;color:#8ca7bf;font-weight:800}
 .trend-state{margin-top:6px;font-weight:900}
+.trend-time{margin-top:6px;font-size:11px;color:#a9bfd2;font-weight:700;line-height:1.25}
 .bull{color:#35e28a}
 .bear{color:#ff6b7d}
 .mixed{color:#f2c94c}
@@ -1100,6 +1101,7 @@ a{text-decoration:none}
                 <div class="trend-state {{ item['css'] }}">
                     {% if not item.get('reference_only') %}{{ item['icon'] }} {% endif %}{{ item['state'] }}
                 </div>
+                <div class="trend-time">{{ item.get('closed_time_perth', '') }}</div>
             </div>
         {% endfor %}
         </div>
@@ -6045,6 +6047,19 @@ def last_closed_candle(candles, interval):
     return closed[-1]
 
 
+def format_closed_candle_perth(candle, interval):
+    """Show the exact fully closed candle used by Trend in Perth time."""
+    dt = parse_candle_utc(candle.get("datetime")) if candle else None
+    if dt is None:
+        return ""
+    # Candle timestamps are candle START times. Show that chart candle's start
+    # time in Perth so Edo can match it directly against the broker chart.
+    perth_dt = dt.astimezone(ZoneInfo("Australia/Perth"))
+    if interval == "1week":
+        return perth_dt.strftime("%d %b %Y")
+    return perth_dt.strftime("%d %b • %H:%M")
+
+
 def analyse_candle(candle):
     """
     Direct candlestick direction only.
@@ -6117,6 +6132,7 @@ def build_trend_scan(symbol, grp=None):
             "css": css,
             "reference_only": True,
             "closed_time": closed.get("datetime", ""),
+            "closed_time_perth": format_closed_candle_perth(closed, interval),
         })
 
     # Existing signal rows stay unchanged.
@@ -6142,6 +6158,7 @@ def build_trend_scan(symbol, grp=None):
             "css": css,
             "reference_only": False,
             "closed_time": closed.get("datetime", ""),
+            "closed_time_perth": format_closed_candle_perth(closed, interval),
         })
 
     signal_labels = ("12H", "8H", "4H", "1H")
