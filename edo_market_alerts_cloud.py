@@ -3195,9 +3195,15 @@ def sr_gap_structure_is_messy(candles, old_i, retest_index, zone_centre, ar, dir
     signal. Let the normal higher-timeframe scanners (8H -> Daily -> Weekly)
     look for the same structure in a cleaner form.
 
-    A clean separation should: 
+    A clean separation should:
       * establish a run of candles clearly away from the S/R zone, and
-      * avoid repeatedly revisiting/crossing the zone before the final retest.
+      * avoid choppy back-and-forth CLOSING through the zone.
+
+    IMPORTANT — repeated clean tests are allowed. The same meaningful S/R
+    level may be tested a 2nd, 3rd, 4th (or later) time. Earlier failed
+    confirmations do NOT invalidate the level. A later retest can signal if
+    its newest fully closed opposite-colour confirmation satisfies Edo's 50%
+    body rule and still leaves room to the nearest structural target.
     """
     if retest_index - old_i < 8 or ar <= 0:
         return True
@@ -3230,9 +3236,11 @@ def sr_gap_structure_is_messy(candles, old_i, retest_index, zone_centre, ar, dir
     if best_run < 3:
         return True
 
-    # After price has clearly departed, repeated returns into the same zone
-    # mean the lower timeframe is too noisy. Count separate revisit clusters,
-    # not every individual candle in one cluster.
+    # After price has clearly departed, repeated CLEAN returns to the same
+    # zone are valid in Edo's method (2nd / 3rd / 4th+ tests). We therefore
+    # track revisit clusters for diagnostics only; we do NOT reject a setup
+    # merely because the level has been touched several times. What makes the
+    # structure messy is repeated CLOSES flipping through the level.
     departed = False
     revisit_clusters = 0
     in_revisit = False
@@ -3274,10 +3282,12 @@ def sr_gap_structure_is_messy(candles, old_i, retest_index, zone_centre, ar, dir
         if side:
             previous_side = side
 
-    # One ordinary revisit before the final retest can happen. Multiple
-    # separate revisits or repeated side-flips are the messy structures Edo
-    # wants promoted to a higher timeframe instead of signalled here.
-    return revisit_clusters >= 2 or side_flips >= 3
+    # Do NOT reject simply because revisit_clusters is 2, 3, 4 or more.
+    # Those can be legitimate repeated tests of the same S/R level. Reject
+    # only genuine back-and-forth closes through the zone; that is congestion,
+    # not a clean retest. A rejected 8H structure is still free to qualify
+    # independently on Daily/Weekly.
+    return side_flips >= 3
 
 
 def detect_bounce_retest(candles, conf):
@@ -3295,6 +3305,9 @@ def detect_bounce_retest(candles, conf):
         slightly through, the original level.
       * The opposite-colour confirmation must also satisfy the separate 50%
         previous-candle BODY rule from sr_confirmation_at().
+      * The same S/R level may be tested repeatedly (2nd / 3rd / 4th+). A
+        failed earlier test does not retire the level; a later fully closed
+        confirmation may qualify when all Gap-Retest rules are satisfied.
       * Reject the setup if the confirmation candle itself has already shot
         to/near the previous structural target (old high for BUY, old low for
         SELL). There must still be useful room after confirmation.
