@@ -391,6 +391,10 @@ h2{font-size:18px}
 .alerttrend-bull{color:#35e28a}
 .alerttrend-bear{color:#ff5f73}
 .alerttrend-mixed{color:#f2c94c}
+.trailing-card{border:1px solid #ff9f1a;background:linear-gradient(135deg,#2b1a0d,#0d1b2a)}
+.trailing-btn{background:#f28c18!important;color:white!important}
+.trailing-row{border-left:4px solid #ff9f1a;padding-left:12px}
+.trailing-stop{color:#ffb347;font-weight:900}
 @media(max-width:700px){
     .alerttrend-grid{grid-template-columns:repeat(5,1fr);gap:3px}
     .alerttrend{padding:8px 6px}
@@ -675,6 +679,18 @@ No saved pairs yet. Enter a market above and press ⭐ SAVE PAIR.
 
 </div>
 
+
+<div class="card trailing-card">
+<h2>🟣 Candle-Close Trailing Stop</h2>
+<div class="small" style="margin-bottom:10px">Trade-management alert only. Wicks/spikes are ignored — only a fully closed candle can hit the trail.</div>
+<form method="post" action="/trailing/add">
+<div class="row"><input name="symbol" placeholder="EUR/USD" value="{{ selected_symbol }}" required>
+<select name="group"><option {% if selected_group=='FOREX' %}selected{% endif %}>FOREX</option><option {% if selected_group=='CRYPTO' %}selected{% endif %}>CRYPTO</option><option {% if selected_group=='CFD' %}selected{% endif %}>CFD</option></select>
+<select name="side"><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
+<select name="interval"><option value="1h">1H</option><option value="4h">4H</option><option value="8h">8H</option><option value="1day">Daily</option></select></div>
+<div class="row" style="margin-top:8px"><input name="distance_pips" type="number" min="0.1" step="0.1" placeholder="Trail distance (pips / points)" required><input name="note" type="text" placeholder="Note (optional)"><button class="trailing-btn">ARM TRAIL</button></div></form>
+{% if trailing_stops %}<div style="margin-top:14px">{% for t in trailing_stops %}<div class="market trailing-row"><div><span class="pill" style="background:#f28c1822;color:#ffb347">TRAIL</span> <b>{{t['symbol']}} • {{t['side']}} • {{ {'1h':'1H','4h':'4H','8h':'8H','1day':'Daily'}.get(t['interval'],t['interval']) }}</b><div class="small">Distance {{t['distance_pips']}} {{ 'pips' if t['grp']=='FOREX' else 'points' }} • Stop <span class="trailing-stop">{{t['stop_price']}}</span></div>{% if t['last_candle_time'] %}<div class="small">Last closed candle checked: {{t['last_candle_time']}}</div>{% endif %}{% if t['note'] %}<div class="small">📝 {{t['note']}}</div>{% endif %}</div><div style="text-align:right"><div class="status">{{'🛑 HIT' if t['triggered'] else '🟣 ARMED'}}</div><a href="/trailing/delete/{{t['id']}}"><button class="danger">Delete</button></a></div></div>{% endfor %}</div>{% endif %}
+</div>
 
 <div class="card">
 <h2>🚨 Active Alerts</h2>
@@ -1419,6 +1435,15 @@ def init_db():
             updated TEXT
         )
         ''')
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS trailing_stops(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, grp TEXT NOT NULL,
+            side TEXT NOT NULL, interval TEXT NOT NULL, distance_pips REAL NOT NULL,
+            stop_price REAL NOT NULL, last_candle_start TEXT DEFAULT '', last_candle_time TEXT DEFAULT '',
+            triggered INTEGER DEFAULT 0, created TEXT, note TEXT
+        )
+        ''')
+
         c.execute('''
         CREATE TABLE IF NOT EXISTS pattern_notifications(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6217,6 +6242,34 @@ def build_trend_scan(symbol, grp=None):
     }, None
 
 
+def trailing_stop_monitor():
+    """Ratchet only from fully closed candles; intrabar wicks/spikes never trigger."""
+    while True:
+        try:
+            if manual_api_priority_active(): time.sleep(20); continue
+            with db_conn() as c: rows=c.execute('SELECT * FROM trailing_stops WHERE triggered=0 ORDER BY id').fetchall()
+            for t in rows:
+                try:
+                    if str(t['grp']).upper()=='FOREX' and forex_weekend_closed(): continue
+                    candles,error=get_candles(t['symbol'],t['interval'],outputsize=8,grp=t['grp'])
+                    if error or not candles: continue
+                    candle=last_closed_candle(candles,t['interval'])
+                    if not candle: continue
+                    candle_start=str(candle.get('datetime',''))
+                    if candle_start==(t['last_candle_start'] or ''): continue
+                    close=float(candle['close']); old_stop=float(t['stop_price']); dist=trailing_distance_value(t['symbol'],t['grp'],t['distance_pips']); side=str(t['side']).upper()
+                    hit=(side=='BUY' and close<=old_stop) or (side=='SELL' and close>=old_stop); perth_time=format_closed_candle_perth(candle,t['interval'])
+                    if hit:
+                        with db_conn() as c: c.execute('UPDATE trailing_stops SET triggered=1,last_candle_start=?,last_candle_time=? WHERE id=?',(candle_start,perth_time,t['id'])); c.commit()
+                        send_push(f"🟣 {t['symbol']} TRAILING STOP HIT", f"{side} candle-close trail hit.\nClosed candle: {perth_time} Perth\nCandle close: {close}\nTrail level: {old_stop}\nWicks/spikes were ignored.\nNote: {t['note'] or '-'}")
+                    else:
+                        candidate=close-dist if side=='BUY' else close+dist; new_stop=max(old_stop,candidate) if side=='BUY' else min(old_stop,candidate)
+                        with db_conn() as c: c.execute('UPDATE trailing_stops SET stop_price=?,last_candle_start=?,last_candle_time=? WHERE id=?',(new_stop,candle_start,perth_time,t['id'])); c.commit()
+                except Exception as e: print('trailing stop monitor error',t['symbol'],e)
+                time.sleep(2)
+        except Exception as e: print('trailing stop monitor loop error',e)
+        time.sleep(60)
+
 def monitor():
 
     while True:
@@ -6406,6 +6459,7 @@ def home():
             favorites = c.execute(
                 'SELECT * FROM favorites ORDER BY grp,symbol'
             ).fetchall()
+            trailing_stops = c.execute('SELECT * FROM trailing_stops ORDER BY triggered,id DESC').fetchall()
 
             trend_rows = c.execute(
                 'SELECT symbol,status FROM trend_status'
@@ -6445,6 +6499,7 @@ def home():
         with _HOME_PAGE_CACHE_LOCK:
             markets = _HOME_PAGE_CACHE["markets"]
             favorites = _HOME_PAGE_CACHE["favorites"]
+            trailing_stops = []
             trend_statuses = dict(_HOME_PAGE_CACHE["trend_statuses"])
             trend_snapshots = dict(_HOME_PAGE_CACHE["trend_snapshots"])
 
@@ -6452,6 +6507,7 @@ def home():
         HTML,
         markets=markets,
         favorites=favorites,
+        trailing_stops=trailing_stops,
         colors=COLORS,
         selected_symbol=selected_symbol,
         selected_group=selected_group,
@@ -6495,6 +6551,32 @@ note
 
     return redirect('/')
 
+
+def trailing_distance_value(symbol, grp, distance_pips):
+    d = float(distance_pips)
+    if str(grp).upper() == "FOREX":
+        compact = str(symbol).upper().replace("/", "").replace(" ", "")
+        return d * (0.01 if compact.endswith("JPY") else 0.0001)
+    return d
+
+@APP.post('/trailing/add')
+def trailing_add():
+    symbol=request.form.get('symbol','').upper().strip(); grp=request.form.get('group','FOREX').upper().strip()
+    side=request.form.get('side','BUY').upper().strip(); interval=request.form.get('interval','1h').strip(); note=request.form.get('note','').strip()
+    try: distance_pips=float(request.form.get('distance_pips','0'))
+    except Exception: return redirect('/')
+    if not symbol or distance_pips<=0 or side not in {'BUY','SELL'} or interval not in {'1h','4h','8h','1day'}: return redirect('/')
+    price=latest_price(symbol,grp)
+    if price is None: return redirect('/')
+    dist=trailing_distance_value(symbol,grp,distance_pips); stop=price-dist if side=='BUY' else price+dist
+    with db_conn() as c:
+        c.execute("INSERT INTO trailing_stops(symbol,grp,side,interval,distance_pips,stop_price,created,note) VALUES(?,?,?,?,?,?,?,?)", (symbol,grp,side,interval,distance_pips,stop,datetime.now(timezone.utc).isoformat(),note)); c.commit()
+    return redirect('/')
+
+@APP.route('/trailing/delete/<int:i>')
+def trailing_delete(i):
+    with db_conn() as c: c.execute('DELETE FROM trailing_stops WHERE id=?',(i,)); c.commit()
+    return redirect('/')
 
 @APP.post('/favorite/add')
 def favorite_add():
@@ -6791,6 +6873,11 @@ init_db()
 # Keep trend/pattern processing state across restart so new valid signals are not missed.
 threading.Thread(
     target=monitor,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=trailing_stop_monitor,
     daemon=True
 ).start()
 
