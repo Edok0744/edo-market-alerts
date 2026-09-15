@@ -681,7 +681,7 @@ No saved pairs yet. Enter a market above and press ⭐ SAVE PAIR.
 
 
 <div class="card trailing-card">
-<h2>🟣 Candle-Close Trailing Stop</h2>
+<h2>🟠 Candle-Close Trailing Stop</h2>
 <div class="small" style="margin-bottom:10px">Trade-management alert only. Wicks/spikes are ignored — only a fully closed candle can hit the trail.</div>
 <form method="post" action="/trailing/add">
 <div class="row"><input name="symbol" placeholder="EUR/USD" value="{{ selected_symbol }}" required>
@@ -6261,7 +6261,7 @@ def trailing_stop_monitor():
                     hit=(side=='BUY' and close<=old_stop) or (side=='SELL' and close>=old_stop); perth_time=format_closed_candle_perth(candle,t['interval'])
                     if hit:
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET triggered=1,last_candle_start=?,last_candle_time=? WHERE id=?',(candle_start,perth_time,t['id'])); c.commit()
-                        send_push(f"🟣 {t['symbol']} TRAILING STOP HIT", f"{side} candle-close trail hit.\nClosed candle: {perth_time} Perth\nCandle close: {close}\nTrail level: {old_stop}\nWicks/spikes were ignored.\nNote: {t['note'] or '-'}")
+                        send_push(f"🟠 {t['symbol']} TRAILING STOP HIT", f"{side} candle-close trail hit.\nClosed candle: {perth_time} Perth\nCandle close: {close}\nTrail level: {old_stop}\nWicks/spikes were ignored.\nNote: {t['note'] or '-'}")
                     else:
                         candidate=close-dist if side=='BUY' else close+dist; new_stop=max(old_stop,candidate) if side=='BUY' else min(old_stop,candidate)
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET stop_price=?,last_candle_start=?,last_candle_time=? WHERE id=?',(new_stop,candle_start,perth_time,t['id'])); c.commit()
