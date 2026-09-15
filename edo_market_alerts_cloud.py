@@ -24,7 +24,7 @@ FOREX_FACTORY_CALENDAR_FALLBACK_URL = os.environ.get(
 )
 NEWS_REFRESH_SECONDS = int(os.environ.get('NEWS_REFRESH_SECONDS', '1800'))
 NEWS_WARNING_MINUTES = int(os.environ.get('NEWS_WARNING_MINUTES', '5'))
-NEWS_PUSH_SOUND = os.environ.get('NEWS_PUSH_SOUND', 'siren')
+NEWS_PUSH_SOUND = os.environ.get('NEWS_PUSH_SOUND', 'persistent')
 
 # Edo Major News filter: Forex Factory can label events High even when they
 # are not normally the kind of release Edo wants to stop new entries for.
@@ -1929,7 +1929,7 @@ def economic_news_warning_monitor():
     Check cached HIGH-impact Forex Factory events once per minute.
 
     Around 5 minutes before an event:
-      - send THREE Pushover siren warnings in a short burst
+      - send ONE Pushover warning using a longer persistent alarm sound
       - include affected saved pairs/markets
       - do not alter or cancel any Edo trading signal
 
@@ -1979,25 +1979,17 @@ def economic_news_warning_monitor():
                     f"⚠ Consider holding a new entry until the news has passed."
                 )
 
-                # Edo 5-minute news warning: THREE sirens in a row.
-                # Three separate Pushover notifications are sent about
-                # three seconds apart. Persistent event dedupe means this
-                # burst happens only once for each economic event.
-                delivered = False
+                # Edo 5-minute news warning: ONE Pushover per event.
+                # Use the longer persistent alarm sound instead of sending
+                # three separate notifications for the same event.
+                delivered = send_push(
+                    title,
+                    message,
+                    sound=NEWS_PUSH_SOUND
+                )
 
-                for siren_no in range(1, 4):
-                    ok = send_push(
-                        title,
-                        message,
-                        sound=NEWS_PUSH_SOUND
-                    )
-                    delivered = delivered or ok
-
-                    if siren_no < 3:
-                        time.sleep(3)
-
-                # If none of the three notifications could be delivered,
-                # release the reservation so a later monitor pass can retry.
+                # If the notification could not be delivered, release the
+                # reservation so a later monitor pass can retry.
                 if not delivered:
                     try:
                         with db_conn() as c:
