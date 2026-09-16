@@ -1155,10 +1155,9 @@ a{text-decoration:none}
         {% endif %}
 
         <div class="small" style="margin-top:12px">
-            Trend is calculated directly from candlestick colour: green candle = bullish, red candle = bearish
-            and short-term momentum. Monthly is shown for your own reference but is excluded
-            from the FULL BULLISH / FULL BEARISH signal. It is an analysis aid, not a guarantee
-            of future price movement.
+            Trend is calculated from fully closed candlesticks only. FULL BULLISH / FULL BEARISH
+            requires 12H, 8H, 4H and 1H to all agree. Weekly is shown for reference only and does
+            not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
         </div>
     {% endif %}
     </div>
