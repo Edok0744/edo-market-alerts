@@ -358,6 +358,19 @@ h2{font-size:18px}
 .price{font-variant-numeric:tabular-nums;font-weight:700}
 .status{font-size:12px;font-weight:800}
 .fulltrend{font-size:12px;font-weight:900;margin-top:4px}
+.saved-fulltrend{
+    display:inline-flex;
+    align-items:center;
+    gap:4px;
+    margin-left:5px;
+    padding:4px 7px;
+    border-radius:999px;
+    font-size:10px;
+    font-weight:900;
+    white-space:nowrap;
+}
+.saved-fulltrend.bull{background:#153d32;color:#45e0a8}
+.saved-fulltrend.bear{background:#4a2028;color:#ff7488}
 
 .alerttrend{
     margin-top:10px;
@@ -646,6 +659,12 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 </span>
 
 <b>{{f['symbol']}}</b>
+{% set saved_ts = trend_statuses.get(f['symbol'], '') %}
+{% if saved_ts == 'FULL BULLISH' %}
+<span class="saved-fulltrend bull">🟢 FULL BULLISH</span>
+{% elif saved_ts == 'FULL BEARISH' %}
+<span class="saved-fulltrend bear">🔴 FULL BEARISH</span>
+{% endif %}
 </div>
 
 <div class="saved-actions forex-actions">
@@ -5775,14 +5794,9 @@ def active_trend_monitor():
                     # does not erase the previously processed trend state.
                     previous = save_trend_status(symbol, status)
 
-                    if status in ("FULL BULLISH", "FULL BEARISH") and status != previous:
-                        icon = "🟢" if status == "FULL BULLISH" else "🔴"
-                        direction = "bullish" if status == "FULL BULLISH" else "bearish"
-                        send_push(
-                            f"{icon} {symbol} — {status}",
-                            f"All 4 last CLOSED signal candles are {direction}: 12H, 8H, 4H, 1H. "
-                            f"Weekly is display-only. CFD markets may use an ETF proxy for trend data."
-                        )
+                    # FULL TREND is now a dashboard indicator only.
+                    # Keep the persistent state fresh for Saved Pairs / Trend pages,
+                    # but do NOT send FULL BULLISH / FULL BEARISH Pushover alerts.
 
         except Exception as e:
             print("active trend monitor error", e)
