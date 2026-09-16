@@ -205,6 +205,7 @@ def ohlc_cache_seconds(interval):
         "1min": 20,
         "1h": 120,
         "2h": 180,
+        "3h": 210,
         "4h": 240,
         "8h": 300,
         "12h": 360,
@@ -744,7 +745,7 @@ Target {{m['direction']}} {{m['target']}}
 <div class="alerttrend">
     <div class="alerttrend-title">TREND • Weekly reference only</div>
     <div class="alerttrend-grid">
-        {% for tf in ['Weekly','12H','8H','4H','1H'] %}
+        {% for tf in ['Weekly','12H','8H','4H','3H'] %}
         {% set st = snap.get(tf, '') %}
         <div>
             <div class="alerttrend-tf">{{ 'W' if tf == 'Weekly' else tf }}</div>
@@ -1156,7 +1157,7 @@ a{text-decoration:none}
 
         <div class="small" style="margin-top:12px">
             Trend is calculated from fully closed candlesticks only. FULL BULLISH / FULL BEARISH
-            requires 12H, 8H, 4H and 1H to all agree. Weekly is shown for reference only and does
+            requires 12H, 8H, 4H and 3H to all agree. Weekly is shown for reference only and does
             not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
         </div>
     {% endif %}
@@ -1625,6 +1626,16 @@ def init_db():
         # Keep them identifiable so they are never silently reinterpreted as a price distance.
         try:
             c.execute("ALTER TABLE trailing_stops ADD COLUMN distance_mode TEXT DEFAULT 'PIPS'")
+        except sqlite3.OperationalError:
+            pass
+
+        # Full Trend migration: 3H replaces the old 1H trigger timeframe.
+        # Adding h3 is our one-time migration marker. Clear the old FULL status
+        # so a badge calculated under the previous 1H rule is never shown as
+        # if it were a 3H result after deployment.
+        try:
+            c.execute("ALTER TABLE trend_snapshot ADD COLUMN h3 TEXT")
+            c.execute("UPDATE trend_status SET status='', updated=NULL")
         except sqlite3.OperationalError:
             pass
         c.commit()
@@ -2828,6 +2839,7 @@ def interval_seconds(interval):
         "1min": 60,
         "1h": 60 * 60,
         "2h": 2 * 60 * 60,
+        "3h": 3 * 60 * 60,
         "4h": 4 * 60 * 60,
         "8h": 8 * 60 * 60,
         "12h": 12 * 60 * 60,
@@ -5608,14 +5620,14 @@ def save_trend_snapshot(symbol, states):
     with db_conn() as c:
         c.execute(
             """
-            INSERT INTO trend_snapshot(symbol,weekly,h12,h8,h4,h1,updated)
+            INSERT INTO trend_snapshot(symbol,weekly,h12,h8,h4,h3,updated)
             VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 weekly=excluded.weekly,
                 h12=excluded.h12,
                 h8=excluded.h8,
                 h4=excluded.h4,
-                h1=excluded.h1,
+                h3=excluded.h3,
                 updated=excluded.updated
             """,
             (
@@ -5624,7 +5636,7 @@ def save_trend_snapshot(symbol, states):
                 states.get("12H", ""),
                 states.get("8H", ""),
                 states.get("4H", ""),
-                states.get("1H", ""),
+                states.get("3H", ""),
                 datetime.utcnow().isoformat(),
             )
         )
@@ -5636,7 +5648,7 @@ def build_full_alignment(symbol, grp=None):
     Edo direct-candlestick alignment signal.
 
     TRIGGER timeframes:
-      12H + 8H + 4H + 1H
+      12H + 8H + 4H + 3H
 
     Weekly:
       display/reference only. It NEVER affects FULL BULLISH / FULL BEARISH.
@@ -5647,7 +5659,7 @@ def build_full_alignment(symbol, grp=None):
         "12H": "12h",
         "8H": "8h",
         "4H": "4h",
-        "1H": "1h",
+        "3H": "3h",
     }
 
     signal_states = {}
@@ -5681,7 +5693,7 @@ def build_full_alignment(symbol, grp=None):
         signal_states[label] = analyse_candle(closed)
 
     # Weekly is reference-only. If Weekly data fails, the real trigger
-    # still works from 12H + 8H + 4H + 1H.
+    # still works from 12H + 8H + 4H + 3H.
     weekly_state = ""
     weekly_candles, weekly_err = get_candles(symbol, "1week", outputsize=3, grp=grp)
     if not weekly_err:
@@ -5811,7 +5823,7 @@ TREND_INTERVALS = [
     ("1D", "1day"),
     ("8H", "8h"),
     ("4H", "4h"),
-    ("1H", "1h"),
+    ("3H", "3h"),
 ]
 
 
@@ -5970,6 +5982,56 @@ def twelve_symbol(symbol, grp=None):
     return s
 
 
+def _aggregate_1h_to_3h(candles_1h):
+    """Build synthetic 3H candles from 3 consecutive 1H candles.
+
+    The source feed's 1H phase is preserved. Only complete groups of three
+    consecutive hourly candles are emitted, so a forming 1H candle can never
+    make a synthetic 3H candle appear closed early.
+    """
+    from collections import Counter
+    from datetime import timedelta
+
+    parsed = []
+    for c in candles_1h or []:
+        dt = parse_candle_utc(c.get("datetime", ""))
+        if dt is not None:
+            parsed.append((dt, c))
+    if not parsed:
+        return []
+    parsed.sort(key=lambda item: item[0])
+
+    phase_counts = Counter(dt.hour % 3 for dt, _ in parsed)
+    phase = phase_counts.most_common(1)[0][0]
+    buckets = {}
+    for dt, c in parsed:
+        shifted = dt - timedelta(hours=phase)
+        bucket_hour = (shifted.hour // 3) * 3
+        bucket_shifted = shifted.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
+        bucket_start = bucket_shifted + timedelta(hours=phase)
+        buckets.setdefault(bucket_start, []).append((dt, c))
+
+    synthetic = []
+    for bucket_start in sorted(buckets):
+        group = sorted(buckets[bucket_start], key=lambda item: item[0])
+        if len(group) != 3:
+            continue
+        expected = [bucket_start + timedelta(hours=i) for i in range(3)]
+        actual = [dt for dt, _ in group]
+        if actual != expected:
+            continue
+        parts = [c for _, c in group]
+        synthetic.append({
+            "datetime": bucket_start.strftime("%Y-%m-%d %H:%M:%S"),
+            "open": parts[0]["open"],
+            "high": max(x["high"] for x in parts),
+            "low": min(x["low"] for x in parts),
+            "close": parts[-1]["close"],
+            "_parts": 3,
+        })
+    return synthetic
+
+
 def _aggregate_4h_to_12h(candles_4h):
     """
     Build synthetic 12H candles from 3 consecutive 4H candles.
@@ -6047,12 +6109,22 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
     Return OHLC candles oldest -> newest using the same protected shared cache
     as the setup scanner.
 
-    12H is synthetic because Twelve Data does not support a native 12h interval:
-    it is built from 3 x 4H candles.
+    3H is synthetic from 3 x 1H candles and 12H is synthetic from 3 x 4H
+    candles. This keeps both Full Trend timeframes on completed source candles.
 
     The newest API/synthetic candle may still be forming. Signal logic still uses
     last_closed_candle(), so live candles never trigger a signal.
     """
+    if interval == "3h":
+        source_size = max(60, outputsize * 3 + 9)
+        candles_1h, error = get_ohlc(symbol, "1h", outputsize=source_size, grp=grp)
+        if error:
+            return None, error
+        candles_3h = _aggregate_1h_to_3h(candles_1h)
+        if len(candles_3h) < 1:
+            return None, "Not enough 1H candle history to build completed 3H candles."
+        return candles_3h[-outputsize:], None
+
     if interval == "12h":
         # Fetch enough 4H candles to construct the requested 12H history.
         source_size = max(60, outputsize * 3 + 9)
@@ -6162,7 +6234,7 @@ def build_trend_scan(symbol, grp=None):
         ("12H", "12h"),
         ("8H", "8h"),
         ("4H", "4h"),
-        ("1H", "1h"),
+        ("3H", "3h"),
     ]
 
     states = {}
@@ -6218,8 +6290,8 @@ def build_trend_scan(symbol, grp=None):
             "closed_time_perth": format_closed_candle_perth(closed, interval),
         })
 
-    signal_labels = ("12H", "8H", "4H", "1H")
-    weights = {"12H": 4, "8H": 3, "4H": 2, "1H": 1}
+    signal_labels = ("12H", "8H", "4H", "3H")
+    weights = {"12H": 4, "8H": 3, "4H": 2, "3H": 1}
     score = 0
 
     for label in signal_labels:
@@ -6234,11 +6306,11 @@ def build_trend_scan(symbol, grp=None):
     if full_bull:
         summary = "FULL BULLISH"
         icon, css = "🟢", "bull"
-        detail = "Last CLOSED candles on 12H, 8H, 4H and 1H are all GREEN. Bullish possibility."
+        detail = "Last CLOSED candles on 12H, 8H, 4H and 3H are all GREEN. Bullish possibility."
     elif full_bear:
         summary = "FULL BEARISH"
         icon, css = "🔴", "bear"
-        detail = "Last CLOSED candles on 12H, 8H, 4H and 1H are all RED. Bearish possibility."
+        detail = "Last CLOSED candles on 12H, 8H, 4H and 3H are all RED. Bearish possibility."
     elif states["12H"] == "Bullish" and any(
         states[x] == "Bearish" for x in ("8H", "4H", "1H")
     ):
@@ -6254,15 +6326,15 @@ def build_trend_scan(symbol, grp=None):
     elif score >= 6:
         summary = "BULLISH"
         icon, css = "🟢", "bull"
-        detail = "12H, 8H, 4H and 1H lean bullish."
+        detail = "12H, 8H, 4H and 3H lean bullish."
     elif score <= -6:
         summary = "BEARISH"
         icon, css = "🔴", "bear"
-        detail = "12H, 8H, 4H and 1H lean bearish."
+        detail = "12H, 8H, 4H and 3H lean bearish."
     else:
         summary = "MIXED / WAIT"
         icon, css = "🟡", "mixed"
-        detail = "12H, 8H, 4H and 1H are not aligned strongly enough."
+        detail = "12H, 8H, 4H and 3H are not aligned strongly enough."
 
     return {
         "results": results,
@@ -6392,7 +6464,7 @@ def monitor():
                                 f"{a['symbol']} is {p}\n"
                                 f"Target: {a['direction']} {a['target']}\n"
                                 f"{trend_line}\n"
-                                f"12H + 8H + 4H + 1H use CLOSED candles only.\n"
+                                f"12H + 8H + 4H + 3H use CLOSED candles only.\n"
                                 f"Weekly is reference only.\n"
                                 f"Note: {a['note'] or '-'}"
                             )
@@ -6503,7 +6575,7 @@ def home():
             }
 
             snapshot_rows = c.execute(
-                'SELECT symbol,weekly,h12,h8,h4,h1,updated FROM trend_snapshot'
+                'SELECT symbol,weekly,h12,h8,h4,h3,updated FROM trend_snapshot'
             ).fetchall()
 
             trend_snapshots = {
@@ -6512,7 +6584,7 @@ def home():
                     '12H': r['h12'] or '',
                     '8H': r['h8'] or '',
                     '4H': r['h4'] or '',
-                    '1H': r['h1'] or '',
+                    '3H': r['h3'] or '',
                     'updated': r['updated'] or ''
                 }
                 for r in snapshot_rows
