@@ -4063,7 +4063,7 @@ def trend_pullback_near_structural_sr(candles, setup, interval):
     """
     Edo 8H / Daily / Weekly Trend Pullback context rule.
 
-    4H is handled separately by the strong higher-timeframe trend filter and
+    4H is handled separately by the higher-timeframe direction filter and
     does NOT require support/resistance proximity.
 
     For higher-timeframe Trend Pullbacks:
@@ -4607,53 +4607,47 @@ def weekly_spike_monitor():
 
 def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
     """
-    Edo strong-trend filter using CLOSED higher-timeframe candles only.
+    Edo 4H higher-timeframe trend rule, using fully CLOSED candles only.
 
-    4H continuation setup:
-      require 8H + 12H + 1D all aligned with the setup direction.
+    Priority:
+      1) Read the 8H price-structure trend first.
+      2) If 8H is mixed/unclear, use Daily as the backup trend.
 
-    8H continuation setup:
-      no higher-timeframe filter is used; this branch is retained only for
-      compatibility and is not called by the active 8H signal flow.
-
-    Daily normal Trend Pullback is allowed without a higher-timeframe filter.
-    Weekly normal Trend Pullback remains disabled.
-    No indicators are used; Bullish = close > open, Bearish = close < open.
+    Only ONE clear higher timeframe is required. 12H is deliberately not part
+    of this 4H pullback filter. No indicators are used.
     """
-    if interval == "4h":
-        checks = [("8H", "8h"), ("12H", "12h"), ("1D", "1day")]
-    elif interval == "8h":
-        checks = [("12H", "12h"), ("1D", "1day"), ("1W", "1week")]
-    else:
+    if interval != "4h":
         return None, {}, None
 
     states = {}
 
-    for label, tf_interval in checks:
-        if tf_interval == "12h":
-            candles, err = get_candles(symbol, "12h", outputsize=6, grp=grp)
-            if err:
-                return None, states, err
-            closed = last_closed_candle(candles, "12h")
-        else:
-            candles, err = get_ohlc(symbol, tf_interval, outputsize=60, grp=grp)
-            if err:
-                return None, states, err
-            closed_list = fully_closed_candles(candles, tf_interval)
-            closed = closed_list[-1] if closed_list else None
+    # 8H is the primary context for a 4H pullback.
+    candles_8h, err = get_ohlc(symbol, "8h", outputsize=80, grp=grp)
+    if err:
+        return None, states, err
+    closed_8h = fully_closed_candles(candles_8h, "8h")
+    if len(closed_8h) < 12:
+        return None, states, "Not enough completed 8H candle data."
+    trend_8h = local_structure_trend(closed_8h, len(closed_8h))
+    states["8H"] = trend_8h.capitalize()
+    if trend_8h in ("bullish", "bearish"):
+        states["Used"] = "8H"
+        return trend_8h, states, None
 
-        if closed is None:
-            return None, states, f"Not enough completed {label} candle data."
+    # If 8H is not structurally clear, step up to Daily.
+    candles_1d, err = get_ohlc(symbol, "1day", outputsize=80, grp=grp)
+    if err:
+        return None, states, err
+    closed_1d = fully_closed_candles(candles_1d, "1day")
+    if len(closed_1d) < 12:
+        return None, states, "Not enough completed Daily candle data."
+    trend_1d = local_structure_trend(closed_1d, len(closed_1d))
+    states["1D"] = trend_1d.capitalize()
+    if trend_1d in ("bullish", "bearish"):
+        states["Used"] = "1D"
+        return trend_1d, states, None
 
-        states[label] = analyse_candle(closed)
-
-    labels = [label for label, _ in checks]
-
-    if all(states[x] == "Bullish" for x in labels):
-        return "bullish", states, None
-    if all(states[x] == "Bearish" for x in labels):
-        return "bearish", states, None
-
+    states["Used"] = "None"
     return None, states, None
 
 
@@ -4661,9 +4655,8 @@ def apply_strong_trend_filter(symbol, grp, interval, setups):
     """
     4H Trend Pullback signals are continuation-only signals.
 
-    A bullish 4H setup is allowed only when all required CLOSED higher
-    timeframes are Bullish. A bearish 4H setup is allowed only when they
-    are all Bearish.
+    A 4H setup needs one clear higher-timeframe direction. 8H is checked
+    first; Daily is used only when 8H price structure is mixed/unclear.
 
     8H Trend Pullback is intentionally NOT filtered by higher-timeframe trend.
     Daily Trend Pullback is intentionally NOT filtered by higher-timeframe trend.
@@ -4965,7 +4958,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         found = []
 
     # Edo rule:
-    #   4H Trend Pullback -> strong higher-timeframe trend alignment; S/R not required.
+    #   4H Trend Pullback -> higher-timeframe direction (8H first, Daily fallback); S/R not required.
     #   8H / Daily / Weekly Trend Pullback -> no 4H-style higher-timeframe trend
     #   requirement, but the clean 2+ candle sequence must occur at/near
     #   meaningful support/resistance.
@@ -5036,10 +5029,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                 )
             elif interval == "4h" and higher_tf_states:
                 state_text = " | ".join(f"{k} {v}" for k, v in higher_tf_states.items())
-                rule_text = "8H + 12H + 1D"
                 summary = (
-                    f"No {interval.upper()} setup passed the strong higher-timeframe filter. "
-                    f"For this alert, {rule_text} must all agree with the setup direction. "
+                    f"No {interval.upper()} setup passed the higher-timeframe direction filter. "
+                    f"8H is used first; Daily is checked only when 8H is mixed/unclear. "
                     f"Current higher-timeframe state: {state_text}."
                 )
             else:
@@ -5359,9 +5351,11 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
         if interval == "4h" and p.get("higher_tf_filter"):
             htf = p.get("higher_tf_states", {})
+            used_tf = htf.get("Used", "")
+            used_state = htf.get(used_tf, "") if used_tf else ""
             trend_line = (
-                f"Strong higher-timeframe trend: "
-                f"8H {htf.get('8H','')} | 12H {htf.get('12H','')} | 1D {htf.get('1D','')}. "
+                f"Higher-timeframe trend used: {used_tf} {used_state}. "
+                f"(8H first; Daily only if 8H is unclear.) "
             )
         else:
             trend_line = ""
@@ -5482,7 +5476,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         setups = []
 
     # Edo rule:
-    #   4H Trend Pullback -> strong higher-timeframe trend alignment; S/R not required.
+    #   4H Trend Pullback -> higher-timeframe direction (8H first, Daily fallback); S/R not required.
     #   8H / Daily / Weekly Trend Pullback -> must be near meaningful S/R and do
     #   not use the 4H higher-timeframe alignment requirement.
     # The separate S/R Gap-Retest setup remains independent.
