@@ -980,8 +980,25 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
     let edoLastHiddenAt = 0;
     let edoReloading = false;
 
+    function edoUserIsEditing() {
+        const active = document.activeElement;
+        if (active && active.matches && active.matches('input, select, textarea')) return true;
+        const trailForm = document.querySelector('form[action="/trailing/add"]');
+        if (trailForm && trailForm.dataset.edoDirty === '1') return true;
+        return false;
+    }
+
+    const edoTrailForm = document.querySelector('form[action="/trailing/add"]');
+    if (edoTrailForm) {
+        edoTrailForm.addEventListener('input', function () { edoTrailForm.dataset.edoDirty = '1'; });
+        edoTrailForm.addEventListener('change', function () { edoTrailForm.dataset.edoDirty = '1'; });
+        edoTrailForm.addEventListener('submit', function () { edoTrailForm.dataset.edoDirty = '0'; });
+    }
+
     function edoFreshHome(force) {
         if (edoReloading || document.visibilityState !== 'visible') return;
+        // Never reload HOME while Edo is typing/selecting or has started a trailing-stop form.
+        if (edoUserIsEditing()) return;
         const ageMs = Date.now() - edoHomeLoadedAt;
         if (!force && ageMs < 30000) return;
         edoReloading = true;
