@@ -4066,13 +4066,14 @@ def trend_pullback_near_structural_sr(candles, setup, interval):
     4H is handled separately by the higher-timeframe direction filter and
     does NOT require support/resistance proximity.
 
-    For higher-timeframe Trend Pullbacks:
-      * bullish confirmation must occur at/near meaningful SUPPORT;
-      * bearish confirmation must occur at/near meaningful RESISTANCE.
+    For higher-timeframe Trend Pullbacks, context may come from EITHER:
+      * meaningful horizontal structural S/R, OR
+      * an established sloping trend-line built from at least two prior
+        meaningful swing touches.
 
-    The S/R area comes from prior structural swing wicks. The pullback can
-    touch the area with the pullback candles or the confirmation candle.
-    No 50% rule is introduced here.
+    Bullish confirmation must be at/near support; bearish confirmation must
+    be at/near resistance. No 50% body rule is introduced here, and only
+    fully closed candles supplied to this detector can qualify.
     """
     if not candles or not setup:
         return False, None, None
@@ -4090,7 +4091,7 @@ def trend_pullback_near_structural_sr(candles, setup, interval):
     if ar <= 0:
         return False, None, None
 
-    # Treat support/resistance as an AREA, not one exact price.
+    # S/R is an area rather than one exact price.
     zone_tolerance = max(
         ar * 0.85,
         abs(float(candles[i]["close"])) * 0.0015
@@ -4107,38 +4108,92 @@ def trend_pullback_near_structural_sr(candles, setup, interval):
         touch_price = min(float(c["low"]) for c in reaction_slice)
         swings = swing_points(history, "low", left=2, right=2)
         sr_kind = "support"
+        wanted_slope = "up"
     elif direction == "bearish":
         touch_price = max(float(c["high"]) for c in reaction_slice)
         swings = swing_points(history, "high", left=2, right=2)
         sr_kind = "resistance"
+        wanted_slope = "down"
     else:
         return False, None, None
 
+    # 1) Existing horizontal structural S/R test.
     candidates = []
+    full_swings = []
     for local_i, level in swings:
         full_i = search_start + local_i
+        full_swings.append((full_i, float(level)))
         separation = run_start - full_i
         if separation < 3:
             continue
-
         distance = abs(float(level) - touch_price)
         if distance <= zone_tolerance:
-            # Prefer the closest meaningful level, then the more recent swing.
             candidates.append((distance, -full_i, float(level)))
 
-    if not candidates:
+    if candidates:
+        candidates.sort()
+        distance, _, level = candidates[0]
+        setup["sr_context_ok"] = True
+        setup["sr_kind"] = sr_kind
+        setup["sr_level"] = level
+        setup["sr_distance"] = distance
+        setup["sr_zone_tolerance"] = zone_tolerance
+        setup["sr_context_type"] = "horizontal"
+        return True, sr_kind, level
+
+    # 2) Trend-line S/R test. Use two meaningful PRIOR swing touches only.
+    #    The current pullback is a later test; it is never used to invent
+    #    the line. Resistance lines must slope down and support lines up.
+    trend_candidates = []
+    pts = full_swings[-14:]  # recent meaningful swings; avoids ancient lines
+    for a in range(len(pts) - 1):
+        x1, y1 = pts[a]
+        for b in range(a + 1, len(pts)):
+            x2, y2 = pts[b]
+            if x2 - x1 < 3:
+                continue
+            slope = (y2 - y1) / float(x2 - x1)
+            if wanted_slope == "down" and slope >= 0:
+                continue
+            if wanted_slope == "up" and slope <= 0:
+                continue
+
+            # Project the established line into the current pullback area.
+            # Accept a touch by any pullback/confirmation wick within the
+            # same adaptive S/R tolerance used for horizontal structure.
+            best_dist = None
+            best_level = None
+            best_x = None
+            for x in range(run_start, i + 1):
+                projected = y1 + slope * (x - x1)
+                wick = float(candles[x]["low"] if direction == "bullish" else candles[x]["high"])
+                dist = abs(wick - projected)
+                if best_dist is None or dist < best_dist:
+                    best_dist, best_level, best_x = dist, projected, x
+
+            if best_dist is not None and best_dist <= zone_tolerance:
+                # Prefer the closest line touch, then the more recently
+                # established second anchor.
+                trend_candidates.append((best_dist, -x2, best_level, x1, y1, x2, y2, slope, best_x))
+
+    if not trend_candidates:
         return False, None, None
 
-    candidates.sort()
-    distance, _, level = candidates[0]
+    trend_candidates.sort(key=lambda row: (row[0], row[1]))
+    distance, _, level, x1, y1, x2, y2, slope, touch_i = trend_candidates[0]
 
     setup["sr_context_ok"] = True
     setup["sr_kind"] = sr_kind
-    setup["sr_level"] = level
-    setup["sr_distance"] = distance
+    setup["sr_level"] = float(level)
+    setup["sr_distance"] = float(distance)
     setup["sr_zone_tolerance"] = zone_tolerance
+    setup["sr_context_type"] = "trendline"
+    setup["trendline_anchor_1"] = {"index": x1, "price": y1}
+    setup["trendline_anchor_2"] = {"index": x2, "price": y2}
+    setup["trendline_slope_per_candle"] = slope
+    setup["trendline_touch_index"] = touch_i
 
-    return True, sr_kind, level
+    return True, sr_kind, float(level)
 
 
 def sr_second_reaction_exception(candles, setup):
