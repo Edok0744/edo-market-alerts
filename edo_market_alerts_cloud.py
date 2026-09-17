@@ -4165,7 +4165,40 @@ def trend_pullback_near_structural_sr(candles, setup, interval):
     else:
         return False, None, None
 
-    # 1) Existing horizontal structural S/R test.
+    # 1) Fresh structural extreme test.
+    # Edo rule: on 8H / Daily / Weekly a clean 2+ pullback may also finish at
+    # a NEW meaningful swing extreme.  This matters when price has trended
+    # into fresh support/resistance, so there may be no older horizontal level
+    # at exactly the same price yet (for example 5 red Weekly candles into a
+    # fresh low followed by a fully closed bullish confirmation).
+    #
+    # Use only PRIOR candles to define the extreme; the current pullback cannot
+    # manufacture the comparison level.  The normal 2+ adjacency/clean-run and
+    # fully-closed confirmation rules have already passed before this helper.
+    prior_window = candles[max(0, run_start - 30):run_start]
+    if len(prior_window) >= 8:
+        if direction == "bullish":
+            prior_extreme = min(float(c["low"]) for c in prior_window)
+            if touch_price <= prior_extreme + zone_tolerance:
+                setup["sr_context_ok"] = True
+                setup["sr_kind"] = sr_kind
+                setup["sr_level"] = float(touch_price)
+                setup["sr_distance"] = max(0.0, touch_price - prior_extreme)
+                setup["sr_zone_tolerance"] = zone_tolerance
+                setup["sr_context_type"] = "fresh_structural_extreme"
+                return True, sr_kind, float(touch_price)
+        else:
+            prior_extreme = max(float(c["high"]) for c in prior_window)
+            if touch_price >= prior_extreme - zone_tolerance:
+                setup["sr_context_ok"] = True
+                setup["sr_kind"] = sr_kind
+                setup["sr_level"] = float(touch_price)
+                setup["sr_distance"] = max(0.0, prior_extreme - touch_price)
+                setup["sr_zone_tolerance"] = zone_tolerance
+                setup["sr_context_type"] = "fresh_structural_extreme"
+                return True, sr_kind, float(touch_price)
+
+    # 2) Existing horizontal structural S/R test.
     candidates = []
     full_swings = []
     for local_i, level in swings:
@@ -4189,7 +4222,7 @@ def trend_pullback_near_structural_sr(candles, setup, interval):
         setup["sr_context_type"] = "horizontal"
         return True, sr_kind, level
 
-    # 2) Trend-line S/R test. Use two meaningful PRIOR swing touches only.
+    # 3) Trend-line S/R test. Use two meaningful PRIOR swing touches only.
     #    The current pullback is a later test; it is never used to invent
     #    the line. Resistance lines must slope down and support lines up.
     trend_candidates = []
