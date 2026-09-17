@@ -6873,10 +6873,31 @@ def trailing_add():
     if side=='SELL' and stop<=arm_price: return redirect('/?trail_error=sell_stop')
     distance_price=abs(float(arm_price)-stop)
     if distance_price<=0: return redirect('/')
+
+    # Baseline the newest candle that was ALREADY fully closed when Edo arms the trail.
+    # That candle belongs to the past and must never move/hit a newly-created trail.
+    # The monitor will therefore act only after a DIFFERENT candle closes later.
+    baseline_start=''
+    baseline_time=''
+    try:
+        arm_candles, arm_error = get_candles(symbol, interval, outputsize=8, grp=grp)
+        if not arm_error and arm_candles:
+            baseline = last_closed_candle(arm_candles, interval)
+            if baseline:
+                baseline_start = str(baseline.get('datetime',''))
+                baseline_time = format_closed_candle_close_perth(baseline, interval)
+    except Exception as e:
+        print('trailing arm baseline error', symbol, e)
+
+    # Do not arm without a closed-candle baseline: otherwise the monitor could process
+    # the previous candle as though it closed after the trail was created.
+    if not baseline_start:
+        return redirect('/?trail_error=baseline')
+
     with db_conn() as c:
         # distance_pips is retained as the DB column name for backwards-compatible schema;
         # ARM_PRICE records store the permanent raw PRICE distance here. entry_price stores arm quote.
-        c.execute("INSERT INTO trailing_stops(symbol,grp,side,interval,distance_pips,stop_price,created,note,distance_mode,entry_price) VALUES(?,?,?,?,?,?,?,?,?,?)", (symbol,grp,side,interval,distance_price,stop,datetime.now(timezone.utc).isoformat(),note,'ARM_PRICE',float(arm_price))); c.commit()
+        c.execute("INSERT INTO trailing_stops(symbol,grp,side,interval,distance_pips,stop_price,last_candle_start,last_candle_time,created,note,distance_mode,entry_price) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (symbol,grp,side,interval,distance_price,stop,baseline_start,baseline_time,datetime.now(timezone.utc).isoformat(),note,'ARM_PRICE',float(arm_price))); c.commit()
     return redirect('/')
 
 @APP.route('/trailing/delete/<int:i>')
