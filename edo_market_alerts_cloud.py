@@ -704,13 +704,15 @@ No saved pairs yet. Enter a market above and press ⭐ SAVE PAIR.
 <div class="card trailing-card">
 <h2>🟠 Candle-Close Trailing Stop</h2>
 <div class="small" style="margin-bottom:10px">Trade-management alert only. Wicks/spikes are ignored — only a fully closed candle can hit the trail.</div>
-<form method="post" action="/trailing/add">
-<div class="row"><input name="symbol" placeholder="EUR/USD" value="{{ selected_symbol }}" required>
-<select name="group"><option {% if selected_group=='FOREX' %}selected{% endif %}>FOREX</option><option {% if selected_group=='CRYPTO' %}selected{% endif %}>CRYPTO</option><option {% if selected_group=='CFD' %}selected{% endif %}>CFD</option></select>
+<form id="trail_form" method="post" action="/trailing/add">
+<div class="row"><input id="trail_symbol" name="symbol" placeholder="EUR/USD" value="{{ selected_symbol }}" required>
+<select id="trail_group" name="group"><option {% if selected_group=='FOREX' %}selected{% endif %}>FOREX</option><option {% if selected_group=='CRYPTO' %}selected{% endif %}>CRYPTO</option><option {% if selected_group=='CFD' %}selected{% endif %}>CFD</option></select>
 <select name="side"><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
 <select name="interval"><option value="1h">1H</option><option value="4h">4H</option><option value="8h">8H</option><option value="1day">Daily</option></select></div>
-<div class="row" style="margin-top:8px"><input name="entry_price" type="number" min="0" step="any" placeholder="Trade ENTRY price" required><input name="stop_price" type="number" min="0" step="any" placeholder="Starting trailing stop PRICE" required><input name="note" type="text" placeholder="Note (optional)"><button class="trailing-btn">ARM TRAIL</button></div></form>
-{% if trailing_stops %}<div style="margin-top:14px">{% for t in trailing_stops %}<div class="market trailing-row"><div><span class="pill" style="background:#f28c1822;color:#ffb347">TRAIL</span> <b>{{t['symbol']}} • {{t['side']}} • {{ {'1h':'1H','4h':'4H','8h':'8H','1day':'Daily'}.get(t['interval'],t['interval']) }}</b><div class="small">{{ ('Entry %.5f • Price distance %.5f'|format(t['entry_price'],t['distance_pips'])) if t['distance_mode']=='ENTRY_PRICE' and t['entry_price'] else ('OLD TRAIL — delete and recreate') }} • Stop <span class="trailing-stop">{{t['stop_price']}}</span></div>{% if t['last_candle_time'] %}<div class="small">Last fully closed candle: {{t['last_candle_time']}} Perth</div>{% endif %}{% if t['note'] %}<div class="small">📝 {{t['note']}}</div>{% endif %}</div><div style="text-align:right"><div class="status">{% if t['triggered'] %}🛑 HIT{% else %}<span class="trail-armed-dot"></span> ARMED{% endif %}</div><a href="/trailing/delete/{{t['id']}}"><button class="danger">Delete</button></a></div></div>{% endfor %}</div>{% endif %}
+<div id="trail_live_price" class="small" style="margin-top:8px;color:#ffb347;font-weight:800">Live price: waiting for pair…</div>
+<div class="row" style="margin-top:8px"><input name="stop_price" type="number" min="0" step="any" placeholder="Starting trailing stop PRICE" required><input name="note" type="text" placeholder="Note (optional)"><button class="trailing-btn">ARM TRAIL</button></div>
+<div class="small" style="margin-top:6px">When you press ARM TRAIL, EdoSignal takes a fresh market price and locks the price-distance to your starting stop.</div></form>
+{% if trailing_stops %}<div style="margin-top:14px">{% for t in trailing_stops %}<div class="market trailing-row"><div><span class="pill" style="background:#f28c1822;color:#ffb347">TRAIL</span> <b>{{t['symbol']}} • {{t['side']}} • {{ {'1h':'1H','4h':'4H','8h':'8H','1day':'Daily'}.get(t['interval'],t['interval']) }}</b><div class="small">{{ ('Arm price %.5f • Price distance %.5f'|format(t['entry_price'],t['distance_pips'])) if t['distance_mode'] in ['ENTRY_PRICE','ARM_PRICE'] and t['entry_price'] else ('OLD TRAIL — delete and recreate') }} • Stop <span class="trailing-stop">{{t['stop_price']}}</span></div>{% if t['last_candle_time'] %}<div class="small">Last fully closed candle: {{t['last_candle_time']}} Perth</div>{% endif %}{% if t['note'] %}<div class="small">📝 {{t['note']}}</div>{% endif %}</div><div style="text-align:right"><div class="status">{% if t['triggered'] %}🛑 HIT{% else %}<span class="trail-armed-dot"></span> ARMED{% endif %}</div><a href="/trailing/delete/{{t['id']}}"><button class="danger">Delete</button></a></div></div>{% endfor %}</div>{% endif %}
 </div>
 
 <div class="card">
@@ -1075,6 +1077,45 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
             }
         });
     }
+})();
+</script>
+<script>
+// Keep the pair selected by Saved Pairs -> USE synchronized into both forms.
+(function(){
+  function syncUsePair(){
+    const mainSymbol=document.getElementById('symbol');
+    const mainGroup=document.getElementById('group');
+    const trailSymbol=document.getElementById('trail_symbol');
+    const trailGroup=document.getElementById('trail_group');
+    if(mainSymbol && trailSymbol && mainSymbol.value){ trailSymbol.value=mainSymbol.value; }
+    if(mainGroup && trailGroup && mainGroup.value){ trailGroup.value=mainGroup.value; }
+  }
+  async function refreshTrailLivePrice(){
+    const form=document.getElementById('trail_form');
+    const symbol=document.getElementById('trail_symbol');
+    const group=document.getElementById('trail_group');
+    const out=document.getElementById('trail_live_price');
+    if(!form || !symbol || !group || !out || !symbol.value.trim() || document.hidden) return;
+    const r=form.getBoundingClientRect();
+    if(r.bottom < 0 || r.top > window.innerHeight) return; // only spend API credit while trail card is on screen
+    out.textContent='Live price: updating…';
+    try{
+      const res=await fetch('/trailing/live-price?symbol='+encodeURIComponent(symbol.value.trim())+'&group='+encodeURIComponent(group.value), {cache:'no-store'});
+      const j=await res.json();
+      if(j.ok){ out.textContent='Live price: '+Number(j.price).toFixed(5)+' • refreshes every 15 sec while this card is open'; }
+      else { out.textContent='Live price: temporarily unavailable'; }
+    }catch(e){ out.textContent='Live price: temporarily unavailable'; }
+  }
+  function initTrailPrice(){
+    syncUsePair();
+    refreshTrailLivePrice();
+    const symbol=document.getElementById('trail_symbol');
+    const group=document.getElementById('trail_group');
+    if(symbol) symbol.addEventListener('change',refreshTrailLivePrice);
+    if(group) group.addEventListener('change',refreshTrailLivePrice);
+    setInterval(refreshTrailLivePrice,15000);
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initTrailPrice); else initTrailPrice();
 })();
 </script>
 </body>
@@ -2674,7 +2715,7 @@ def send_push(title, msg, sound='cashregister'):
         return False
 
 
-def latest_price(symbol, grp=None):
+def latest_price(symbol, grp=None, force_refresh=False):
     if not TWELVE_KEY:
         return None
 
@@ -2683,7 +2724,7 @@ def latest_price(symbol, grp=None):
 
     with _CACHE_LOCK:
         cached = _PRICE_CACHE.get(cache_key)
-        if cached and now - cached["saved_at"] < 30:
+        if (not force_refresh) and cached and now - cached["saved_at"] < 30:
             return cached["price"]
 
     try:
@@ -6491,7 +6532,7 @@ def trailing_stop_monitor():
                     if not candle: continue
                     candle_start=str(candle.get('datetime',''))
                     if candle_start==(t['last_candle_start'] or ''): continue
-                    close=float(candle['close']); old_stop=float(t['stop_price']); dist=(float(t['distance_pips']) if (t['distance_mode'] or '')=='ENTRY_PRICE' else trailing_legacy_distance_value(t['symbol'],t['grp'],t['distance_pips'])); side=str(t['side']).upper()
+                    close=float(candle['close']); old_stop=float(t['stop_price']); dist=(float(t['distance_pips']) if (t['distance_mode'] or '') in {'ENTRY_PRICE','ARM_PRICE'} else trailing_legacy_distance_value(t['symbol'],t['grp'],t['distance_pips'])); side=str(t['side']).upper()
                     hit=(side=='BUY' and close<=old_stop) or (side=='SELL' and close>=old_stop); perth_time=format_closed_candle_close_perth(candle,t['interval'])
                     if hit:
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET triggered=1,last_candle_start=?,last_candle_time=? WHERE id=?',(candle_start,perth_time,t['id'])); c.commit()
@@ -6806,24 +6847,36 @@ def trailing_legacy_distance_value(symbol, grp, distance_pips):
     return d
 
 
+@APP.get('/trailing/live-price')
+def trailing_live_price():
+    symbol=request.args.get('symbol','').upper().strip(); grp=request.args.get('group','FOREX').upper().strip()
+    if not symbol or grp not in {'FOREX','CRYPTO','CFD'}:
+        return jsonify(ok=False, error='Select a valid pair'), 400
+    price=latest_price(symbol, grp, force_refresh=True)
+    if price is None:
+        return jsonify(ok=False, error='Live price temporarily unavailable'), 503
+    return jsonify(ok=True, symbol=symbol, group=grp, price=price)
+
+
 @APP.post('/trailing/add')
 def trailing_add():
     symbol=request.form.get('symbol','').upper().strip(); grp=request.form.get('group','FOREX').upper().strip()
     side=request.form.get('side','BUY').upper().strip(); interval=request.form.get('interval','1h').strip(); note=request.form.get('note','').strip()
     try:
-        entry=float(request.form.get('entry_price','0'))
         stop=float(request.form.get('stop_price','0'))
     except Exception: return redirect('/')
-    if not symbol or entry<=0 or stop<=0 or side not in {'BUY','SELL'} or interval not in {'1h','4h','8h','1day'}: return redirect('/')
-    # Lock the trail distance to Edo's actual trade entry price, not to a later live quote.
-    if side=='BUY' and stop>=entry: return redirect('/')
-    if side=='SELL' and stop<=entry: return redirect('/')
-    distance_price=abs(entry-stop)
+    if not symbol or stop<=0 or side not in {'BUY','SELL'} or interval not in {'1h','4h','8h','1day'}: return redirect('/')
+    # Take a fresh quote at the exact ARM action and permanently lock that raw price distance.
+    arm_price=latest_price(symbol, grp, force_refresh=True)
+    if arm_price is None or arm_price<=0: return redirect('/?trail_error=price')
+    if side=='BUY' and stop>=arm_price: return redirect('/?trail_error=buy_stop')
+    if side=='SELL' and stop<=arm_price: return redirect('/?trail_error=sell_stop')
+    distance_price=abs(float(arm_price)-stop)
     if distance_price<=0: return redirect('/')
     with db_conn() as c:
-        # distance_pips is retained as the DB column name for backwards-compatible schema,
-        # but ENTRY_PRICE records store the permanent raw PRICE distance here.
-        c.execute("INSERT INTO trailing_stops(symbol,grp,side,interval,distance_pips,stop_price,created,note,distance_mode,entry_price) VALUES(?,?,?,?,?,?,?,?,?,?)", (symbol,grp,side,interval,distance_price,stop,datetime.now(timezone.utc).isoformat(),note,'ENTRY_PRICE',entry)); c.commit()
+        # distance_pips is retained as the DB column name for backwards-compatible schema;
+        # ARM_PRICE records store the permanent raw PRICE distance here. entry_price stores arm quote.
+        c.execute("INSERT INTO trailing_stops(symbol,grp,side,interval,distance_pips,stop_price,created,note,distance_mode,entry_price) VALUES(?,?,?,?,?,?,?,?,?,?)", (symbol,grp,side,interval,distance_price,stop,datetime.now(timezone.utc).isoformat(),note,'ARM_PRICE',float(arm_price))); c.commit()
     return redirect('/')
 
 @APP.route('/trailing/delete/<int:i>')
