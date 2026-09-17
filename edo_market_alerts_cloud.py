@@ -709,8 +709,8 @@ No saved pairs yet. Enter a market above and press ⭐ SAVE PAIR.
 <select name="group"><option {% if selected_group=='FOREX' %}selected{% endif %}>FOREX</option><option {% if selected_group=='CRYPTO' %}selected{% endif %}>CRYPTO</option><option {% if selected_group=='CFD' %}selected{% endif %}>CFD</option></select>
 <select name="side"><option value="BUY">BUY</option><option value="SELL">SELL</option></select>
 <select name="interval"><option value="1h">1H</option><option value="4h">4H</option><option value="8h">8H</option><option value="1day">Daily</option></select></div>
-<div class="row" style="margin-top:8px"><input name="stop_price" type="number" min="0" step="any" placeholder="Starting trailing stop PRICE" required><input name="note" type="text" placeholder="Note (optional)"><button class="trailing-btn">ARM TRAIL</button></div></form>
-{% if trailing_stops %}<div style="margin-top:14px">{% for t in trailing_stops %}<div class="market trailing-row"><div><span class="pill" style="background:#f28c1822;color:#ffb347">TRAIL</span> <b>{{t['symbol']}} • {{t['side']}} • {{ {'1h':'1H','4h':'4H','8h':'8H','1day':'Daily'}.get(t['interval'],t['interval']) }}</b><div class="small">{{ ('Price distance %.5f'|format(t['distance_pips'])) if t['distance_mode']=='PRICE' else 'OLD PIP TRAIL — delete and recreate' }} • Stop <span class="trailing-stop">{{t['stop_price']}}</span></div>{% if t['last_candle_time'] %}<div class="small">Last fully closed candle: {{t['last_candle_time']}} Perth</div>{% endif %}{% if t['note'] %}<div class="small">📝 {{t['note']}}</div>{% endif %}</div><div style="text-align:right"><div class="status">{% if t['triggered'] %}🛑 HIT{% else %}<span class="trail-armed-dot"></span> ARMED{% endif %}</div><a href="/trailing/delete/{{t['id']}}"><button class="danger">Delete</button></a></div></div>{% endfor %}</div>{% endif %}
+<div class="row" style="margin-top:8px"><input name="entry_price" type="number" min="0" step="any" placeholder="Trade ENTRY price" required><input name="stop_price" type="number" min="0" step="any" placeholder="Starting trailing stop PRICE" required><input name="note" type="text" placeholder="Note (optional)"><button class="trailing-btn">ARM TRAIL</button></div></form>
+{% if trailing_stops %}<div style="margin-top:14px">{% for t in trailing_stops %}<div class="market trailing-row"><div><span class="pill" style="background:#f28c1822;color:#ffb347">TRAIL</span> <b>{{t['symbol']}} • {{t['side']}} • {{ {'1h':'1H','4h':'4H','8h':'8H','1day':'Daily'}.get(t['interval'],t['interval']) }}</b><div class="small">{{ ('Entry %.5f • Price distance %.5f'|format(t['entry_price'],t['distance_pips'])) if t['distance_mode']=='ENTRY_PRICE' and t['entry_price'] else ('OLD TRAIL — delete and recreate') }} • Stop <span class="trailing-stop">{{t['stop_price']}}</span></div>{% if t['last_candle_time'] %}<div class="small">Last fully closed candle: {{t['last_candle_time']}} Perth</div>{% endif %}{% if t['note'] %}<div class="small">📝 {{t['note']}}</div>{% endif %}</div><div style="text-align:right"><div class="status">{% if t['triggered'] %}🛑 HIT{% else %}<span class="trail-armed-dot"></span> ARMED{% endif %}</div><a href="/trailing/delete/{{t['id']}}"><button class="danger">Delete</button></a></div></div>{% endfor %}</div>{% endif %}
 </div>
 
 <div class="card">
@@ -1477,7 +1477,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, grp TEXT NOT NULL,
             side TEXT NOT NULL, interval TEXT NOT NULL, distance_pips REAL NOT NULL,
             stop_price REAL NOT NULL, last_candle_start TEXT DEFAULT '', last_candle_time TEXT DEFAULT '',
-            triggered INTEGER DEFAULT 0, created TEXT, note TEXT, distance_mode TEXT DEFAULT 'PRICE'
+            triggered INTEGER DEFAULT 0, created TEXT, note TEXT, distance_mode TEXT DEFAULT 'PRICE', entry_price REAL
         )
         ''')
 
@@ -1643,6 +1643,13 @@ def init_db():
         # Keep them identifiable so they are never silently reinterpreted as a price distance.
         try:
             c.execute("ALTER TABLE trailing_stops ADD COLUMN distance_mode TEXT DEFAULT 'PIPS'")
+        except sqlite3.OperationalError:
+            pass
+
+        # Entry-price trailing-stop migration. New trails use the user's actual trade entry
+        # price to lock the permanent raw price distance to the starting stop.
+        try:
+            c.execute("ALTER TABLE trailing_stops ADD COLUMN entry_price REAL")
         except sqlite3.OperationalError:
             pass
 
@@ -6484,7 +6491,7 @@ def trailing_stop_monitor():
                     if not candle: continue
                     candle_start=str(candle.get('datetime',''))
                     if candle_start==(t['last_candle_start'] or ''): continue
-                    close=float(candle['close']); old_stop=float(t['stop_price']); dist=(float(t['distance_pips']) if (t['distance_mode'] or 'PIPS')=='PRICE' else trailing_legacy_distance_value(t['symbol'],t['grp'],t['distance_pips'])); side=str(t['side']).upper()
+                    close=float(candle['close']); old_stop=float(t['stop_price']); dist=(float(t['distance_pips']) if (t['distance_mode'] or '')=='ENTRY_PRICE' else trailing_legacy_distance_value(t['symbol'],t['grp'],t['distance_pips'])); side=str(t['side']).upper()
                     hit=(side=='BUY' and close<=old_stop) or (side=='SELL' and close>=old_stop); perth_time=format_closed_candle_close_perth(candle,t['interval'])
                     if hit:
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET triggered=1,last_candle_start=?,last_candle_time=? WHERE id=?',(candle_start,perth_time,t['id'])); c.commit()
@@ -6803,20 +6810,20 @@ def trailing_legacy_distance_value(symbol, grp, distance_pips):
 def trailing_add():
     symbol=request.form.get('symbol','').upper().strip(); grp=request.form.get('group','FOREX').upper().strip()
     side=request.form.get('side','BUY').upper().strip(); interval=request.form.get('interval','1h').strip(); note=request.form.get('note','').strip()
-    try: stop=float(request.form.get('stop_price','0'))
+    try:
+        entry=float(request.form.get('entry_price','0'))
+        stop=float(request.form.get('stop_price','0'))
     except Exception: return redirect('/')
-    if not symbol or stop<=0 or side not in {'BUY','SELL'} or interval not in {'1h','4h','8h','1day'}: return redirect('/')
-    price=latest_price(symbol,grp)
-    if price is None: return redirect('/')
-    # User enters the actual starting stop PRICE. Keep that raw price distance while trailing.
-    if side=='BUY' and stop>=price: return redirect('/')
-    if side=='SELL' and stop<=price: return redirect('/')
-    distance_price=abs(float(price)-stop)
+    if not symbol or entry<=0 or stop<=0 or side not in {'BUY','SELL'} or interval not in {'1h','4h','8h','1day'}: return redirect('/')
+    # Lock the trail distance to Edo's actual trade entry price, not to a later live quote.
+    if side=='BUY' and stop>=entry: return redirect('/')
+    if side=='SELL' and stop<=entry: return redirect('/')
+    distance_price=abs(entry-stop)
     if distance_price<=0: return redirect('/')
     with db_conn() as c:
         # distance_pips is retained as the DB column name for backwards-compatible schema,
-        # but new records store a raw PRICE distance here (no pip conversion).
-        c.execute("INSERT INTO trailing_stops(symbol,grp,side,interval,distance_pips,stop_price,created,note,distance_mode) VALUES(?,?,?,?,?,?,?,?,?)", (symbol,grp,side,interval,distance_price,stop,datetime.now(timezone.utc).isoformat(),note,'PRICE')); c.commit()
+        # but ENTRY_PRICE records store the permanent raw PRICE distance here.
+        c.execute("INSERT INTO trailing_stops(symbol,grp,side,interval,distance_pips,stop_price,created,note,distance_mode,entry_price) VALUES(?,?,?,?,?,?,?,?,?,?)", (symbol,grp,side,interval,distance_price,stop,datetime.now(timezone.utc).isoformat(),note,'ENTRY_PRICE',entry)); c.commit()
     return redirect('/')
 
 @APP.route('/trailing/delete/<int:i>')
