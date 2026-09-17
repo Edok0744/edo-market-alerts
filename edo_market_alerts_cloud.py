@@ -4115,7 +4115,8 @@ def trend_pullback_near_structural_sr(candles, setup, interval):
     does NOT require support/resistance proximity.
 
     For higher-timeframe Trend Pullbacks, context may come from EITHER:
-      * meaningful horizontal structural S/R, OR
+      * meaningful horizontal structural S/R ZONES (including support /
+        resistance role reversal), OR
       * an established sloping trend-line built from at least two prior
         meaningful swing touches.
 
@@ -4221,6 +4222,108 @@ def trend_pullback_near_structural_sr(candles, setup, interval):
         setup["sr_zone_tolerance"] = zone_tolerance
         setup["sr_context_type"] = "horizontal"
         return True, sr_kind, level
+
+    # 2b) Edo horizontal S/R ZONE / role-reversal test.
+    #
+    # Edo draws support/resistance as a BOX, not an exact-price line.  A prior
+    # reaction area remains meaningful when price later returns anywhere inside
+    # that area (or just through it within tolerance).  A former resistance can
+    # also become support after price has broken above it, and former support can
+    # become resistance after price has broken below it.
+    #
+    # Build zones only from PRIOR meaningful swing highs/lows.  The current
+    # pullback/confirmation is never allowed to manufacture its own zone.
+    zone_points = []
+    for point_kind in ("low", "high"):
+        for local_i, level in swing_points(history, point_kind, left=2, right=2):
+            full_i = search_start + local_i
+            if run_start - full_i < 3:
+                continue
+            level = float(level)
+
+            # The old level must have produced a real reaction/move away.
+            after_end = min(run_start, full_i + 9)
+            after = candles[full_i + 1:after_end]
+            if len(after) < 2:
+                continue
+            if point_kind == "low":
+                reaction = max(float(c["high"]) for c in after) - level
+            else:
+                reaction = level - min(float(c["low"]) for c in after)
+            if reaction < ar * 1.10:
+                continue
+
+            zone_points.append((full_i, level, point_kind))
+
+    # Cluster nearby old reaction prices into the kind of horizontal boxes Edo
+    # marks manually.  Multiple touches strengthen a zone but one strong old
+    # reaction is enough when the later role-reversal is clear.
+    zone_points.sort(key=lambda row: row[1])
+    clusters = []
+    for pt in zone_points:
+        if not clusters or abs(pt[1] - clusters[-1][-1][1]) > zone_tolerance * 1.35:
+            clusters.append([pt])
+        else:
+            clusters[-1].append(pt)
+
+    zone_candidates = []
+    for cluster in clusters:
+        levels = [row[1] for row in cluster]
+        zone_low = min(levels) - zone_tolerance * 0.35
+        zone_high = max(levels) + zone_tolerance * 0.35
+        zone_mid = sum(levels) / len(levels)
+
+        # Current reaction may wick into or slightly through the box.
+        if touch_price < zone_low - zone_tolerance or touch_price > zone_high + zone_tolerance:
+            continue
+
+        latest_anchor = max(row[0] for row in cluster)
+        between = candles[latest_anchor + 1:run_start]
+        if not between:
+            continue
+
+        # Accept same-role zones directly.  Also accept role reversal only when
+        # price clearly crossed to the other side before this retest.
+        kinds = {row[2] for row in cluster}
+        role_ok = False
+        role_reversal = False
+        if direction == "bullish":
+            if "low" in kinds:
+                role_ok = True
+            if "high" in kinds and max(float(c["close"]) for c in between) > zone_high + zone_tolerance * 0.20:
+                role_ok = True
+                role_reversal = True
+        else:
+            if "high" in kinds:
+                role_ok = True
+            if "low" in kinds and min(float(c["close"]) for c in between) < zone_low - zone_tolerance * 0.20:
+                role_ok = True
+                role_reversal = True
+
+        if not role_ok:
+            continue
+
+        if touch_price < zone_low:
+            distance = zone_low - touch_price
+        elif touch_price > zone_high:
+            distance = touch_price - zone_high
+        else:
+            distance = 0.0
+        zone_candidates.append((distance, -len(cluster), -latest_anchor, zone_mid, zone_low, zone_high, role_reversal))
+
+    if zone_candidates:
+        zone_candidates.sort()
+        distance, neg_touches, _, level, zone_low, zone_high, role_reversal = zone_candidates[0]
+        setup["sr_context_ok"] = True
+        setup["sr_kind"] = sr_kind
+        setup["sr_level"] = float(level)
+        setup["sr_zone_low"] = float(zone_low)
+        setup["sr_zone_high"] = float(zone_high)
+        setup["sr_zone_touches"] = int(-neg_touches)
+        setup["sr_distance"] = float(distance)
+        setup["sr_zone_tolerance"] = zone_tolerance
+        setup["sr_context_type"] = "horizontal_role_reversal" if role_reversal else "horizontal_zone"
+        return True, sr_kind, float(level)
 
     # 3) Trend-line S/R test. Use two meaningful PRIOR swing touches only.
     #    The current pullback is a later test; it is never used to invent
