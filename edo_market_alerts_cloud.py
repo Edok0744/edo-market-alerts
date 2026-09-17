@@ -6492,6 +6492,16 @@ def trailing_stop_monitor():
                     else:
                         candidate=close-dist if side=='BUY' else close+dist; new_stop=max(old_stop,candidate) if side=='BUY' else min(old_stop,candidate)
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET stop_price=?,last_candle_start=?,last_candle_time=? WHERE id=?',(new_stop,candle_start,perth_time,t['id'])); c.commit()
+                        # Notify only when the actual trailing-stop level ratchets in Edo's favour.
+                        # A closed candle that leaves the stop unchanged stays quiet.
+                        moved = (side=='BUY' and new_stop > old_stop) or (side=='SELL' and new_stop < old_stop)
+                        if moved:
+                            tf_label = {'1h':'1H','4h':'4H','8h':'8H','1day':'Daily'}.get(str(t['interval']), str(t['interval']).upper())
+                            send_push(
+                                f"🟠 {t['symbol']} {tf_label} TRAIL MOVED",
+                                f"{side} candle-close trail advanced.\nClosed candle: {perth_time} Perth\nCandle close: {close}\nOld stop: {old_stop}\nNew stop: {new_stop}\nNote: {t['note'] or '-'}",
+                                sound='pushover'
+                            )
                 except Exception as e: print('trailing stop monitor error',t['symbol'],e)
                 time.sleep(2)
         except Exception as e: print('trailing stop monitor loop error',e)
