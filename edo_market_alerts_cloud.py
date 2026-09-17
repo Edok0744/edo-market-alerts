@@ -3347,11 +3347,68 @@ def sr_gap_structure_is_messy(candles, old_i, retest_index, zone_centre, ar, dir
         if side:
             previous_side = side
 
-    # Do NOT reject simply because revisit_clusters is 2, 3, 4 or more.
-    # Those can be legitimate repeated tests of the same S/R level. Reject
-    # only genuine back-and-forth closes through the zone; that is congestion,
-    # not a clean retest. A rejected 8H structure is still free to qualify
-    # independently on Daily/Weekly.
+    # Repeated tests are valid only when they are genuinely SEPARATE tests.
+    # Edo does not want a cluster of candles hanging around the level to be
+    # called a clean Gap-Retest.  Between one revisit and the next there must
+    # be another clean departure (minimum three consecutive closes clearly
+    # away from the zone).  This rejects range/congestion such as several
+    # candles repeatedly probing the same resistance/support without a fresh
+    # move-away in between.
+    post_departure = []
+    seen_departure = False
+    for c in middle:
+        close = float(c["close"])
+        low = float(c["low"])
+        high = float(c["high"])
+        if direction == "bullish":
+            clearly_away = close >= zone_centre + away_distance
+        else:
+            clearly_away = close <= zone_centre - away_distance
+        if clearly_away:
+            seen_departure = True
+        if seen_departure:
+            post_departure.append((clearly_away, low <= zone_centre + zone_band and high >= zone_centre - zone_band))
+
+    # Build revisit clusters and count the longest clean-away run separating
+    # neighbouring clusters. A later 3rd/4th test is still allowed, but only
+    # after price has clearly left the level again.
+    clusters = []
+    in_cluster = False
+    for idx, (_away, overlaps) in enumerate(post_departure):
+        if overlaps and not in_cluster:
+            clusters.append([idx, idx])
+            in_cluster = True
+        elif overlaps and in_cluster:
+            clusters[-1][1] = idx
+        elif not overlaps:
+            in_cluster = False
+
+    # Too many candles living in/around the zone is congestion, not a gap.
+    zone_candles = sum(1 for _away, overlaps in post_departure if overlaps)
+    if post_departure and zone_candles / len(post_departure) > 0.38:
+        return True
+    if any((b - a + 1) >= 3 for a, b in clusters):
+        return True
+
+    # Every repeated revisit must have a fresh 3-close departure between it
+    # and the previous revisit. This preserves Edo's valid 2nd/3rd/4th-test
+    # rule while rejecting one prolonged choppy test.
+    for n in range(1, len(clusters)):
+        prev_end = clusters[n - 1][1]
+        next_start = clusters[n][0]
+        best_sep = run_sep = 0
+        for away, _overlaps in post_departure[prev_end + 1:next_start]:
+            if away:
+                run_sep += 1
+                best_sep = max(best_sep, run_sep)
+            else:
+                run_sep = 0
+        if best_sep < 3:
+            return True
+
+    # Genuine back-and-forth closes through the level are also congestion.
+    # A rejected 8H setup remains eligible to be found independently on
+    # Daily, and a rejected Daily setup remains eligible on Weekly.
     return side_flips >= 3
 
 
