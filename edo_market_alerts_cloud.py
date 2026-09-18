@@ -220,6 +220,7 @@ _HOME_PAGE_CACHE = {
     "markets": [],
     "favorites": [],
     "trend_statuses": {},
+    "trend_since": {},
     "trend_snapshots": {},
 }
 _HOME_PAGE_CACHE_LOCK = threading.Lock()
@@ -662,9 +663,9 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <b>{{f['symbol']}}</b>
 {% set saved_ts = trend_statuses.get(f['symbol'], '') %}
 {% if saved_ts == 'FULL BULLISH' %}
-<span class="saved-fulltrend bull">🟢 FULL BULLISH</span>
+<span class="saved-fulltrend bull">🟢 FULL BULLISH{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</span>
 {% elif saved_ts == 'FULL BEARISH' %}
-<span class="saved-fulltrend bear">🔴 FULL BEARISH</span>
+<span class="saved-fulltrend bear">🔴 FULL BEARISH{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</span>
 {% endif %}
 </div>
 
@@ -6485,6 +6486,20 @@ def format_closed_candle_perth(candle, interval):
     return perth_dt.strftime("%d %b • %H:%M")
 
 
+def format_trend_since_perth(value):
+    """Format the time the current FULL trend state began, in Perth time."""
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        perth_dt = dt.astimezone(ZoneInfo("Australia/Perth"))
+        return perth_dt.strftime("%d %b • %H:%M")
+    except Exception:
+        return ""
+
+
 def format_closed_candle_close_perth(candle, interval):
     """Show when the candle actually CLOSED, in Perth time, for trail checks."""
     dt = parse_candle_utc(candle.get("datetime")) if candle else None
@@ -6882,12 +6897,17 @@ def home():
             trailing_stops = c.execute('SELECT * FROM trailing_stops ORDER BY triggered,id DESC').fetchall()
 
             trend_rows = c.execute(
-                'SELECT symbol,status FROM trend_status'
+                'SELECT symbol,status,updated FROM trend_status'
             ).fetchall()
 
             trend_statuses = {
                 r['symbol']: r['status']
                 for r in trend_rows
+            }
+            trend_since = {
+                r['symbol']: format_trend_since_perth(r['updated'])
+                for r in trend_rows
+                if r['updated'] and r['status'] in ('FULL BULLISH', 'FULL BEARISH')
             }
 
             snapshot_rows = c.execute(
@@ -6911,6 +6931,7 @@ def home():
             _HOME_PAGE_CACHE["markets"] = markets
             _HOME_PAGE_CACHE["favorites"] = favorites
             _HOME_PAGE_CACHE["trend_statuses"] = trend_statuses
+            _HOME_PAGE_CACHE["trend_since"] = trend_since
             _HOME_PAGE_CACHE["trend_snapshots"] = trend_snapshots
 
     except sqlite3.OperationalError as e:
@@ -6921,6 +6942,7 @@ def home():
             favorites = _HOME_PAGE_CACHE["favorites"]
             trailing_stops = []
             trend_statuses = dict(_HOME_PAGE_CACHE["trend_statuses"])
+            trend_since = dict(_HOME_PAGE_CACHE.get("trend_since", {}))
             trend_snapshots = dict(_HOME_PAGE_CACHE["trend_snapshots"])
 
     return render_template_string(
@@ -6932,6 +6954,7 @@ def home():
         selected_symbol=selected_symbol,
         selected_group=selected_group,
         trend_statuses=trend_statuses,
+        trend_since=trend_since,
         trend_snapshots=trend_snapshots,
         news_items=news_items,
         news_configured=news_configured,
