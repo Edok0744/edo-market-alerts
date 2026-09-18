@@ -6668,11 +6668,17 @@ def trailing_stop_monitor():
                     if not candle: continue
                     candle_start=str(candle.get('datetime',''))
                     if candle_start==(t['last_candle_start'] or ''): continue
-                    close=float(candle['close']); old_stop=float(t['stop_price']); dist=(float(t['distance_pips']) if (t['distance_mode'] or '') in {'ENTRY_PRICE','ARM_PRICE'} else trailing_legacy_distance_value(t['symbol'],t['grp'],t['distance_pips'])); side=str(t['side']).upper()
-                    hit=(side=='BUY' and close<=old_stop) or (side=='SELL' and close>=old_stop); perth_time=format_closed_candle_close_perth(candle,t['interval'])
+                    close=float(candle['close']); open_price=float(candle['open']); old_stop=float(t['stop_price']); dist=(float(t['distance_pips']) if (t['distance_mode'] or '') in {'ENTRY_PRICE','ARM_PRICE'} else trailing_legacy_distance_value(t['symbol'],t['grp'],t['distance_pips'])); side=str(t['side']).upper()
+                    # STOP HIT is deliberately stricter than a price touch. Edo's rule:
+                    # BUY trail -> a fully closed BEARISH candle must close at/below the stop.
+                    # SELL trail -> a fully closed BULLISH candle must close at/above the stop.
+                    # Forming candles and intrabar wicks/spikes are ignored by last_closed_candle().
+                    bearish_closed = close < open_price
+                    bullish_closed = close > open_price
+                    hit=(side=='BUY' and bearish_closed and close<=old_stop) or (side=='SELL' and bullish_closed and close>=old_stop); perth_time=format_closed_candle_close_perth(candle,t['interval'])
                     if hit:
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET triggered=1,last_candle_start=?,last_candle_time=? WHERE id=?',(candle_start,perth_time,t['id'])); c.commit()
-                        send_push(f"🟠 {t['symbol']} TRAILING STOP HIT", f"{side} candle-close trail hit.\nClosed candle: {perth_time} Perth\nCandle close: {close}\nTrail level: {old_stop}\nWicks/spikes were ignored.\nNote: {t['note'] or '-'}", sound="none")
+                        send_push(f"🟠 {t['symbol']} TRAILING STOP HIT", f"{side} candle-close trail hit.\nClosed candle: {perth_time} Perth\nCandle close: {close:.5f}\nTrail level: {old_stop:.5f}\nOpposite-colour candle fully closed beyond the trail. Wicks/spikes were ignored.\nNote: {t['note'] or '-'}", sound="none")
                     else:
                         candidate=close-dist if side=='BUY' else close+dist; new_stop=max(old_stop,candidate) if side=='BUY' else min(old_stop,candidate)
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET stop_price=?,last_candle_start=?,last_candle_time=? WHERE id=?',(new_stop,candle_start,perth_time,t['id'])); c.commit()
@@ -6683,7 +6689,7 @@ def trailing_stop_monitor():
                             tf_label = {'1h':'1H','4h':'4H','8h':'8H','1day':'Daily'}.get(str(t['interval']), str(t['interval']).upper())
                             send_push(
                                 f"🟠 {t['symbol']} {tf_label} TRAIL MOVED",
-                                f"{side} candle-close trail advanced.\nClosed candle: {perth_time} Perth\nCandle close: {close}\nOld stop: {old_stop}\nNew stop: {new_stop}\nNote: {t['note'] or '-'}",
+                                f"{side} candle-close trail advanced.\nClosed candle: {perth_time} Perth\nCandle close: {close:.5f}\nOld stop: {old_stop:.5f}\nNew stop: {new_stop:.5f}\nNote: {t['note'] or '-'}",
                                 sound='pushover'
                             )
                 except Exception as e: print('trailing stop monitor error',t['symbol'],e)
