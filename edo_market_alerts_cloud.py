@@ -4065,22 +4065,19 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     if not exact_adjacent_pullback_run(candles, run_start, i, run_colour):
         return None
 
-    clean_ok, clean_reason = clean_pullback_run(
-        candles, run_start, i, run_colour
-    )
-    if not clean_ok:
-        return None
+    # Edo 4H rule: the separate higher-timeframe filter supplies the trend
+    # context. Do not reject a valid 4H 2+ candle pullback because of local
+    # 4H structure or the stricter clean-run quality filter.
+    #
+    # 8H / Daily / Weekly keep the existing clean-pullback and S/R rules.
+    if not require_local_trend:
+        clean_ok, clean_reason = clean_pullback_run(
+            candles, run_start, i, run_colour
+        )
+        if not clean_ok:
+            return None
 
     trend = local_structure_trend(candles, run_start)
-
-    # 4H uses established trend context and then also passes the separate
-    # strong higher-timeframe alignment filter later in the signal flow.
-    #
-    # 8H / Daily / Weekly use Edo's higher-timeframe S/R context rule instead:
-    # the clean 2+ candle sequence must occur at/near meaningful support or
-    # resistance, so local-trend agreement is not required here.
-    if require_local_trend and trend != required_trend and not allow_sr_exception:
-        return None
 
     score = 6.0 + min(3.0, (run_count - 2) * 0.75)
     target = previous_target(candles, direction, run_start)
@@ -5215,11 +5212,14 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
         found = normal_found + other_found
 
-    # Edo filter: do not chase a valid 4H/8H confirmation candle if it has
-    # already shot into the next important historical S/R level.
-    found, rejected_room_setups = apply_confirmation_room_filter(
-        closed_candles, interval, found
-    )
+    # S/R confirmation-room rejection is not part of Edo's 4H pullback rule.
+    # Keep that extra filter for 8H only.
+    if interval == "4h":
+        rejected_room_setups = []
+    else:
+        found, rejected_room_setups = apply_confirmation_room_filter(
+            closed_candles, interval, found
+        )
 
     found.sort(
         key=lambda p: (
