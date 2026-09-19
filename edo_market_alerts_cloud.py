@@ -4107,12 +4107,13 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
 
 def trend_pullback_near_structural_sr(candles, setup, interval):
     """
-    Edo 8H / Daily / Weekly Trend Pullback context rule.
+    Edo 4H / 8H / Daily / Weekly Trend Pullback context rule.
 
-    4H is handled separately by the higher-timeframe direction filter and
-    does NOT require support/resistance proximity.
+    4H also requires support/resistance proximity in addition to its separate
+    higher-timeframe direction filter. This keeps 4H entries at meaningful
+    structural levels instead of signalling every 2+ candle retracement.
 
-    For higher-timeframe Trend Pullbacks, context may come from EITHER:
+    Trend Pullback context may come from EITHER:
       * meaningful horizontal structural S/R ZONES (including support /
         resistance role reversal), OR
       * an established sloping trend-line built from at least two prior
@@ -5130,8 +5131,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    then an opposite-colour fully CLOSED confirmation.
     #    NO 50% rule applies to this signal.
     #
-    #    4H: must pass the higher-timeframe trend filter; S/R is NOT required.
-    #    8H / Daily / Weekly: must be at/near meaningful S/R.
+    #    4H: must pass the higher-timeframe trend filter AND be at/near meaningful S/R.
+    #    8H / Daily / Weekly: must also be at/near meaningful S/R.
     if interval in NORMAL_PULLBACK_INTERVALS:
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
@@ -5143,12 +5144,13 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             if not pullback:
                 continue
 
-            if interval in ("8h", "1day", "1week"):
-                near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
-                    closed_candles, pullback, interval
-                )
-                if not near_sr:
-                    continue
+            # Edo S/R location rule for every normal pullback timeframe.
+            # 4H still has its separate higher-timeframe trend-direction filter.
+            near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
+                closed_candles, pullback, interval
+            )
+            if not near_sr:
+                continue
 
             found.append(pullback)
 
@@ -5655,8 +5657,8 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     found = []
 
     # A) NORMAL Trend Pullback — 4H, 8H, Daily and Weekly, NO 50% rule.
-    #    4H needs higher-timeframe trend alignment and does NOT need S/R.
-    #    8H / Daily / Weekly must be at/near meaningful S/R.
+    #    4H needs higher-timeframe trend alignment AND meaningful S/R.
+    #    8H / Daily / Weekly must also be at/near meaningful S/R.
     if interval in NORMAL_PULLBACK_INTERVALS:
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
@@ -5668,12 +5670,13 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             if not pullback:
                 continue
 
-            if interval in ("8h", "1day", "1week"):
-                near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
-                    closed_candles, pullback, interval
-                )
-                if not near_sr:
-                    continue
+            # Edo S/R location rule for every normal pullback timeframe.
+            # 4H still has its separate higher-timeframe trend-direction filter.
+            near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
+                closed_candles, pullback, interval
+            )
+            if not near_sr:
+                continue
 
             found.append(pullback)
 
