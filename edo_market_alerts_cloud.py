@@ -4960,7 +4960,7 @@ def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
     states = {}
 
     # 8H is the primary context for a 4H pullback.
-    candles_8h, err = get_ohlc(symbol, "8h", outputsize=80, grp=grp)
+    candles_8h, err = get_candles(symbol, "8h", outputsize=80, grp=grp)
     if err:
         return None, states, err
     closed_8h = fully_closed_candles(candles_8h, "8h")
@@ -5210,7 +5210,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     if cached and not force_refresh and now - cached["saved_at"] < PATTERN_SIGNAL_CACHE_SECONDS:
         return cached["data"], None
 
-    candles, error = get_ohlc(symbol, interval, outputsize=140, grp=grp)
+    candles, error = get_candles(symbol, interval, outputsize=140, grp=grp)
 
     if error:
         if "credits" in error.lower() or "limit" in error.lower():
@@ -5760,7 +5760,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     Returns:
       setups, latest_closed_date, error
     """
-    candles, error = get_ohlc(symbol, interval, outputsize=140, grp=grp)
+    candles, error = get_candles(symbol, interval, outputsize=140, grp=grp)
     if error:
         return None, None, error
     if not candles or len(candles) < 41:
