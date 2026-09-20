@@ -4633,16 +4633,16 @@ def describe_setup(p):
             f"{htf_text}"
         )
 
-            sr_kind = str(p.get("sr_kind", "S/R")).title()
-    sr_level = p.get("sr_level")
-    
-    if sr_level is not None:
-        level_text = (
-            f"{sr_kind} used: {float(sr_level):.5f} • "
-            f"Confirmation close: {p['confirmation_close']:.5f}"
-        )
-    else:
-        level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
+        sr_kind = str(p.get("sr_kind", "S/R")).title()
+sr_level = p.get("sr_level")
+
+if sr_level is not None:
+    level_text = (
+        f"{sr_kind} used: {float(sr_level):.5f} • "
+        f"Confirmation close: {p['confirmation_close']:.5f}"
+    )
+else:
+    level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
 
     else:
         detail = (
