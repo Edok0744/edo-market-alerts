@@ -4686,9 +4686,14 @@ def detect_weekly_spike(closed_weekly):
     (recent close progress + swing highs/lows). No moving averages, RSI, etc.
 
     The wick itself must also be clearly out of ordinary:
-      - at least 2.2x the recent median same-side wick
-      - at least 45% of the recent median weekly range
-      - at least 1.2x the current candle body
+      - at least 3.0x the recent median same-side wick
+      - at least 55% of the recent median weekly range
+      - at least 25% of the current candle's full range
+      - at least 1.5x the current candle body
+
+    Requiring both a strong historical ratio AND meaningful absolute size
+    prevents a small wick from looking abnormal only because recent same-side
+    wicks happened to be tiny.
     """
     if not closed_weekly or len(closed_weekly) < 14:
         return None
@@ -4737,15 +4742,20 @@ def detect_weekly_spike(closed_weekly):
     upper_ratio = upper / med_upper
     lower_ratio = lower / med_lower
 
+    # A real Weekly Spike should stand out visually as well as statistically.
+    # The current-range test protects against inflated ratios caused by a tiny
+    # historical same-side wick median.
     upper_hit = (
-        upper_ratio >= 2.2
-        and upper >= med_range * 0.45
-        and upper >= body_floor * 1.2
+        upper_ratio >= 3.0
+        and upper >= med_range * 0.55
+        and upper >= current_range * 0.25
+        and upper >= body_floor * 1.5
     )
     lower_hit = (
-        lower_ratio >= 2.2
-        and lower >= med_range * 0.45
-        and lower >= body_floor * 1.2
+        lower_ratio >= 3.0
+        and lower >= med_range * 0.55
+        and lower >= current_range * 0.25
+        and lower >= body_floor * 1.5
     )
 
     # Directional reversal filter:
@@ -4894,6 +4904,41 @@ def weekly_spike_monitor():
 
                         previous = state["last_closed_date"] if state else ""
 
+                        # A Railway restart/redeploy must never turn an already
+                        # closed Weekly candle into a fresh phone alert. If the
+                        # latest Weekly candle had already closed before this
+                        # Python process started, silently baseline it.
+                        weekly_close_utc = pattern_candle_close_utc(
+                            latest_closed_date, "1week"
+                        )
+                        if (
+                            weekly_close_utc is not None
+                            and weekly_close_utc <= PROCESS_STARTED_UTC
+                            and latest_closed_date != previous
+                        ):
+                            c.execute(
+                                """
+                                INSERT INTO weekly_spike_state(
+                                    grp, symbol, last_closed_date, updated
+                                ) VALUES(?,?,?,?)
+                                ON CONFLICT(grp, symbol) DO UPDATE SET
+                                    last_closed_date=excluded.last_closed_date,
+                                    updated=excluded.updated
+                                """,
+                                (
+                                    grp,
+                                    symbol,
+                                    latest_closed_date,
+                                    datetime.utcnow().isoformat()
+                                )
+                            )
+                            c.commit()
+                            print(
+                                "weekly spike baseline after restart",
+                                grp, symbol, latest_closed_date
+                            )
+                            continue
+
                         if state is None:
                             c.execute(
                                 """
@@ -4910,10 +4955,8 @@ def weekly_spike_monitor():
                             )
                             c.commit()
 
-                            # On first installation, alert once if the latest
-                            # closed Weekly candle itself is already a spike.
-                            if spike:
-                                notify_weekly_spike(symbol, grp, spike)
+                            # First observation creates a baseline only.
+                            # Historical Weekly spikes are never replayed.
 
                         elif latest_closed_date != previous:
                             c.execute(
