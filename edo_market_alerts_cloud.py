@@ -753,7 +753,8 @@ Target {{m['direction']}} {{m['target']}}
 <div class="alerttrend">
     <div class="alerttrend-title">TREND • Weekly reference only</div>
     <div class="alerttrend-grid">
-        {% for tf in ['Weekly','12H','8H','4H','3H'] %}
+        {% set alert_tfs = ['Weekly','Daily','8H','4H'] if m['grp'] == 'CFD' else ['Weekly','12H','8H','4H','3H'] %}
+        {% for tf in alert_tfs %}
         {% set st = snap.get(tf, '') %}
         <div>
             <div class="alerttrend-tf">{{ 'W' if tf == 'Weekly' else tf }}</div>
@@ -1512,6 +1513,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS trend_snapshot(
             symbol TEXT PRIMARY KEY,
             weekly TEXT,
+            daily TEXT,
             h12 TEXT,
             h8 TEXT,
             h4 TEXT,
@@ -1707,6 +1709,12 @@ def init_db():
         try:
             c.execute("ALTER TABLE trend_snapshot ADD COLUMN h3 TEXT")
             c.execute("UPDATE trend_status SET status='', updated=NULL")
+        except sqlite3.OperationalError:
+            pass
+
+        # CFD Full Trend migration: Daily is now a CFD signal timeframe.
+        try:
+            c.execute("ALTER TABLE trend_snapshot ADD COLUMN daily TEXT")
         except sqlite3.OperationalError:
             pass
         c.commit()
@@ -6091,10 +6099,11 @@ def save_trend_snapshot(symbol, states):
     with db_conn() as c:
         c.execute(
             """
-            INSERT INTO trend_snapshot(symbol,weekly,h12,h8,h4,h3,updated)
-            VALUES(?,?,?,?,?,?,?)
+            INSERT INTO trend_snapshot(symbol,weekly,daily,h12,h8,h4,h3,updated)
+            VALUES(?,?,?,?,?,?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 weekly=excluded.weekly,
+                daily=excluded.daily,
                 h12=excluded.h12,
                 h8=excluded.h8,
                 h4=excluded.h4,
@@ -6104,6 +6113,7 @@ def save_trend_snapshot(symbol, states):
             (
                 symbol,
                 states.get("Weekly", ""),
+                states.get("Daily", ""),
                 states.get("12H", ""),
                 states.get("8H", ""),
                 states.get("4H", ""),
@@ -6118,29 +6128,36 @@ def build_full_alignment(symbol, grp=None):
     """
     Edo direct-candlestick alignment signal.
 
-    TRIGGER timeframes:
+    CFD trigger timeframes:
+      4H + 8H + Daily
+
+    FOREX / CRYPTO trigger timeframes remain:
       12H + 8H + 4H + 3H
 
-    Weekly:
-      display/reference only. It NEVER affects FULL BULLISH / FULL BEARISH.
-
+    Weekly is display/reference only for every market group.
     All decisions use the last fully CLOSED candle.
     """
-    intervals = {
-        "12H": "12h",
-        "8H": "8h",
-        "4H": "4h",
-        "3H": "3h",
-    }
+    is_cfd = str(grp or "").upper() == "CFD"
+
+    if is_cfd:
+        intervals = {
+            "Daily": "1day",
+            "8H": "8h",
+            "4H": "4h",
+        }
+        refresh_intervals = {"1day", "4h", "8h"}
+    else:
+        intervals = {
+            "12H": "12h",
+            "8H": "8h",
+            "4H": "4h",
+            "3H": "3h",
+        }
+        refresh_intervals = {"1h", "4h", "8h"}
 
     signal_states = {}
 
-    # FULL TREND must be based on the market's newest genuinely CLOSED
-    # candles, not a cache created just before a candle boundary. 12H is
-    # synthetic from 4H, so refreshing 4H also refreshes the 12H source.
-    clear_ohlc_cache_for_symbol(
-        symbol, grp, intervals={"1h", "4h", "8h"}
-    )
+    clear_ohlc_cache_for_symbol(symbol, grp, intervals=refresh_intervals)
 
     from datetime import timezone
     now_utc = datetime.now(timezone.utc)
@@ -6154,17 +6171,13 @@ def build_full_alignment(symbol, grp=None):
         if closed is None:
             return "", f"Not enough completed {label} candle data."
 
-        # If Twelve Data has not yet published the newest completed candle,
-        # do NOT fall back to the previous candle and create a false FULL
-        # BULLISH/BEARISH state. Wait for the next monitor pass instead.
         if not closed_candle_is_fresh(closed, interval, now_utc=now_utc):
             stamp = closed.get("datetime", "unknown")
             return "", f"Waiting for fresh completed {label} candle data (latest {stamp})."
 
         signal_states[label] = analyse_candle(closed)
 
-    # Weekly is reference-only. If Weekly data fails, the real trigger
-    # still works from 12H + 8H + 4H + 3H.
+    # Weekly is reference-only and never decides FULL BULLISH / FULL BEARISH.
     weekly_state = ""
     weekly_candles, weekly_err = get_candles(symbol, "1week", outputsize=3, grp=grp)
     if not weekly_err:
@@ -6172,10 +6185,7 @@ def build_full_alignment(symbol, grp=None):
         if weekly_closed is not None:
             weekly_state = analyse_candle(weekly_closed)
 
-    save_trend_snapshot(
-        symbol,
-        {"Weekly": weekly_state, **signal_states}
-    )
+    save_trend_snapshot(symbol, {"Weekly": weekly_state, **signal_states})
 
     if all(v == "Bullish" for v in signal_states.values()):
         return "FULL BULLISH", None
@@ -6781,126 +6791,112 @@ def build_trend_scan(symbol, grp=None):
         "Mixed": ("🟡", "mixed"),
     }
 
-    # Weekly is DISPLAY ONLY for reference.
-    # It does NOT affect FULL BULLISH / FULL BEARISH or Pushover triggering.
-    reference_intervals = [
-        ("Weekly", "1week"),
-    ]
+    reference_intervals = [("Weekly", "1week")]
+    is_cfd = str(grp or "").upper() == "CFD"
 
-    # These FOUR timeframes alone control the Full Trend signal.
-    signal_intervals = [
-        ("12H", "12h"),
-        ("8H", "8h"),
-        ("4H", "4h"),
-        ("3H", "3h"),
-    ]
+    # CFD uses no timeframe below 4H: 4H + 8H + Daily decide FULL TREND.
+    # Weekly remains visible as reference only. FOREX / CRYPTO are unchanged.
+    if is_cfd:
+        signal_intervals = [
+            ("Daily", "1day"),
+            ("8H", "8h"),
+            ("4H", "4h"),
+        ]
+    else:
+        signal_intervals = [
+            ("12H", "12h"),
+            ("8H", "8h"),
+            ("4H", "4h"),
+            ("3H", "3h"),
+        ]
 
     states = {}
 
-    # Weekly first: coloured text only, no red/green dot.
     for label, interval in reference_intervals:
         candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
-
         if error:
             return None, error
-
         closed = last_closed_candle(candles, interval)
         if closed is None:
             return None, f"Not enough completed {label} candle data."
-
         state = analyse_candle(closed)
         _, css = state_info[state]
-
         results.append({
-            "label": label,
-            "interval": interval,
-            "state": state,
-            "icon": "",
-            "css": css,
-            "reference_only": True,
+            "label": label, "interval": interval, "state": state,
+            "icon": "", "css": css, "reference_only": True,
             "closed_time": closed.get("datetime", ""),
             "closed_time_perth": format_closed_candle_perth(closed, interval),
         })
 
-    # Existing signal rows stay unchanged.
     for label, interval in signal_intervals:
         candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
-
         if error:
             return None, error
-
         closed = last_closed_candle(candles, interval)
         if closed is None:
             return None, f"Not enough completed {label} candle data."
-
         state = analyse_candle(closed)
         states[label] = state
         icon, css = state_info[state]
-
         results.append({
-            "label": label,
-            "interval": interval,
-            "state": state,
-            "icon": icon,
-            "css": css,
-            "reference_only": False,
+            "label": label, "interval": interval, "state": state,
+            "icon": icon, "css": css, "reference_only": False,
             "closed_time": closed.get("datetime", ""),
             "closed_time_perth": format_closed_candle_perth(closed, interval),
         })
 
-    signal_labels = ("12H", "8H", "4H", "3H")
-    weights = {"12H": 4, "8H": 3, "4H": 2, "3H": 1}
-    score = 0
-
-    for label in signal_labels:
-        if states[label] == "Bullish":
-            score += weights[label]
-        elif states[label] == "Bearish":
-            score -= weights[label]
-
-    full_bull = all(states[x] == "Bullish" for x in signal_labels)
-    full_bear = all(states[x] == "Bearish" for x in signal_labels)
-
-    if full_bull:
-        summary = "FULL BULLISH"
-        icon, css = "🟢", "bull"
-        detail = "Last CLOSED candles on 12H, 8H, 4H and 3H are all GREEN. Bullish possibility."
-    elif full_bear:
-        summary = "FULL BEARISH"
-        icon, css = "🔴", "bear"
-        detail = "Last CLOSED candles on 12H, 8H, 4H and 3H are all RED. Bearish possibility."
-    elif states["12H"] == "Bullish" and any(
-        states[x] == "Bearish" for x in ("8H", "4H", "1H")
-    ):
-        summary = "BULLISH — LOWER-TIMEFRAME PULLBACK"
-        icon, css = "🟡", "mixed"
-        detail = "12H is bullish, but one or more lower signal timeframes are pulling back."
-    elif states["12H"] == "Bearish" and any(
-        states[x] == "Bullish" for x in ("8H", "4H", "1H")
-    ):
-        summary = "BEARISH — LOWER-TIMEFRAME BOUNCE"
-        icon, css = "🟡", "mixed"
-        detail = "12H is bearish, but one or more lower signal timeframes are bouncing."
-    elif score >= 6:
-        summary = "BULLISH"
-        icon, css = "🟢", "bull"
-        detail = "12H, 8H, 4H and 3H lean bullish."
-    elif score <= -6:
-        summary = "BEARISH"
-        icon, css = "🔴", "bear"
-        detail = "12H, 8H, 4H and 3H lean bearish."
+    if is_cfd:
+        signal_labels = ("Daily", "8H", "4H")
+        weights = {"Daily": 3, "8H": 2, "4H": 1}
+        score = sum(weights[x] if states[x] == "Bullish" else -weights[x] if states[x] == "Bearish" else 0 for x in signal_labels)
+        full_bull = all(states[x] == "Bullish" for x in signal_labels)
+        full_bear = all(states[x] == "Bearish" for x in signal_labels)
+        if full_bull:
+            summary, icon, css = "FULL BULLISH", "🟢", "bull"
+            detail = "Last CLOSED candles on 4H, 8H and Daily are all GREEN. Weekly is reference only."
+        elif full_bear:
+            summary, icon, css = "FULL BEARISH", "🔴", "bear"
+            detail = "Last CLOSED candles on 4H, 8H and Daily are all RED. Weekly is reference only."
+        elif score >= 4:
+            summary, icon, css = "BULLISH", "🟢", "bull"
+            detail = "4H, 8H and Daily lean bullish but are not fully aligned. Weekly is reference only."
+        elif score <= -4:
+            summary, icon, css = "BEARISH", "🔴", "bear"
+            detail = "4H, 8H and Daily lean bearish but are not fully aligned. Weekly is reference only."
+        else:
+            summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
+            detail = "4H, 8H and Daily are not aligned strongly enough. Weekly is reference only."
     else:
-        summary = "MIXED / WAIT"
-        icon, css = "🟡", "mixed"
-        detail = "12H, 8H, 4H and 3H are not aligned strongly enough."
+        signal_labels = ("12H", "8H", "4H", "3H")
+        weights = {"12H": 4, "8H": 3, "4H": 2, "3H": 1}
+        score = sum(weights[x] if states[x] == "Bullish" else -weights[x] if states[x] == "Bearish" else 0 for x in signal_labels)
+        full_bull = all(states[x] == "Bullish" for x in signal_labels)
+        full_bear = all(states[x] == "Bearish" for x in signal_labels)
+        if full_bull:
+            summary, icon, css = "FULL BULLISH", "🟢", "bull"
+            detail = "Last CLOSED candles on 12H, 8H, 4H and 3H are all GREEN. Bullish possibility."
+        elif full_bear:
+            summary, icon, css = "FULL BEARISH", "🔴", "bear"
+            detail = "Last CLOSED candles on 12H, 8H, 4H and 3H are all RED. Bearish possibility."
+        elif states["12H"] == "Bullish" and any(states[x] == "Bearish" for x in ("8H", "4H", "3H")):
+            summary, icon, css = "BULLISH — LOWER-TIMEFRAME PULLBACK", "🟡", "mixed"
+            detail = "12H is bullish, but one or more lower signal timeframes are pulling back."
+        elif states["12H"] == "Bearish" and any(states[x] == "Bullish" for x in ("8H", "4H", "3H")):
+            summary, icon, css = "BEARISH — LOWER-TIMEFRAME BOUNCE", "🟡", "mixed"
+            detail = "12H is bearish, but one or more lower signal timeframes are bouncing."
+        elif score >= 6:
+            summary, icon, css = "BULLISH", "🟢", "bull"
+            detail = "12H, 8H, 4H and 3H lean bullish."
+        elif score <= -6:
+            summary, icon, css = "BEARISH", "🔴", "bear"
+            detail = "12H, 8H, 4H and 3H lean bearish."
+        else:
+            summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
+            detail = "12H, 8H, 4H and 3H are not aligned strongly enough."
 
     return {
-        "results": results,
-        "summary": summary,
-        "summary_icon": icon,
-        "summary_css": css,
-        "detail": detail,
-        "score": score,
+        "results": results, "summary": summary, "summary_icon": icon,
+        "summary_css": css, "detail": detail, "score": score,
     }, None
 
 
@@ -7147,12 +7143,13 @@ def home():
             }
 
             snapshot_rows = c.execute(
-                'SELECT symbol,weekly,h12,h8,h4,h3,updated FROM trend_snapshot'
+                'SELECT symbol,weekly,daily,h12,h8,h4,h3,updated FROM trend_snapshot'
             ).fetchall()
 
             trend_snapshots = {
                 r['symbol']: {
                     'Weekly': r['weekly'] or '',
+                    'Daily': r['daily'] or '',
                     '12H': r['h12'] or '',
                     '8H': r['h8'] or '',
                     '4H': r['h4'] or '',
