@@ -4170,40 +4170,9 @@ def trend_pullback_near_structural_sr(candles, setup, interval):
     else:
         return False, None, None
 
-    # 1) Fresh structural extreme test.
-    # Edo rule: on 8H / Daily / Weekly a clean 2+ pullback may also finish at
-    # a NEW meaningful swing extreme.  This matters when price has trended
-    # into fresh support/resistance, so there may be no older horizontal level
-    # at exactly the same price yet (for example 5 red Weekly candles into a
-    # fresh low followed by a fully closed bullish confirmation).
-    #
-    # Use only PRIOR candles to define the extreme; the current pullback cannot
-    # manufacture the comparison level.  The normal 2+ adjacency/clean-run and
-    # fully-closed confirmation rules have already passed before this helper.
-    prior_window = candles[max(0, run_start - 30):run_start]
-    if len(prior_window) >= 8:
-        if direction == "bullish":
-            prior_extreme = min(float(c["low"]) for c in prior_window)
-            if touch_price <= prior_extreme + zone_tolerance:
-                setup["sr_context_ok"] = True
-                setup["sr_kind"] = sr_kind
-                setup["sr_level"] = float(touch_price)
-                setup["sr_distance"] = max(0.0, touch_price - prior_extreme)
-                setup["sr_zone_tolerance"] = zone_tolerance
-                setup["sr_context_type"] = "fresh_structural_extreme"
-                return True, sr_kind, float(touch_price)
-        else:
-            prior_extreme = max(float(c["high"]) for c in prior_window)
-            if touch_price >= prior_extreme - zone_tolerance:
-                setup["sr_context_ok"] = True
-                setup["sr_kind"] = sr_kind
-                setup["sr_level"] = float(touch_price)
-                setup["sr_distance"] = max(0.0, prior_extreme - touch_price)
-                setup["sr_zone_tolerance"] = zone_tolerance
-                setup["sr_context_type"] = "fresh_structural_extreme"
-                return True, sr_kind, float(touch_price)
-
-    # 2) Existing horizontal structural S/R test.
+    # 1) Existing horizontal structural S/R test.
+    # A Trend Pullback must react at a level that existed BEFORE the pullback.
+    # Do not let a fresh high/low manufacture its own S/R zone.
     candidates = []
     full_swings = []
     for local_i, level in swings:
@@ -5202,7 +5171,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         found = []
 
     # Edo rule:
-    #   4H Trend Pullback -> higher-timeframe direction (8H first, Daily fallback); S/R not required.
+    #   4H Trend Pullback -> meaningful pre-existing S/R AND higher-timeframe direction (8H first, Daily fallback).
     #   8H / Daily / Weekly Trend Pullback -> no 4H-style higher-timeframe trend
     #   requirement, but the clean 2+ candle sequence must occur at/near
     #   meaningful support/resistance.
@@ -5219,14 +5188,11 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
         found = normal_found + other_found
 
-    # S/R confirmation-room rejection is not part of Edo's 4H pullback rule.
-    # Keep that extra filter for 8H only.
-    if interval == "4h":
-        rejected_room_setups = []
-    else:
-        found, rejected_room_setups = apply_confirmation_room_filter(
-            closed_candles, interval, found
-        )
+    # Use the same final confirmation-room rule as the automatic monitor.
+    # This keeps the manual SIGNAL page and phone alerts in agreement.
+    found, rejected_room_setups = apply_confirmation_room_filter(
+        closed_candles, interval, found
+    )
 
     found.sort(
         key=lambda p: (
@@ -5745,7 +5711,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         setups = []
 
     # Edo rule:
-    #   4H Trend Pullback -> higher-timeframe direction (8H first, Daily fallback); S/R not required.
+    #   4H Trend Pullback -> meaningful pre-existing S/R AND higher-timeframe direction (8H first, Daily fallback).
     #   8H / Daily / Weekly Trend Pullback -> must be near meaningful S/R and do
     #   not use the 4H higher-timeframe alignment requirement.
     # The separate S/R Gap-Retest setup remains independent.
