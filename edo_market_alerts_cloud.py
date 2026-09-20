@@ -1,10 +1,14 @@
 import os, time, sqlite3, threading, json
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from flask import Flask, request, jsonify, render_template_string, redirect
+from flask import Flask, request, jsonify, render_template_string, redirect, send_from_directory
 import requests
 
 APP = Flask(__name__)
+
+@APP.route('/apple-touch-icon.png')
+def apple_touch_icon():
+    return send_from_directory('.', 'apple-touch-icon.png', mimetype='image/png')
 
 # Used to prevent a Railway restart/redeploy from replaying an already-closed
 # historical candle as a brand-new phone signal.
