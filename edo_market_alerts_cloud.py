@@ -5626,6 +5626,27 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 f"through the previous candle body. "
                 f"{direction_word} possibility.{target_lines} Review the chart before trading."
             )
+        elif p.get("name") == "TREND PULLBACK SETUP":
+            pullback_colour = str(p.get("run_colour", "")).upper()
+            confirmation_colour = "GREEN" if bullish else "RED"
+            continuation_word = "BUY" if bullish else "SELL"
+            structure_word = str(p.get("required_trend", p.get("direction", ""))).upper()
+            run_count = int(p.get("run_count", 2))
+
+            if p.get("context") == "second_sr_reaction" or p.get("trend") == "developing":
+                market_text = f"This is a developing {structure_word} setup at structural S/R. "
+            else:
+                market_text = f"The larger price structure is {structure_word}. "
+
+            push_body = (
+                f"TREND PULLBACK SETUP confirmed on the NEWEST CLOSED {tf_label} candle "
+                f"({confirmation_date}). "
+                f"{market_text}"
+                f"{run_count} {pullback_colour} CLOSED candles pulled against that direction, "
+                f"then the opposite-colour {confirmation_colour} confirmation candle fully CLOSED. "
+                f"{trend_line}"
+                f"Possible {continuation_word} continuation. Review the chart before trading."
+            )
         else:
             push_body = (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
