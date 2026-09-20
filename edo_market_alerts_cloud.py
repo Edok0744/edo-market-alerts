@@ -2721,10 +2721,37 @@ def send_push(title, msg, sound='cashregister'):
         return False
 
 
-def latest_price(symbol, grp=None, force_refresh=False):
-    if not TWELVE_KEY:
-        return None
+def bybit_crypto_symbol(symbol):
+    """Map Edo's USD-style crypto names to Bybit USDT perpetual symbols."""
+    raw = "".join(ch for ch in str(symbol).upper() if ch.isalnum())
+    if raw.endswith("USDT"):
+        return raw
+    if raw.endswith("USD"):
+        return raw[:-3] + "USDT"
+    return raw + "USDT"
 
+
+def bybit_interval(interval):
+    """Map EdoSignal intervals to Bybit V5 kline intervals."""
+    return {
+        "1min": "1",
+        "1h": "60",
+        "2h": "120",
+        "4h": "240",
+        "12h": "720",
+        "1day": "D",
+        "1week": "W",
+    }.get(interval)
+
+
+def bybit_get_json(endpoint, params, timeout=15):
+    """Public Bybit market-data request; no trading API key is required."""
+    r = requests.get(endpoint, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def latest_price(symbol, grp=None, force_refresh=False):
     cache_key = (grp or "", symbol.upper().strip())
     now = time.time()
 
@@ -2732,6 +2759,39 @@ def latest_price(symbol, grp=None, force_refresh=False):
         cached = _PRICE_CACHE.get(cache_key)
         if (not force_refresh) and cached and now - cached["saved_at"] < 30:
             return cached["price"]
+
+    # Edo's crypto prices follow Bybit USDT perpetuals.
+    if grp == "CRYPTO":
+        resolved_symbol = bybit_crypto_symbol(symbol)
+        try:
+            j = bybit_get_json(
+                "https://api.bybit.com/v5/market/tickers",
+                {"category": "linear", "symbol": resolved_symbol},
+                timeout=10
+            )
+            if int(j.get("retCode", -1)) != 0:
+                print("Bybit price API error", symbol, j.get("retMsg", "Unknown error"))
+                return None
+
+            rows = (j.get("result") or {}).get("list") or []
+            if not rows or "lastPrice" not in rows[0]:
+                return None
+
+            price = float(rows[0]["lastPrice"])
+            with _CACHE_LOCK:
+                _PRICE_CACHE[cache_key] = {
+                    "saved_at": now,
+                    "price": price,
+                    "source_symbol": resolved_symbol
+                }
+            return price
+
+        except Exception as e:
+            print("Bybit price error", symbol, e)
+            return None
+
+    if not TWELVE_KEY:
+        return None
 
     try:
         for resolved_symbol in twelve_symbol_candidates(symbol, grp):
@@ -2803,10 +2863,7 @@ CORE_PATTERN_INTERVALS = SR_GAP_RETEST_INTERVALS
 
 
 def get_ohlc(symbol, interval, outputsize=140, grp=None):
-    """Download OHLC candles from Twelve Data, oldest -> newest, with shared caching."""
-    if not TWELVE_KEY:
-        return None, "Twelve Data API key is not configured."
-
+    """Download OHLC oldest -> newest. Crypto uses Bybit; Forex/CFD keep Twelve Data."""
     cache_key = (grp or "", symbol.upper().strip(), interval)
     now = time.time()
     ttl = ohlc_cache_seconds(interval)
@@ -2815,6 +2872,75 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
         cached = _OHLC_CACHE.get(cache_key)
         if cached and now - cached["saved_at"] < ttl and len(cached["candles"]) >= outputsize:
             return cached["candles"][-outputsize:], None
+
+    # Crypto uses the same Bybit USDT perpetual market Edo trades.
+    # The newest raw candle may still be forming. Signal logic continues to
+    # pass through fully_closed_candles(), so a live candle cannot trigger.
+    if grp == "CRYPTO":
+        resolved_symbol = bybit_crypto_symbol(symbol)
+        resolved_interval = bybit_interval(interval)
+        if not resolved_interval:
+            return None, f"Bybit interval {interval} is built synthetically by EdoSignal."
+
+        try:
+            j = bybit_get_json(
+                "https://api.bybit.com/v5/market/kline",
+                {
+                    "category": "linear",
+                    "symbol": resolved_symbol,
+                    "interval": resolved_interval,
+                    "limit": min(1000, max(40, int(outputsize))),
+                },
+                timeout=15
+            )
+
+            if int(j.get("retCode", -1)) != 0:
+                return None, f"Bybit error for {resolved_symbol}: {j.get('retMsg', 'Unknown error')}"
+
+            values = (j.get("result") or {}).get("list") or []
+            candles = []
+
+            # Bybit returns newest -> oldest. EdoSignal uses oldest -> newest.
+            for row in reversed(values):
+                try:
+                    start_dt = datetime.fromtimestamp(
+                        int(row[0]) / 1000.0, tz=timezone.utc
+                    )
+                    candles.append({
+                        "datetime": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                        "_source_symbol": resolved_symbol,
+                        "_source_label": f"Bybit {resolved_symbol} USDT Perpetual",
+                    })
+                except (IndexError, TypeError, ValueError, OverflowError):
+                    pass
+
+            if len(candles) < 40:
+                return None, (
+                    f"Not enough {interval} Bybit candle history returned "
+                    f"for {resolved_symbol}."
+                )
+
+            with _CACHE_LOCK:
+                old = _OHLC_CACHE.get(cache_key)
+                if not old or len(candles) >= len(old["candles"]):
+                    _OHLC_CACHE[cache_key] = {
+                        "saved_at": now,
+                        "candles": candles
+                    }
+
+            print("CRYPTO market source", symbol, "-> Bybit", resolved_symbol, interval)
+            return candles[-outputsize:], None
+
+        except Exception as e:
+            print("Bybit setup scanner data error", symbol, interval, e)
+            return None, "Could not download Bybit crypto setup data."
+
+    if not TWELVE_KEY:
+        return None, "Twelve Data API key is not configured."
 
     last_error = "Twelve Data returned no usable market data."
 
@@ -6335,6 +6461,61 @@ def _aggregate_1h_to_3h(candles_1h):
     return synthetic
 
 
+def _aggregate_4h_to_8h(candles_4h):
+    """Build synthetic 8H candles from two consecutive Bybit 4H candles."""
+    from collections import Counter
+    from datetime import timedelta
+
+    parsed = []
+    for c in candles_4h or []:
+        dt = parse_candle_utc(c.get("datetime", ""))
+        if dt is not None:
+            parsed.append((dt, c))
+
+    if not parsed:
+        return []
+
+    parsed.sort(key=lambda item: item[0])
+    phase = Counter(dt.hour % 4 for dt, _ in parsed).most_common(1)[0][0]
+
+    buckets = {}
+    for dt, c in parsed:
+        shifted = dt - timedelta(hours=phase)
+        bucket_hour = (shifted.hour // 8) * 8
+        bucket_start = shifted.replace(
+            hour=bucket_hour, minute=0, second=0, microsecond=0
+        ) + timedelta(hours=phase)
+        buckets.setdefault(bucket_start, []).append((dt, c))
+
+    synthetic = []
+    for bucket_start in sorted(buckets):
+        group = sorted(buckets[bucket_start], key=lambda item: item[0])
+
+        if len(group) != 2:
+            continue
+
+        expected = [
+            bucket_start,
+            bucket_start + timedelta(hours=4),
+        ]
+        if [dt for dt, _ in group] != expected:
+            continue
+
+        parts = [c for _, c in group]
+        synthetic.append({
+            "datetime": bucket_start.strftime("%Y-%m-%d %H:%M:%S"),
+            "open": parts[0]["open"],
+            "high": max(x["high"] for x in parts),
+            "low": min(x["low"] for x in parts),
+            "close": parts[-1]["close"],
+            "_parts": 2,
+            "_source_symbol": parts[0].get("_source_symbol", ""),
+            "_source_label": parts[0].get("_source_label", ""),
+        })
+
+    return synthetic
+
+
 def _aggregate_4h_to_12h(candles_4h):
     """
     Build synthetic 12H candles from 3 consecutive 4H candles.
@@ -6427,6 +6608,24 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
         if len(candles_3h) < 1:
             return None, "Not enough 1H candle history to build completed 3H candles."
         return candles_3h[-outputsize:], None
+
+    if interval == "8h" and grp == "CRYPTO":
+        # Bybit V5 does not provide a native 8H kline.
+        # Build 8H from two consecutive Bybit 4H candles.
+        source_size = max(60, outputsize * 2 + 8)
+        candles_4h, error = get_ohlc(
+            symbol, "4h", outputsize=source_size, grp=grp
+        )
+        if error:
+            return None, error
+
+        candles_8h = _aggregate_4h_to_8h(candles_4h)
+        if len(candles_8h) < 1:
+            return None, (
+                "Not enough Bybit 4H candle history to build completed 8H candles."
+            )
+
+        return candles_8h[-outputsize:], None
 
     if interval == "12h":
         # Fetch enough 4H candles to construct the requested 12H history.
