@@ -514,6 +514,9 @@ h2{font-size:18px}
     display:inline-flex;align-items:center;justify-content:center;
 }
 .price-action-icon{width:24px;height:24px;display:block}
+.price-action-btn.ready-buy{border-color:#35e28a!important;box-shadow:0 0 10px rgba(53,226,138,.75);animation:edoReadyBlink 1s infinite}
+.price-action-btn.ready-sell{border-color:#ff5f73!important;box-shadow:0 0 10px rgba(255,95,115,.75);animation:edoReadyBlink 1s infinite}
+@keyframes edoReadyBlink{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.28;transform:scale(.92)}}
 .trend-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-top:12px}
 .trend-box{background:#12263b;border-radius:12px;padding:10px;text-align:center}
 .trend-tf{font-size:12px;color:#8ca7bf;font-weight:800}
@@ -691,8 +694,9 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <button class="trendbtn">📊 TREND</button>
 </a>
 
-<a class="price-action-link" href="/signal/{{f['id']}}" aria-label="Price Action" title="Price Action">
-<button class="price-action-btn" type="button" aria-label="Price Action">
+{% set pa = price_action_statuses.get(f['symbol'], {}) %}
+<a class="price-action-link" href="/signal/{{f['id']}}" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
+<button class="price-action-btn {{ pa.get('css', '') }}" type="button" aria-label="{{ pa.get('label', 'Price Action — WAIT') }}">
 <svg class="price-action-icon" viewBox="0 0 32 32" role="img" aria-hidden="true">
   <rect x="1.5" y="1.5" width="29" height="29" rx="7" fill="#07111f" stroke="#20c9ff" stroke-width="1.5"/>
   <line x1="6" y1="24" x2="26" y2="24" stroke="#8a6cff" stroke-width="1.5" opacity=".9"/>
@@ -1594,6 +1598,18 @@ def init_db():
             last_closed_date TEXT NOT NULL DEFAULT '',
             updated TEXT,
             PRIMARY KEY(grp, symbol, interval)
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS price_action_status(
+            grp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'WAIT',
+            direction TEXT NOT NULL DEFAULT '',
+            confirmation_date TEXT NOT NULL DEFAULT '',
+            updated TEXT,
+            PRIMARY KEY(grp, symbol)
         )
         """)
 
@@ -5937,6 +5953,35 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     return setups, latest_closed_date, None
 
 
+def save_price_action_status(grp, symbol, setups, latest_closed_date):
+    """Save the newest CLOSED 4H Price Action state for the small HOME icon."""
+    current = [p for p in (setups or []) if p.get("confirmation_date", "") == latest_closed_date]
+    bullish = any(p.get("direction") == "bullish" for p in current)
+    bearish = any(p.get("direction") == "bearish" for p in current)
+
+    if bullish and not bearish:
+        status, direction = "READY", "BUY"
+    elif bearish and not bullish:
+        status, direction = "READY", "SELL"
+    else:
+        status, direction = "WAIT", ""
+
+    with db_conn() as c:
+        c.execute(
+            """
+            INSERT INTO price_action_status(grp,symbol,status,direction,confirmation_date,updated)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(grp,symbol) DO UPDATE SET
+                status=excluded.status,
+                direction=excluded.direction,
+                confirmation_date=excluded.confirmation_date,
+                updated=excluded.updated
+            """,
+            (grp, symbol, status, direction, latest_closed_date or "", datetime.utcnow().isoformat())
+        )
+        c.commit()
+
+
 def pattern_signal_monitor():
     """
     Grow-55 background pattern scheduler.
@@ -6030,6 +6075,8 @@ def pattern_signal_monitor():
             if error:
                 print("pattern monitor error", symbol, interval, error)
             else:
+                if interval == "4h":
+                    save_price_action_status(grp, symbol, setups, latest_closed_date)
                 notify_new_pattern_setups(
                     symbol,
                     interval,
@@ -7145,6 +7192,19 @@ def home():
             favorites = c.execute(
                 'SELECT * FROM favorites ORDER BY grp,symbol'
             ).fetchall()
+
+            pa_rows = c.execute(
+                'SELECT grp,symbol,status,direction,confirmation_date,updated FROM price_action_status'
+            ).fetchall()
+            price_action_statuses = {}
+            for r in pa_rows:
+                if r['status'] == 'READY' and r['direction'] == 'BUY':
+                    price_action_statuses[r['symbol']] = {'css':'ready-buy','label':'Price Action — READY BUY'}
+                elif r['status'] == 'READY' and r['direction'] == 'SELL':
+                    price_action_statuses[r['symbol']] = {'css':'ready-sell','label':'Price Action — READY SELL'}
+                else:
+                    price_action_statuses[r['symbol']] = {'css':'','label':'Price Action — WAIT'}
+
             trailing_stops = c.execute('SELECT * FROM trailing_stops ORDER BY triggered,id DESC').fetchall()
 
             trend_rows = c.execute(
@@ -7193,6 +7253,7 @@ def home():
             markets = _HOME_PAGE_CACHE["markets"]
             favorites = _HOME_PAGE_CACHE["favorites"]
             trailing_stops = []
+            price_action_statuses = {}
             trend_statuses = dict(_HOME_PAGE_CACHE["trend_statuses"])
             trend_since = dict(_HOME_PAGE_CACHE.get("trend_since", {}))
             trend_snapshots = dict(_HOME_PAGE_CACHE["trend_snapshots"])
@@ -7208,6 +7269,7 @@ def home():
         trend_statuses=trend_statuses,
         trend_since=trend_since,
         trend_snapshots=trend_snapshots,
+        price_action_statuses=price_action_statuses,
         news_items=news_items,
         news_configured=news_configured,
         news_feed_status=news_feed_status,
@@ -7395,6 +7457,8 @@ def signal(i):
         if setup_error:
             print("manual pattern notification error", f['symbol'], selected_tf, setup_error)
         else:
+            if selected_tf == "4h":
+                save_price_action_status(f['grp'], f['symbol'], setups, latest_closed_date)
             notify_new_pattern_setups(
                 f['symbol'],
                 selected_tf,
