@@ -695,7 +695,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 </a>
 
 {% set pa = price_action_statuses.get(f['symbol'], {}) %}
-<a class="price-action-link" href="/signal/{{f['id']}}" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
+<a class="price-action-link" href="/signal/{{f['id']}}?tf=4h&ack=1" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
 <button class="price-action-btn {{ pa.get('css', '') }}" type="button" aria-label="{{ pa.get('label', 'Price Action — WAIT') }}">
 <svg class="price-action-icon" viewBox="0 0 32 32" role="img" aria-hidden="true">
   <rect x="1.5" y="1.5" width="29" height="29" rx="7" fill="#07111f" stroke="#20c9ff" stroke-width="1.5"/>
@@ -1608,10 +1608,17 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'WAIT',
             direction TEXT NOT NULL DEFAULT '',
             confirmation_date TEXT NOT NULL DEFAULT '',
+            acknowledged_date TEXT NOT NULL DEFAULT '',
             updated TEXT,
             PRIMARY KEY(grp, symbol)
         )
         """)
+
+        # Migration for existing EdoSignal databases: remember which READY setup Edo has opened.
+        try:
+            c.execute("ALTER TABLE price_action_status ADD COLUMN acknowledged_date TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
 
         c.execute("""
         CREATE TABLE IF NOT EXISTS weekly_spike_notifications(
@@ -5974,10 +5981,29 @@ def save_price_action_status(grp, symbol, setups, latest_closed_date):
             ON CONFLICT(grp,symbol) DO UPDATE SET
                 status=excluded.status,
                 direction=excluded.direction,
+                acknowledged_date=CASE
+                    WHEN price_action_status.confirmation_date = excluded.confirmation_date
+                    THEN price_action_status.acknowledged_date
+                    ELSE ''
+                END,
                 confirmation_date=excluded.confirmation_date,
                 updated=excluded.updated
             """,
             (grp, symbol, status, direction, latest_closed_date or "", datetime.utcnow().isoformat())
+        )
+        c.commit()
+
+
+def acknowledge_price_action(grp, symbol):
+    """Stop HOME icon blinking for the current READY setup after Edo opens it."""
+    with db_conn() as c:
+        c.execute(
+            """
+            UPDATE price_action_status
+            SET acknowledged_date=confirmation_date, updated=?
+            WHERE grp=? AND symbol=? AND status='READY'
+            """,
+            (datetime.utcnow().isoformat(), grp, symbol)
         )
         c.commit()
 
@@ -7194,13 +7220,13 @@ def home():
             ).fetchall()
 
             pa_rows = c.execute(
-                'SELECT grp,symbol,status,direction,confirmation_date,updated FROM price_action_status'
+                'SELECT grp,symbol,status,direction,confirmation_date,acknowledged_date,updated FROM price_action_status'
             ).fetchall()
             price_action_statuses = {}
             for r in pa_rows:
-                if r['status'] == 'READY' and r['direction'] == 'BUY':
+                if r['status'] == 'READY' and r['direction'] == 'BUY' and r['acknowledged_date'] != r['confirmation_date']:
                     price_action_statuses[r['symbol']] = {'css':'ready-buy','label':'Price Action — READY BUY'}
-                elif r['status'] == 'READY' and r['direction'] == 'SELL':
+                elif r['status'] == 'READY' and r['direction'] == 'SELL' and r['acknowledged_date'] != r['confirmation_date']:
                     price_action_statuses[r['symbol']] = {'css':'ready-sell','label':'Price Action — READY SELL'}
                 else:
                     price_action_statuses[r['symbol']] = {'css':'','label':'Price Action — WAIT'}
@@ -7459,6 +7485,8 @@ def signal(i):
         else:
             if selected_tf == "4h":
                 save_price_action_status(f['grp'], f['symbol'], setups, latest_closed_date)
+                if request.args.get('ack') == '1':
+                    acknowledge_price_action(f['grp'], f['symbol'])
             notify_new_pattern_setups(
                 f['symbol'],
                 selected_tf,
