@@ -5839,9 +5839,18 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 f"{direction_word} possibility. Review the chart before trading."
             )
 
+        # HOME Price Action READY alert:
+        # A new CLOSED 4H setup is the event that makes the small HOME icon blink.
+        # Give that event one distinctive Pushover siren ("whoop-whoop") sound.
+        # Duplicate protection in pattern_notifications means the same confirmed
+        # setup cannot make the phone sound repeatedly. Other timeframe pattern
+        # notifications keep the normal Pushover sound.
+        ready_sound = "siren" if interval == "4h" else "cashregister"
+
         send_push(
             f"{icon} {symbol} [{grp}] — {p['name']}",
-            push_body
+            push_body,
+            sound=ready_sound
         )
 
 
