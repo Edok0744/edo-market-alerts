@@ -331,7 +331,7 @@ button{
     .saved-actions{
         width:100%;
         display:grid;
-        grid-template-columns:0.85fr 1.15fr 1.35fr 1fr;
+        grid-template-columns:0.85fr 1.15fr 38px 1fr;
         gap:6px;
     }
     .saved-actions a{
@@ -357,7 +357,7 @@ button{
         grid-template-columns:0.85fr 1.25fr 1fr;
     }
     .forex-actions{
-        grid-template-columns:0.8fr 1.15fr 1.35fr 1fr;
+        grid-template-columns:0.8fr 1.15fr 38px 1fr;
     }
 }
 h1{font-size:27px;margin-bottom:3px}
@@ -506,6 +506,14 @@ h2{font-size:18px}
 }
 .trendbtn{background:#5dade2;color:#07111f}
 .livebtn{background:#f2c94c;color:#07111f}
+.price-action-link{display:inline-flex;align-items:center;justify-content:center}
+.price-action-btn{
+    width:32px!important;height:32px!important;min-width:32px!important;
+    padding:0!important;border-radius:9px!important;background:#07111f!important;
+    border:1px solid #20c9ff!important;box-shadow:0 0 7px rgba(32,201,255,.25);
+    display:inline-flex;align-items:center;justify-content:center;
+}
+.price-action-icon{width:24px;height:24px;display:block}
 .trend-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-top:12px}
 .trend-box{background:#12263b;border-radius:12px;padding:10px;text-align:center}
 .trend-tf{font-size:12px;color:#8ca7bf;font-weight:800}
@@ -683,8 +691,19 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <button class="trendbtn">📊 TREND</button>
 </a>
 
-<a href="/signal/{{f['id']}}">
-<button class="livebtn">⚡ SIGNAL</button>
+<a class="price-action-link" href="/signal/{{f['id']}}" aria-label="Price Action" title="Price Action">
+<button class="price-action-btn" type="button" aria-label="Price Action">
+<svg class="price-action-icon" viewBox="0 0 32 32" role="img" aria-hidden="true">
+  <rect x="1.5" y="1.5" width="29" height="29" rx="7" fill="#07111f" stroke="#20c9ff" stroke-width="1.5"/>
+  <line x1="6" y1="24" x2="26" y2="24" stroke="#8a6cff" stroke-width="1.5" opacity=".9"/>
+  <line x1="10" y1="8" x2="10" y2="22" stroke="#35e28a" stroke-width="1.5"/>
+  <rect x="7.5" y="12" width="5" height="7" rx="1" fill="#35e28a"/>
+  <line x1="17" y1="7" x2="17" y2="21" stroke="#ff5f73" stroke-width="1.5"/>
+  <rect x="14.5" y="10" width="5" height="7" rx="1" fill="#ff5f73"/>
+  <line x1="24" y1="11" x2="24" y2="25" stroke="#35e28a" stroke-width="1.5"/>
+  <rect x="21.5" y="15" width="5" height="6" rx="1" fill="#35e28a"/>
+</svg>
+</button>
 </a>
 
 <a href="/favorite/delete/{{f['id']}}">
@@ -1241,7 +1260,7 @@ SIGNAL_HTML = r"""
 <html>
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{ symbol }} Pattern Signal - Edo Market Alerts</title>
+<title>{{ symbol }} Price Action - Edo Market Alerts</title>
 <style>
 body{
     font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
@@ -1350,8 +1369,8 @@ a{text-decoration:none}
 </head>
 <body>
 <div class="wrap">
-    <h1>⚡ {{ symbol }} EDO SETUP SIGNAL</h1>
-    <div class="small">{{ group }} • Your price-action method • Trend Pullback: 4H / 8H / 1D • consecutive adjacent 2+ candles • clean retracement required • S/R Gap-Retest: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
+    <h1>📊 {{ symbol }} PRICE ACTION</h1>
+    <div class="small">{{ group }} • Price Action status • Trend Pullback: 4H / 8H / 1D • consecutive adjacent 2+ candles • clean retracement required • S/R Gap-Retest: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
 
     <div class="tfrow">
         {% for tf in timeframes %}
@@ -1440,7 +1459,7 @@ a{text-decoration:none}
         <div class="small" style="margin-top:12px">
             Updated: {{ updated }}. The headline refers ONLY to the newest fully closed candle.
             If no new setup triggered on that candle, the older valid pattern below is labelled
-            historical. The scanner uses closed candles only and does not place trades.
+            historical. WAIT changes to READY TO REVIEW only after a valid confirmation candle is fully closed. The scanner does not place trades.
         </div>
     {% endif %}
     </div>
@@ -5388,23 +5407,23 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     bearish = [p for p in current_patterns if p["direction"] == "bearish"]
 
     if bullish and not bearish:
-        signal = "NEW BULLISH SETUP TRIGGERED"
+        signal = "READY TO REVIEW — BUY"
         icon, css = "🟢", "buy"
-        summary = "The newest fully CLOSED candle completed a valid bullish Edo pattern."
+        summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bullish Edo setup. No forming candle can make this READY."
     elif bearish and not bullish:
-        signal = "NEW BEARISH SETUP TRIGGERED"
+        signal = "READY TO REVIEW — SELL"
         icon, css = "🔴", "sell"
-        summary = "The newest fully CLOSED candle completed a valid bearish Edo pattern."
+        summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bearish Edo setup. No forming candle can make this READY."
     elif bullish and bearish:
-        signal = "NEW MIXED SETUPS"
+        signal = "WAIT — MIXED PRICE ACTION"
         icon, css = "🟡", "wait"
         summary = (
             "The newest fully CLOSED candle produced conflicting valid setup evidence. "
             "Review the naked chart before trading."
         )
     else:
-        signal = "NO NEW SETUP ON LATEST CLOSED CANDLE"
-        icon, css = "⚪", "neutral"
+        signal = "WAIT"
+        icon, css = "🟡", "wait"
         if found:
             summary = (
                 "No pattern triggered on the newest fully closed candle. "
