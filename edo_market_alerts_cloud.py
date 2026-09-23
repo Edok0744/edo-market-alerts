@@ -2746,7 +2746,7 @@ def cached_home_news(limit=6):
 
 
 
-def send_push(title, msg, sound='cashregister'):
+def send_push(title, msg, sound='cashregister', priority=0):
 
     if not PUSHOVER_APP_TOKEN or not PUSHOVER_USER_KEY:
         print('Pushover not configured:', title, msg)
@@ -2760,7 +2760,8 @@ def send_push(title, msg, sound='cashregister'):
                 'user': PUSHOVER_USER_KEY,
                 'title': title,
                 'message': msg,
-                'sound': sound
+                'sound': sound,
+                'priority': int(priority)
             },
             timeout=10
         )
@@ -5846,11 +5847,13 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         # setup cannot make the phone sound repeatedly. Other timeframe pattern
         # notifications keep the normal Pushover sound.
         ready_sound = "siren" if interval == "4h" else "cashregister"
+        ready_priority = 1 if interval == "4h" else 0
 
         send_push(
             f"{icon} {symbol} [{grp}] — {p['name']}",
             push_body,
-            sound=ready_sound
+            sound=ready_sound,
+            priority=ready_priority
         )
 
 
