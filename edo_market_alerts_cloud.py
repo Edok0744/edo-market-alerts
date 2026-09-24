@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, render_template_string, redirect, send_from_directory
 import requests
+from forexconnect import ForexConnect
 
 APP = Flask(__name__)
 
