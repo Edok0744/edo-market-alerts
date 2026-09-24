@@ -1396,7 +1396,7 @@ a{text-decoration:none}
             <div>
                 <div class="small">Latest FULLY CLOSED candle</div>
                 <div class="pricebig">{{ price }}</div>
-                <div class="small">{{ latest_closed_date }} UTC</div>
+                <div class="small">{{ latest_closed_perth }}</div>
                 {% if market_source %}
                 <div class="small">Data source: {{ market_source }}</div>
                 {% endif %}
@@ -4685,6 +4685,22 @@ def apply_edo_8h_daily_context_rule(candles, interval, setups):
     return out
 
 
+def format_signal_time_perth(value):
+    """Display a stored UTC candle timestamp in Perth local time (AWST)."""
+    if not value:
+        return ""
+    try:
+        raw = str(value).strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo("Australia/Perth")).strftime("%d %b %Y • %H:%M Perth")
+    except Exception:
+        return str(value)
+
+
 def describe_setup(p, interval=None):
     bullish = p["direction"] == "bullish"
     icon = "🟢" if bullish else "🔴"
@@ -4694,7 +4710,7 @@ def describe_setup(p, interval=None):
     if p["name"] == "S/R GAP RETEST SETUP":
         weak_text = " Weakness was also detected in the retest candles." if p["weak_retest"] else ""
         detail = (
-            f"{direction_word} S/R Gap-Retest confirmation on {p['confirmation_date']}. "
+            f"{direction_word} S/R Gap-Retest confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
             f"Price first established a wick-defined support/resistance zone, moved clearly away, "
             f"then returned to RETEST the same zone after {p['separation']} candles. "
             f"The second touch retraced {p.get('retest_depth_pct', 0):.0f}% back toward the original S/R level "
@@ -4704,8 +4720,8 @@ def describe_setup(p, interval=None):
 
         level_text = (
             f"Established retest zone: {p['level']:.5f} • "
-            f"Earlier wick level: {p['old_level']:.5f} on {p['old_date']} • "
-            f"Second {p['level_source']} test: {p['retest_price']:.5f} on {p['retest_date']} • "
+            f"Earlier wick level: {p['old_level']:.5f} on {format_signal_time_perth(p['old_date'])} • "
+            f"Second {p['level_source']} test: {p['retest_price']:.5f} on {format_signal_time_perth(p['retest_date'])} • "
             f"Confirmation close: {p['confirmation_close']:.5f}"
         )
         if p.get("target1") is not None:
@@ -4737,7 +4753,7 @@ def describe_setup(p, interval=None):
         )
 
     elif p["name"] == "TREND PULLBACK SETUP":
-        run_dates = ", ".join(p.get("run_dates", []))
+        run_dates = ", ".join(format_signal_time_perth(x) for x in p.get("run_dates", []))
         htf_text = ""
         if p.get("higher_tf_filter"):
             htf = p.get("higher_tf_states", {})
@@ -4747,7 +4763,7 @@ def describe_setup(p, interval=None):
             )
 
         detail = (
-            f"{direction_word} trend-pullback confirmation on {p['confirmation_date']}. "
+            f"{direction_word} trend-pullback confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
             f"{p['run_count']} {p['run_colour']} CLOSED candles pulled against the larger "
             f"{p['trend']} price structure, then the opposite-colour confirmation candle "
             f"fully CLOSED. No minimum body-penetration percentage is required. "
@@ -4758,7 +4774,7 @@ def describe_setup(p, interval=None):
 
     else:
         detail = (
-            f"{direction_word} range-reversal confirmation on {p['confirmation_date']}. "
+            f"{direction_word} range-reversal confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
             f"{p['run_count']} {p['run_colour']} CLOSED candles moved in one direction "
             f"while local structure was mixed/range-bound, then the confirmation candle "
             f"closed {p['penetration']:.0f}% back through the previous candle body."
@@ -5576,7 +5592,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             for p in rejected_room_setups[:3]
             if p.get("rejection_reason")
         ],
-        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated": datetime.now(ZoneInfo("Australia/Perth")).strftime("%d %b %Y • %H:%M Perth"),
     }
 
     PATTERN_SIGNAL_CACHE[cache_key] = {"saved_at": now, "data": data}
@@ -5892,7 +5908,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 target_lines += f" Take Profit: {p['take_profit']:.5f} ({src})."
             push_body = (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
-                f"({confirmation_date}). "
+                f"({format_signal_time_perth(confirmation_date)}). "
                 f"Established {zone_word} on the left, price moved clearly away, "
                 f"then returned after separation to retest the same zone. "
                 f"Second-touch depth: {p.get('retest_depth_pct', 0):.0f}% back toward the original level. "
@@ -5914,7 +5930,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
             push_body = (
                 f"TREND PULLBACK SETUP confirmed on the NEWEST CLOSED {tf_label} candle "
-                f"({confirmation_date}). "
+                f"({format_signal_time_perth(confirmation_date)}). "
                 f"{market_text}"
                 f"{run_count} {pullback_colour} CLOSED candles pulled against that direction, "
                 f"then the opposite-colour {confirmation_colour} confirmation candle fully CLOSED. "
@@ -5924,7 +5940,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         else:
             push_body = (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
-                f"({confirmation_date}). "
+                f"({format_signal_time_perth(confirmation_date)}). "
                 f"{trend_line}"
                 f"{direction_word} possibility. Review the chart before trading."
             )
@@ -7611,6 +7627,7 @@ def signal(i):
             selected_label=allowed[selected_tf],
             price='—',
             latest_closed_date='—',
+            latest_closed_perth='—',
             market_source='',
             weekly_spike=None,
             signal='',
@@ -7632,6 +7649,7 @@ def signal(i):
         selected_label=allowed[selected_tf],
         price=f"{data['price']:.5f}",
         latest_closed_date=data.get('latest_closed_date', ''),
+        latest_closed_perth=format_signal_time_perth(data.get('latest_closed_date', '')),
         market_source=data.get('market_source', ''),
         weekly_spike=data.get('weekly_spike'),
         signal=data['signal'],
