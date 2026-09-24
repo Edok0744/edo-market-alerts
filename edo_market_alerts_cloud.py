@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, render_template_string, redirect, send_from_directory
 import requests
-from forexconnect import ForexConnect
 
 APP = Flask(__name__)
 
@@ -16,10 +15,7 @@ def apple_touch_icon():
 PROCESS_STARTED_UTC = datetime.now(timezone.utc)
 
 DB = os.environ.get('EDO_DB', 'edo_market_alerts.db')
-FXCM_USERNAME = os.environ.get("FXCM_USERNAME")
-FXCM_PASSWORD = os.environ.get("FXCM_PASSWORD")
-FXCM_CONNECTION = os.environ.get("FXCM_CONNECTION", "Real")
-FXCM_URL = os.environ.get("FXCM_URL", "http://www.fxcorporate.com/Hosts.jsp")
+FXCM_SERVICE_URL = os.environ.get("FXCM_SERVICE_URL", "").rstrip("/")
 TWELVE_KEY = os.environ.get('TWELVE_DATA_API_KEY', '')
 PUSHOVER_APP_TOKEN = os.environ.get('PUSHOVER_APP_TOKEN', '')
 PUSHOVER_USER_KEY = os.environ.get('PUSHOVER_USER_KEY', '')
@@ -2917,67 +2913,61 @@ SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
 # Alias retained for older helper code.
 CORE_PATTERN_INTERVALS = SR_GAP_RETEST_INTERVALS
 
-def fxcm_get_ohlc(symbol, interval, outputsize=140):
-    """Get real FXCM candles directly through ForexConnect."""
 
-    if not FXCM_USERNAME or not FXCM_PASSWORD:
-        return None, "FXCM credentials are not configured."
+
+def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
+    """Read FXCM Bid candles from EdoSignal's private Railway FXCM service."""
+    if not FXCM_SERVICE_URL:
+        return None, "FXCM service URL is not configured."
 
     timeframe_map = {
         "4h": "H4",
         "8h": "H8",
         "12h": "H12",
         "1day": "D1",
-        "1week": "W1",
     }
-
-    fxcm_timeframe = timeframe_map.get(interval.lower())
-    if not fxcm_timeframe:
-        return None, f"Unsupported FXCM timeframe: {interval}"
-
-    fx = ForexConnect()
+    tf = timeframe_map.get(str(interval).lower())
+    if not tf:
+        return None, f"FXCM service does not provide {interval}."
 
     try:
-        fx.login(
-            FXCM_USERNAME,
-            FXCM_PASSWORD,
-            FXCM_URL,
-            FXCM_CONNECTION
+        r = requests.get(
+            FXCM_SERVICE_URL + "/candles",
+            params={
+                "symbol": symbol,
+                "timeframe": tf,
+                "count": max(10, min(int(outputsize), 500)),
+            },
+            timeout=20
         )
+        r.raise_for_status()
+        payload = r.json()
 
-        timeframe = fx.timeframe_collection.get(fxcm_timeframe)
-
-        history = fx.get_history(
-            symbol,
-            timeframe,
-            datetime.now() - timedelta(days=120),
-            datetime.now()
-        )
+        if not payload.get("ok"):
+            return None, "FXCM service error: " + str(payload.get("error", "Unknown error"))
 
         candles = []
-
-        for row in history[-outputsize:]:
+        for row in payload.get("rows") or []:
             candles.append({
-                "datetime": str(row["Date"]),
-                "open": float(row["BidOpen"]),
-                "high": float(row["BidHigh"]),
-                "low": float(row["BidLow"]),
-                "close": float(row["BidClose"]),
+                "datetime": str(row.get("datetime", "")),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
                 "_source_symbol": symbol,
-                "_source_label": f"FXCM {symbol}",
+                "_source_label": "FXCM Bid",
             })
 
-        return candles, None
+        candles.sort(key=lambda x: x["datetime"])
+        if not candles:
+            return None, "FXCM service returned no candles."
+        return candles[-outputsize:], None
 
     except Exception as e:
-        print("FXCM OHLC error:", symbol, interval, e)
-        return None, f"FXCM error: {e}"
+        print("FXCM service OHLC error:", symbol, interval, e)
+        return None, f"FXCM service error: {e}"
 
-    finally:
-        try:
-            fx.logout()
-        except Exception:
-            pass
+
 def get_ohlc(symbol, interval, outputsize=140, grp=None):
     """Download OHLC oldest -> newest. Crypto uses Bybit; Forex/CFD keep Twelve Data."""
     cache_key = (grp or "", symbol.upper().strip(), interval)
@@ -2988,25 +2978,22 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
         cached = _OHLC_CACHE.get(cache_key)
         if cached and now - cached["saved_at"] < ttl and len(cached["candles"]) >= outputsize:
             return cached["candles"][-outputsize:], None
-    # FOREX uses real FXCM candles through ForexConnect.
-    if grp == "FOREX":
-        fxcm_candles, fxcm_error = fxcm_get_ohlc(
-            symbol,
-            interval,
-            outputsize
-        )
 
+    # FOREX: use the real FXCM Bid candle feed from the private Railway service.
+    # Weekly remains reference-only and keeps the existing source because the
+    # FXCM helper service currently exposes H4/H8/H12/D1.
+    if grp == "FOREX" and interval in {"4h", "8h", "12h", "1day"}:
+        fxcm_candles, fxcm_error = fxcm_service_get_ohlc(symbol, interval, outputsize)
         if fxcm_candles:
             with _CACHE_LOCK:
                 _OHLC_CACHE[cache_key] = {
                     "saved_at": now,
                     "candles": fxcm_candles
                 }
-
-            print("FOREX market source", symbol, "-> FXCM ForexConnect")
+            print("FOREX market source", symbol, "-> FXCM private service")
             return fxcm_candles[-outputsize:], None
-
         return None, fxcm_error
+
     # Crypto uses the same Bybit USDT perpetual market Edo trades.
     # The newest raw candle may still be forming. Signal logic continues to
     # pass through fully_closed_candles(), so a live candle cannot trigger.
@@ -6865,6 +6852,9 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
             )
 
         return candles_8h[-outputsize:], None
+
+    if interval == "12h" and grp == "FOREX":
+        return get_ohlc(symbol, "12h", outputsize=outputsize, grp=grp)
 
     if interval == "12h":
         # Fetch enough 4H candles to construct the requested 12H history.
