@@ -3,8 +3,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, render_template_string, redirect, send_from_directory
 import requests
-from forexconnect import ForexConnect
-from forexconnect import Common
+
 APP = Flask(__name__)
 
 @APP.route('/apple-touch-icon.png')
