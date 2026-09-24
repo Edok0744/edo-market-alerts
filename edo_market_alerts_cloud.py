@@ -1296,6 +1296,7 @@ a{text-decoration:none}
 .sell{color:#ff6b7d}
 .wait{color:#f2c94c}
 .neutral{color:#8ca7bf}
+.entry4h{color:#aeb8c2}
 .error{color:#ff8a96;font-weight:800}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .tfrow{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
@@ -4684,7 +4685,7 @@ def apply_edo_8h_daily_context_rule(candles, interval, setups):
     return out
 
 
-def describe_setup(p):
+def describe_setup(p, interval=None):
     bullish = p["direction"] == "bullish"
     icon = "🟢" if bullish else "🔴"
     css = "buy" if bullish else "sell"
@@ -4765,8 +4766,16 @@ def describe_setup(p):
 
         level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
 
+    # Visual-only distinction: Edo uses 4H Trend Pullback mainly as an entry/re-entry
+    # inside the larger trend. Detection rules are unchanged.
+    display_name = p["name"]
+    if interval == "4h" and p["name"] == "TREND PULLBACK SETUP":
+        display_name = "4H PULLBACK ENTRY"
+        icon = "⚪"
+        css = "entry4h"
+
     return {
-        "name": p["name"],
+        "name": display_name,
         "detail": detail,
         "level_text": level_text,
         "icon": icon,
@@ -5501,13 +5510,23 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     bearish = [p for p in current_patterns if p["direction"] == "bearish"]
 
     if bullish and not bearish:
-        signal = "READY TO REVIEW — BUY"
-        icon, css = "🟢", "buy"
-        summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bullish Edo setup. No forming candle can make this READY."
+        if interval == "4h":
+            signal = "4H PULLBACK ENTRY — BUY"
+            icon, css = "⚪", "entry4h"
+            summary = "4H entry/re-entry indication inside the larger trend. The existing Trend Pullback detection rules are unchanged, and only a fully CLOSED candle can trigger it."
+        else:
+            signal = "READY TO REVIEW — BUY"
+            icon, css = "🟢", "buy"
+            summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bullish Edo setup. No forming candle can make this READY."
     elif bearish and not bullish:
-        signal = "READY TO REVIEW — SELL"
-        icon, css = "🔴", "sell"
-        summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bearish Edo setup. No forming candle can make this READY."
+        if interval == "4h":
+            signal = "4H PULLBACK ENTRY — SELL"
+            icon, css = "⚪", "entry4h"
+            summary = "4H entry/re-entry indication inside the larger trend. The existing Trend Pullback detection rules are unchanged, and only a fully CLOSED candle can trigger it."
+        else:
+            signal = "READY TO REVIEW — SELL"
+            icon, css = "🔴", "sell"
+            summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bearish Edo setup. No forming candle can make this READY."
     elif bullish and bearish:
         signal = "WAIT — MIXED PRICE ACTION"
         icon, css = "🟡", "wait"
@@ -5551,7 +5570,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         "signal_icon": icon,
         "signal_css": css,
         "summary": summary,
-        "patterns": [describe_setup(p) for p in found[:4]],
+        "patterns": [describe_setup(p, interval) for p in found[:4]],
         "rejected_setups": [
             p.get("rejection_reason", "")
             for p in rejected_room_setups[:3]
