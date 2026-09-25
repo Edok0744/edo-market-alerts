@@ -6415,13 +6415,28 @@ def build_full_alignment(symbol, grp=None):
         if err:
             return "", err
 
-        closed = last_closed_candle(candles, interval)
+        # CFD Daily feeds can timestamp the live session candle with the
+        # session/trading date rather than a simple UTC 24-hour boundary.
+        # While the CFD market is open, timestamp + 24h can therefore make the
+        # newest Daily candle look closed even though the broker chart still
+        # shows it forming.  For CFD Daily trend alignment, deliberately use
+        # the previous returned Daily candle. This is the conservative rule:
+        # a live Daily candle can never create FULL BULLISH / FULL BEARISH.
+        if is_cfd and interval == "1day":
+            closed = candles[-2] if candles and len(candles) >= 2 else None
+        else:
+            closed = last_closed_candle(candles, interval)
+
         if closed is None:
             return "", f"Not enough completed {label} candle data."
 
-        if not closed_candle_is_fresh(closed, interval, now_utc=now_utc):
-            stamp = closed.get("datetime", "unknown")
-            return "", f"Waiting for fresh completed {label} candle data (latest {stamp})."
+        # The generic freshness test assumes fixed UTC interval boundaries.
+        # Do not apply it to CFD Daily because its session boundary is broker/
+        # exchange based; the explicit previous-candle rule above is safer.
+        if not (is_cfd and interval == "1day"):
+            if not closed_candle_is_fresh(closed, interval, now_utc=now_utc):
+                stamp = closed.get("datetime", "unknown")
+                return "", f"Waiting for fresh completed {label} candle data (latest {stamp})."
 
         signal_states[label] = analyse_candle(closed)
 
