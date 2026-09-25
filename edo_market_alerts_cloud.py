@@ -4327,45 +4327,7 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     if not clean_ok:
         return None
 
-    # Targeted Trend Pullback correction:
-    # A pullback is valid only when a genuine swing-structure trend already
-    # existed BEFORE the retracement began, and the retracement itself did not
-    # break the last protected swing of that trend. This prevents a strong
-    # counter-trend move (for example, a long red selloff) from being relabelled
-    # as a bullish pullback merely because older price action had risen.
-    structure_start = max(0, run_start - 40)
-    pre_pullback = candles[structure_start:run_start]
-    pre_highs = swing_points(pre_pullback, "high")
-    pre_lows = swing_points(pre_pullback, "low")
-
-    bullish_structure = (
-        len(pre_highs) >= 2 and len(pre_lows) >= 2
-        and float(pre_highs[-1][1]) > float(pre_highs[-2][1])
-        and float(pre_lows[-1][1]) > float(pre_lows[-2][1])
-    )
-    bearish_structure = (
-        len(pre_highs) >= 2 and len(pre_lows) >= 2
-        and float(pre_highs[-1][1]) < float(pre_highs[-2][1])
-        and float(pre_lows[-1][1]) < float(pre_lows[-2][1])
-    )
-
-    if required_trend == "bullish":
-        if not bullish_structure:
-            return None
-        protected_swing = float(pre_lows[-1][1])
-        pullback_extreme = min(float(c["low"]) for c in candles[run_start:i])
-        if pullback_extreme <= protected_swing:
-            return None
-        trend = "bullish"
-    else:
-        if not bearish_structure:
-            return None
-        protected_swing = float(pre_highs[-1][1])
-        pullback_extreme = max(float(c["high"]) for c in candles[run_start:i])
-        if pullback_extreme >= protected_swing:
-            return None
-        trend = "bearish"
-
+    trend = local_structure_trend(candles, run_start)
     if require_local_trend and trend != required_trend:
         return None
 
@@ -5457,9 +5419,11 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    NO 50% rule applies to this signal.
     #
     #    Every normal pullback must be a clean retracement against an established
-    #    local trend and be at/near meaningful S/R.
-    #    4H additionally must align with the larger 8H trend (Daily fallback only
-    #    when 8H is structurally unclear), because 4H is Edo's entry/re-entry tool.
+    #    local trend.
+    #    4H is Edo's entry/re-entry tool: it does NOT require S/R proximity,
+    #    but it MUST align with the larger 8H trend (Daily fallback only when
+    #    8H is structurally unclear).
+    #    8H / Daily / Weekly Trend Pullbacks still require meaningful S/R.
     if interval in NORMAL_PULLBACK_INTERVALS:
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
@@ -5471,13 +5435,15 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             if not pullback:
                 continue
 
-            # Edo S/R location rule for every normal pullback timeframe.
-            # 4H still has its separate higher-timeframe trend-direction filter.
-            near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
-                closed_candles, pullback, interval
-            )
-            if not near_sr:
-                continue
+            # Edo rule:
+            # 4H is the entry/re-entry pullback and S/R is context only, not a blocker.
+            # 8H / Daily / Weekly still require meaningful pre-existing S/R.
+            if interval != "4h":
+                near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
+                    closed_candles, pullback, interval
+                )
+                if not near_sr:
+                    continue
 
             found.append(pullback)
 
@@ -5524,10 +5490,10 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         found = []
 
     # Edo rule:
-    #   All Trend Pullbacks -> established local trend + clean 2+ candle retracement
-    #   + meaningful pre-existing S/R.
-    #   4H additionally -> higher-timeframe direction (8H first, Daily fallback).
-    #   8H / Daily do not use that extra 4H higher-timeframe filter.
+    #   All Trend Pullbacks -> established local trend + clean 2+ candle retracement.
+    #   4H -> higher-timeframe direction (8H first, Daily fallback); S/R is context
+    #   only and does not block the entry/re-entry signal.
+    #   8H / Daily / Weekly -> meaningful pre-existing S/R remains mandatory.
     higher_tf_states = None
     if interval == "4h":
         normal_found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
@@ -6023,8 +5989,9 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     found = []
 
     # A) NORMAL Trend Pullback — 4H, 8H, Daily and Weekly, NO 50% rule.
-    #    4H needs higher-timeframe trend alignment AND meaningful S/R.
-    #    8H / Daily / Weekly must also be at/near meaningful S/R.
+    #    4H is the entry/re-entry signal: higher-timeframe trend alignment is
+    #    required, but S/R proximity is NOT a mandatory blocker.
+    #    8H / Daily / Weekly must still be at/near meaningful S/R.
     if interval in NORMAL_PULLBACK_INTERVALS:
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
@@ -6036,13 +6003,15 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             if not pullback:
                 continue
 
-            # Edo S/R location rule for every normal pullback timeframe.
-            # 4H still has its separate higher-timeframe trend-direction filter.
-            near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
-                closed_candles, pullback, interval
-            )
-            if not near_sr:
-                continue
+            # Edo rule:
+            # 4H is the entry/re-entry pullback and S/R is context only, not a blocker.
+            # 8H / Daily / Weekly still require meaningful pre-existing S/R.
+            if interval != "4h":
+                near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
+                    closed_candles, pullback, interval
+                )
+                if not near_sr:
+                    continue
 
             found.append(pullback)
 
@@ -6085,7 +6054,8 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         setups = []
 
     # Edo rule:
-    #   4H Trend Pullback -> meaningful pre-existing S/R AND higher-timeframe direction (8H first, Daily fallback).
+    #   4H Trend Pullback -> higher-timeframe direction (8H first, Daily fallback).
+    #   S/R is useful context on 4H but is NOT a mandatory blocker.
     #   8H / Daily / Weekly Trend Pullback -> must be near meaningful S/R and do
     #   not use the 4H higher-timeframe alignment requirement.
     # The separate S/R Gap-Retest setup remains independent.
@@ -6415,28 +6385,13 @@ def build_full_alignment(symbol, grp=None):
         if err:
             return "", err
 
-        # CFD Daily feeds can timestamp the live session candle with the
-        # session/trading date rather than a simple UTC 24-hour boundary.
-        # While the CFD market is open, timestamp + 24h can therefore make the
-        # newest Daily candle look closed even though the broker chart still
-        # shows it forming.  For CFD Daily trend alignment, deliberately use
-        # the previous returned Daily candle. This is the conservative rule:
-        # a live Daily candle can never create FULL BULLISH / FULL BEARISH.
-        if is_cfd and interval == "1day":
-            closed = candles[-2] if candles and len(candles) >= 2 else None
-        else:
-            closed = last_closed_candle(candles, interval)
-
+        closed = last_closed_candle(candles, interval)
         if closed is None:
             return "", f"Not enough completed {label} candle data."
 
-        # The generic freshness test assumes fixed UTC interval boundaries.
-        # Do not apply it to CFD Daily because its session boundary is broker/
-        # exchange based; the explicit previous-candle rule above is safer.
-        if not (is_cfd and interval == "1day"):
-            if not closed_candle_is_fresh(closed, interval, now_utc=now_utc):
-                stamp = closed.get("datetime", "unknown")
-                return "", f"Waiting for fresh completed {label} candle data (latest {stamp})."
+        if not closed_candle_is_fresh(closed, interval, now_utc=now_utc):
+            stamp = closed.get("datetime", "unknown")
+            return "", f"Waiting for fresh completed {label} candle data (latest {stamp})."
 
         signal_states[label] = analyse_candle(closed)
 
