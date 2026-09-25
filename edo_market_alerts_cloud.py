@@ -651,7 +651,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
             Press Refresh again shortly.
         </div>
         {% else %}
-        <div class="small">✅ No more High-Impact news today for your saved markets.</div>
+        <div class="small">✅ News feed working — No qualifying High-Impact news currently.</div>
         {% endif %}
     {% endif %}
 {% else %}
@@ -2039,12 +2039,11 @@ def refresh_economic_news():
                 fetched,
             ))
 
-        # Never erase a good cache because of a temporary empty/bad feed.
-        if not rows:
-            error = "Forex Factory returned no usable upcoming High-impact rows; existing cache kept."
-            _save_news_feed_status(False, error, source_url)
-            return False, error
-
+        # The Forex Factory feed itself was successfully downloaded and parsed.
+        # Zero rows here is NOT a feed failure: it simply means there are no
+        # upcoming events that pass Edo's stricter major-news keyword filter.
+        # Clear the old cache so HOME does not keep stale events, and record
+        # the feed as healthy.
         with db_conn() as c:
             c.execute("DELETE FROM economic_news")
             c.executemany(
