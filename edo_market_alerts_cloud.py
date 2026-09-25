@@ -4327,7 +4327,45 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     if not clean_ok:
         return None
 
-    trend = local_structure_trend(candles, run_start)
+    # Targeted Trend Pullback correction:
+    # A pullback is valid only when a genuine swing-structure trend already
+    # existed BEFORE the retracement began, and the retracement itself did not
+    # break the last protected swing of that trend. This prevents a strong
+    # counter-trend move (for example, a long red selloff) from being relabelled
+    # as a bullish pullback merely because older price action had risen.
+    structure_start = max(0, run_start - 40)
+    pre_pullback = candles[structure_start:run_start]
+    pre_highs = swing_points(pre_pullback, "high")
+    pre_lows = swing_points(pre_pullback, "low")
+
+    bullish_structure = (
+        len(pre_highs) >= 2 and len(pre_lows) >= 2
+        and float(pre_highs[-1][1]) > float(pre_highs[-2][1])
+        and float(pre_lows[-1][1]) > float(pre_lows[-2][1])
+    )
+    bearish_structure = (
+        len(pre_highs) >= 2 and len(pre_lows) >= 2
+        and float(pre_highs[-1][1]) < float(pre_highs[-2][1])
+        and float(pre_lows[-1][1]) < float(pre_lows[-2][1])
+    )
+
+    if required_trend == "bullish":
+        if not bullish_structure:
+            return None
+        protected_swing = float(pre_lows[-1][1])
+        pullback_extreme = min(float(c["low"]) for c in candles[run_start:i])
+        if pullback_extreme <= protected_swing:
+            return None
+        trend = "bullish"
+    else:
+        if not bearish_structure:
+            return None
+        protected_swing = float(pre_highs[-1][1])
+        pullback_extreme = max(float(c["high"]) for c in candles[run_start:i])
+        if pullback_extreme >= protected_swing:
+            return None
+        trend = "bearish"
+
     if require_local_trend and trend != required_trend:
         return None
 
