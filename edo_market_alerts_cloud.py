@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, render_template_string, redirect, send_from_directory
 import requests
-from forexconnect import ForexConnect
 
 APP = Flask(__name__)
 
@@ -16,10 +15,7 @@ def apple_touch_icon():
 PROCESS_STARTED_UTC = datetime.now(timezone.utc)
 
 DB = os.environ.get('EDO_DB', 'edo_market_alerts.db')
-FXCM_USERNAME = os.environ.get("FXCM_USERNAME")
-FXCM_PASSWORD = os.environ.get("FXCM_PASSWORD")
-FXCM_CONNECTION = os.environ.get("FXCM_CONNECTION", "Real")
-FXCM_URL = os.environ.get("FXCM_URL", "http://www.fxcorporate.com/Hosts.jsp")
+FXCM_SERVICE_URL = os.environ.get("FXCM_SERVICE_URL", "").rstrip("/")
 TWELVE_KEY = os.environ.get('TWELVE_DATA_API_KEY', '')
 PUSHOVER_APP_TOKEN = os.environ.get('PUSHOVER_APP_TOKEN', '')
 PUSHOVER_USER_KEY = os.environ.get('PUSHOVER_USER_KEY', '')
@@ -655,7 +651,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
             Press Refresh again shortly.
         </div>
         {% else %}
-        <div class="small">✅ No more High-Impact news today for your saved markets.</div>
+        <div class="small">✅ News feed working — No qualifying High-Impact news currently.</div>
         {% endif %}
     {% endif %}
 {% else %}
@@ -1300,6 +1296,7 @@ a{text-decoration:none}
 .sell{color:#ff6b7d}
 .wait{color:#f2c94c}
 .neutral{color:#8ca7bf}
+.entry4h{color:#aeb8c2}
 .error{color:#ff8a96;font-weight:800}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .tfrow{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
@@ -1399,7 +1396,7 @@ a{text-decoration:none}
             <div>
                 <div class="small">Latest FULLY CLOSED candle</div>
                 <div class="pricebig">{{ price }}</div>
-                <div class="small">{{ latest_closed_date }} UTC</div>
+                <div class="small">{{ latest_closed_perth }}</div>
                 {% if market_source %}
                 <div class="small">Data source: {{ market_source }}</div>
                 {% endif %}
@@ -2042,12 +2039,11 @@ def refresh_economic_news():
                 fetched,
             ))
 
-        # Never erase a good cache because of a temporary empty/bad feed.
-        if not rows:
-            error = "Forex Factory returned no usable upcoming High-impact rows; existing cache kept."
-            _save_news_feed_status(False, error, source_url)
-            return False, error
-
+        # The Forex Factory feed itself was successfully downloaded and parsed.
+        # Zero rows here is NOT a feed failure: it simply means there are no
+        # upcoming events that pass Edo's stricter major-news keyword filter.
+        # Clear the old cache so HOME does not keep stale events, and record
+        # the feed as healthy.
         with db_conn() as c:
             c.execute("DELETE FROM economic_news")
             c.executemany(
@@ -2917,67 +2913,61 @@ SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
 # Alias retained for older helper code.
 CORE_PATTERN_INTERVALS = SR_GAP_RETEST_INTERVALS
 
-def fxcm_get_ohlc(symbol, interval, outputsize=140):
-    """Get real FXCM candles directly through ForexConnect."""
 
-    if not FXCM_USERNAME or not FXCM_PASSWORD:
-        return None, "FXCM credentials are not configured."
+
+def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
+    """Read FXCM Bid candles from EdoSignal's private Railway FXCM service."""
+    if not FXCM_SERVICE_URL:
+        return None, "FXCM service URL is not configured."
 
     timeframe_map = {
         "4h": "H4",
         "8h": "H8",
         "12h": "H12",
         "1day": "D1",
-        "1week": "W1",
     }
-
-    fxcm_timeframe = timeframe_map.get(interval.lower())
-    if not fxcm_timeframe:
-        return None, f"Unsupported FXCM timeframe: {interval}"
-
-    fx = ForexConnect()
+    tf = timeframe_map.get(str(interval).lower())
+    if not tf:
+        return None, f"FXCM service does not provide {interval}."
 
     try:
-        fx.login(
-            FXCM_USERNAME,
-            FXCM_PASSWORD,
-            FXCM_URL,
-            FXCM_CONNECTION
+        r = requests.get(
+            FXCM_SERVICE_URL + "/candles",
+            params={
+                "symbol": symbol,
+                "timeframe": tf,
+                "count": max(10, min(int(outputsize), 500)),
+            },
+            timeout=20
         )
+        r.raise_for_status()
+        payload = r.json()
 
-        timeframe = fx.timeframe_collection.get(fxcm_timeframe)
-
-        history = fx.get_history(
-            symbol,
-            timeframe,
-            datetime.now() - timedelta(days=120),
-            datetime.now()
-        )
+        if not payload.get("ok"):
+            return None, "FXCM service error: " + str(payload.get("error", "Unknown error"))
 
         candles = []
-
-        for row in history[-outputsize:]:
+        for row in payload.get("rows") or []:
             candles.append({
-                "datetime": str(row["Date"]),
-                "open": float(row["BidOpen"]),
-                "high": float(row["BidHigh"]),
-                "low": float(row["BidLow"]),
-                "close": float(row["BidClose"]),
+                "datetime": str(row.get("datetime", "")),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
                 "_source_symbol": symbol,
-                "_source_label": f"FXCM {symbol}",
+                "_source_label": "FXCM Bid",
             })
 
-        return candles, None
+        candles.sort(key=lambda x: x["datetime"])
+        if not candles:
+            return None, "FXCM service returned no candles."
+        return candles[-outputsize:], None
 
     except Exception as e:
-        print("FXCM OHLC error:", symbol, interval, e)
-        return None, f"FXCM error: {e}"
+        print("FXCM service OHLC error:", symbol, interval, e)
+        return None, f"FXCM service error: {e}"
 
-    finally:
-        try:
-            fx.logout()
-        except Exception:
-            pass
+
 def get_ohlc(symbol, interval, outputsize=140, grp=None):
     """Download OHLC oldest -> newest. Crypto uses Bybit; Forex/CFD keep Twelve Data."""
     cache_key = (grp or "", symbol.upper().strip(), interval)
@@ -2988,25 +2978,22 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
         cached = _OHLC_CACHE.get(cache_key)
         if cached and now - cached["saved_at"] < ttl and len(cached["candles"]) >= outputsize:
             return cached["candles"][-outputsize:], None
-    # FOREX uses real FXCM candles through ForexConnect.
-    if grp == "FOREX":
-        fxcm_candles, fxcm_error = fxcm_get_ohlc(
-            symbol,
-            interval,
-            outputsize
-        )
 
+    # FOREX: use the real FXCM Bid candle feed from the private Railway service.
+    # Weekly remains reference-only and keeps the existing source because the
+    # FXCM helper service currently exposes H4/H8/H12/D1.
+    if grp == "FOREX" and interval in {"4h", "8h", "12h", "1day"}:
+        fxcm_candles, fxcm_error = fxcm_service_get_ohlc(symbol, interval, outputsize)
         if fxcm_candles:
             with _CACHE_LOCK:
                 _OHLC_CACHE[cache_key] = {
                     "saved_at": now,
                     "candles": fxcm_candles
                 }
-
-            print("FOREX market source", symbol, "-> FXCM ForexConnect")
+            print("FOREX market source", symbol, "-> FXCM private service")
             return fxcm_candles[-outputsize:], None
-
         return None, fxcm_error
+
     # Crypto uses the same Bybit USDT perpetual market Edo trades.
     # The newest raw candle may still be forming. Signal logic continues to
     # pass through fully_closed_candles(), so a live candle cannot trigger.
@@ -4330,19 +4317,19 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     if not exact_adjacent_pullback_run(candles, run_start, i, run_colour):
         return None
 
-    # Edo 4H rule: the separate higher-timeframe filter supplies the trend
-    # context. Do not reject a valid 4H 2+ candle pullback because of local
-    # 4H structure or the stricter clean-run quality filter.
-    #
-    # 8H / Daily / Weekly keep the existing clean-pullback and S/R rules.
-    if not require_local_trend:
-        clean_ok, clean_reason = clean_pullback_run(
-            candles, run_start, i, run_colour
-        )
-        if not clean_ok:
-            return None
+    # Edo strong-trend rule for every normal Trend Pullback:
+    # the 2+ opposite-colour candles must be a clean retracement AGAINST an
+    # already established trend on the signal timeframe.  A ranging/mixed
+    # structure is not a Trend Pullback.
+    clean_ok, clean_reason = clean_pullback_run(
+        candles, run_start, i, run_colour
+    )
+    if not clean_ok:
+        return None
 
     trend = local_structure_trend(candles, run_start)
+    if require_local_trend and trend != required_trend:
+        return None
 
     score = 6.0 + min(3.0, (run_count - 2) * 0.75)
     target = previous_target(candles, direction, run_start)
@@ -4697,7 +4684,23 @@ def apply_edo_8h_daily_context_rule(candles, interval, setups):
     return out
 
 
-def describe_setup(p):
+def format_signal_time_perth(value):
+    """Display a stored UTC candle timestamp in Perth local time (AWST)."""
+    if not value:
+        return ""
+    try:
+        raw = str(value).strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo("Australia/Perth")).strftime("%d %b %Y • %H:%M Perth")
+    except Exception:
+        return str(value)
+
+
+def describe_setup(p, interval=None):
     bullish = p["direction"] == "bullish"
     icon = "🟢" if bullish else "🔴"
     css = "buy" if bullish else "sell"
@@ -4706,7 +4709,7 @@ def describe_setup(p):
     if p["name"] == "S/R GAP RETEST SETUP":
         weak_text = " Weakness was also detected in the retest candles." if p["weak_retest"] else ""
         detail = (
-            f"{direction_word} S/R Gap-Retest confirmation on {p['confirmation_date']}. "
+            f"{direction_word} S/R Gap-Retest confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
             f"Price first established a wick-defined support/resistance zone, moved clearly away, "
             f"then returned to RETEST the same zone after {p['separation']} candles. "
             f"The second touch retraced {p.get('retest_depth_pct', 0):.0f}% back toward the original S/R level "
@@ -4716,8 +4719,8 @@ def describe_setup(p):
 
         level_text = (
             f"Established retest zone: {p['level']:.5f} • "
-            f"Earlier wick level: {p['old_level']:.5f} on {p['old_date']} • "
-            f"Second {p['level_source']} test: {p['retest_price']:.5f} on {p['retest_date']} • "
+            f"Earlier wick level: {p['old_level']:.5f} on {format_signal_time_perth(p['old_date'])} • "
+            f"Second {p['level_source']} test: {p['retest_price']:.5f} on {format_signal_time_perth(p['retest_date'])} • "
             f"Confirmation close: {p['confirmation_close']:.5f}"
         )
         if p.get("target1") is not None:
@@ -4749,7 +4752,7 @@ def describe_setup(p):
         )
 
     elif p["name"] == "TREND PULLBACK SETUP":
-        run_dates = ", ".join(p.get("run_dates", []))
+        run_dates = ", ".join(format_signal_time_perth(x) for x in p.get("run_dates", []))
         htf_text = ""
         if p.get("higher_tf_filter"):
             htf = p.get("higher_tf_states", {})
@@ -4759,7 +4762,7 @@ def describe_setup(p):
             )
 
         detail = (
-            f"{direction_word} trend-pullback confirmation on {p['confirmation_date']}. "
+            f"{direction_word} trend-pullback confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
             f"{p['run_count']} {p['run_colour']} CLOSED candles pulled against the larger "
             f"{p['trend']} price structure, then the opposite-colour confirmation candle "
             f"fully CLOSED. No minimum body-penetration percentage is required. "
@@ -4770,7 +4773,7 @@ def describe_setup(p):
 
     else:
         detail = (
-            f"{direction_word} range-reversal confirmation on {p['confirmation_date']}. "
+            f"{direction_word} range-reversal confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
             f"{p['run_count']} {p['run_colour']} CLOSED candles moved in one direction "
             f"while local structure was mixed/range-bound, then the confirmation candle "
             f"closed {p['penetration']:.0f}% back through the previous candle body."
@@ -4778,8 +4781,16 @@ def describe_setup(p):
 
         level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
 
+    # Visual-only distinction: Edo uses 4H Trend Pullback mainly as an entry/re-entry
+    # inside the larger trend. Detection rules are unchanged.
+    display_name = p["name"]
+    if interval == "4h" and p["name"] == "TREND PULLBACK SETUP":
+        display_name = "4H PULLBACK ENTRY"
+        icon = "⚪"
+        css = "entry4h"
+
     return {
-        "name": p["name"],
+        "name": display_name,
         "detail": detail,
         "level_text": level_text,
         "icon": icon,
@@ -5407,15 +5418,17 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    then an opposite-colour fully CLOSED confirmation.
     #    NO 50% rule applies to this signal.
     #
-    #    4H: must pass the higher-timeframe trend filter AND be at/near meaningful S/R.
-    #    8H / Daily / Weekly: must also be at/near meaningful S/R.
+    #    Every normal pullback must be a clean retracement against an established
+    #    local trend and be at/near meaningful S/R.
+    #    4H additionally must align with the larger 8H trend (Daily fallback only
+    #    when 8H is structurally unclear), because 4H is Edo's entry/re-entry tool.
     if interval in NORMAL_PULLBACK_INTERVALS:
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
                 closed_candles,
                 conf,
                 allow_sr_exception=False,
-                require_local_trend=(interval == "4h")
+                require_local_trend=True
             )
             if not pullback:
                 continue
@@ -5473,10 +5486,10 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         found = []
 
     # Edo rule:
-    #   4H Trend Pullback -> meaningful pre-existing S/R AND higher-timeframe direction (8H first, Daily fallback).
-    #   8H / Daily / Weekly Trend Pullback -> no 4H-style higher-timeframe trend
-    #   requirement, but the clean 2+ candle sequence must occur at/near
-    #   meaningful support/resistance.
+    #   All Trend Pullbacks -> established local trend + clean 2+ candle retracement
+    #   + meaningful pre-existing S/R.
+    #   4H additionally -> higher-timeframe direction (8H first, Daily fallback).
+    #   8H / Daily do not use that extra 4H higher-timeframe filter.
     higher_tf_states = None
     if interval == "4h":
         normal_found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
@@ -5514,13 +5527,23 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     bearish = [p for p in current_patterns if p["direction"] == "bearish"]
 
     if bullish and not bearish:
-        signal = "READY TO REVIEW — BUY"
-        icon, css = "🟢", "buy"
-        summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bullish Edo setup. No forming candle can make this READY."
+        if interval == "4h":
+            signal = "4H PULLBACK ENTRY — BUY"
+            icon, css = "⚪", "entry4h"
+            summary = "4H entry/re-entry indication inside the larger trend. The existing Trend Pullback detection rules are unchanged, and only a fully CLOSED candle can trigger it."
+        else:
+            signal = "READY TO REVIEW — BUY"
+            icon, css = "🟢", "buy"
+            summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bullish Edo setup. No forming candle can make this READY."
     elif bearish and not bullish:
-        signal = "READY TO REVIEW — SELL"
-        icon, css = "🔴", "sell"
-        summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bearish Edo setup. No forming candle can make this READY."
+        if interval == "4h":
+            signal = "4H PULLBACK ENTRY — SELL"
+            icon, css = "⚪", "entry4h"
+            summary = "4H entry/re-entry indication inside the larger trend. The existing Trend Pullback detection rules are unchanged, and only a fully CLOSED candle can trigger it."
+        else:
+            signal = "READY TO REVIEW — SELL"
+            icon, css = "🔴", "sell"
+            summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bearish Edo setup. No forming candle can make this READY."
     elif bullish and bearish:
         signal = "WAIT — MIXED PRICE ACTION"
         icon, css = "🟡", "wait"
@@ -5564,13 +5587,13 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         "signal_icon": icon,
         "signal_css": css,
         "summary": summary,
-        "patterns": [describe_setup(p) for p in found[:4]],
+        "patterns": [describe_setup(p, interval) for p in found[:4]],
         "rejected_setups": [
             p.get("rejection_reason", "")
             for p in rejected_room_setups[:3]
             if p.get("rejection_reason")
         ],
-        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated": datetime.now(ZoneInfo("Australia/Perth")).strftime("%d %b %Y • %H:%M Perth"),
     }
 
     PATTERN_SIGNAL_CACHE[cache_key] = {"saved_at": now, "data": data}
@@ -5886,7 +5909,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 target_lines += f" Take Profit: {p['take_profit']:.5f} ({src})."
             push_body = (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
-                f"({confirmation_date}). "
+                f"({format_signal_time_perth(confirmation_date)}). "
                 f"Established {zone_word} on the left, price moved clearly away, "
                 f"then returned after separation to retest the same zone. "
                 f"Second-touch depth: {p.get('retest_depth_pct', 0):.0f}% back toward the original level. "
@@ -5908,7 +5931,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
             push_body = (
                 f"TREND PULLBACK SETUP confirmed on the NEWEST CLOSED {tf_label} candle "
-                f"({confirmation_date}). "
+                f"({format_signal_time_perth(confirmation_date)}). "
                 f"{market_text}"
                 f"{run_count} {pullback_colour} CLOSED candles pulled against that direction, "
                 f"then the opposite-colour {confirmation_colour} confirmation candle fully CLOSED. "
@@ -5918,7 +5941,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         else:
             push_body = (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
-                f"({confirmation_date}). "
+                f"({format_signal_time_perth(confirmation_date)}). "
                 f"{trend_line}"
                 f"{direction_word} possibility. Review the chart before trading."
             )
@@ -5970,7 +5993,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
                 closed_candles,
                 conf,
                 allow_sr_exception=False,
-                require_local_trend=(interval == "4h")
+                require_local_trend=True
             )
             if not pullback:
                 continue
@@ -6866,6 +6889,9 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
 
         return candles_8h[-outputsize:], None
 
+    if interval == "12h" and grp == "FOREX":
+        return get_ohlc(symbol, "12h", outputsize=outputsize, grp=grp)
+
     if interval == "12h":
         # Fetch enough 4H candles to construct the requested 12H history.
         source_size = max(60, outputsize * 3 + 9)
@@ -7602,6 +7628,7 @@ def signal(i):
             selected_label=allowed[selected_tf],
             price='—',
             latest_closed_date='—',
+            latest_closed_perth='—',
             market_source='',
             weekly_spike=None,
             signal='',
@@ -7623,6 +7650,7 @@ def signal(i):
         selected_label=allowed[selected_tf],
         price=f"{data['price']:.5f}",
         latest_closed_date=data.get('latest_closed_date', ''),
+        latest_closed_perth=format_signal_time_perth(data.get('latest_closed_date', '')),
         market_source=data.get('market_source', ''),
         weekly_spike=data.get('weekly_spike'),
         signal=data['signal'],
