@@ -4318,19 +4318,19 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     if not exact_adjacent_pullback_run(candles, run_start, i, run_colour):
         return None
 
-    # Edo 4H rule: the separate higher-timeframe filter supplies the trend
-    # context. Do not reject a valid 4H 2+ candle pullback because of local
-    # 4H structure or the stricter clean-run quality filter.
-    #
-    # 8H / Daily / Weekly keep the existing clean-pullback and S/R rules.
-    if not require_local_trend:
-        clean_ok, clean_reason = clean_pullback_run(
-            candles, run_start, i, run_colour
-        )
-        if not clean_ok:
-            return None
+    # Edo strong-trend rule for every normal Trend Pullback:
+    # the 2+ opposite-colour candles must be a clean retracement AGAINST an
+    # already established trend on the signal timeframe.  A ranging/mixed
+    # structure is not a Trend Pullback.
+    clean_ok, clean_reason = clean_pullback_run(
+        candles, run_start, i, run_colour
+    )
+    if not clean_ok:
+        return None
 
     trend = local_structure_trend(candles, run_start)
+    if require_local_trend and trend != required_trend:
+        return None
 
     score = 6.0 + min(3.0, (run_count - 2) * 0.75)
     target = previous_target(candles, direction, run_start)
@@ -5419,15 +5419,17 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    then an opposite-colour fully CLOSED confirmation.
     #    NO 50% rule applies to this signal.
     #
-    #    4H: must pass the higher-timeframe trend filter AND be at/near meaningful S/R.
-    #    8H / Daily / Weekly: must also be at/near meaningful S/R.
+    #    Every normal pullback must be a clean retracement against an established
+    #    local trend and be at/near meaningful S/R.
+    #    4H additionally must align with the larger 8H trend (Daily fallback only
+    #    when 8H is structurally unclear), because 4H is Edo's entry/re-entry tool.
     if interval in NORMAL_PULLBACK_INTERVALS:
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
                 closed_candles,
                 conf,
                 allow_sr_exception=False,
-                require_local_trend=(interval == "4h")
+                require_local_trend=True
             )
             if not pullback:
                 continue
@@ -5485,10 +5487,10 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         found = []
 
     # Edo rule:
-    #   4H Trend Pullback -> meaningful pre-existing S/R AND higher-timeframe direction (8H first, Daily fallback).
-    #   8H / Daily / Weekly Trend Pullback -> no 4H-style higher-timeframe trend
-    #   requirement, but the clean 2+ candle sequence must occur at/near
-    #   meaningful support/resistance.
+    #   All Trend Pullbacks -> established local trend + clean 2+ candle retracement
+    #   + meaningful pre-existing S/R.
+    #   4H additionally -> higher-timeframe direction (8H first, Daily fallback).
+    #   8H / Daily do not use that extra 4H higher-timeframe filter.
     higher_tf_states = None
     if interval == "4h":
         normal_found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
@@ -5992,7 +5994,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
                 closed_candles,
                 conf,
                 allow_sr_exception=False,
-                require_local_trend=(interval == "4h")
+                require_local_trend=True
             )
             if not pullback:
                 continue
