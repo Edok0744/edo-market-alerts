@@ -5527,6 +5527,21 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         if p.get("confirmation_date", "") == latest_closed_date
     ]
 
+    # Edo Forex weekend rule:
+    # During the normal spot-Forex weekend closure, never present the newest
+    # candle as a NEW actionable Price Action trigger. Automatic pattern pushes
+    # are already suppressed/baselined separately. Keep only older historical
+    # setups visible for reference until the market reopens.
+    forex_weekend_blocked = (
+        str(grp).upper() == "FOREX" and forex_weekend_closed()
+    )
+    if forex_weekend_blocked:
+        current_patterns = []
+        found = [
+            p for p in found
+            if p.get("confirmation_date", "") != latest_closed_date
+        ]
+
     bullish = [p for p in current_patterns if p["direction"] == "bullish"]
     bearish = [p for p in current_patterns if p["direction"] == "bearish"]
 
@@ -5558,7 +5573,13 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     else:
         signal = "WAIT"
         icon, css = "🟡", "wait"
-        if found:
+        if forex_weekend_blocked:
+            summary = (
+                "Forex market is closed for the weekend. New Price Action signals "
+                "are paused until the normal Forex session reopens. Older valid "
+                "setups may be shown below for reference only."
+            )
+        elif found:
             summary = (
                 "No pattern triggered on the newest fully closed candle. "
                 "The most recent older valid trigger is shown below for reference."
