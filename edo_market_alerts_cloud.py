@@ -2922,6 +2922,25 @@ CORE_PATTERN_INTERVALS = SR_GAP_RETEST_INTERVALS
 
 
 
+
+def fxcm_cfd_symbol(symbol):
+    """Map Edo's saved CFD names to the FXCM instrument names used on his charts."""
+    s = str(symbol or "").upper().strip().replace(" ", "")
+    return {
+        "SP500": "SPX500",
+        "US500": "SPX500",
+        "S&P500": "SPX500",
+        "SPX500": "SPX500",
+        "DJ30": "US30",
+        "US30": "US30",
+        "DOW30": "US30",
+        "NAS100": "NAS100",
+        "NASDAQ100": "NAS100",
+        "US100": "NAS100",
+        "USTEC": "NAS100",
+    }.get(s, s)
+
+
 def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
     """Read FXCM Bid candles from EdoSignal's private Railway FXCM service."""
     if not FXCM_SERVICE_URL:
@@ -2985,7 +3004,7 @@ def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
 
 
 def get_ohlc(symbol, interval, outputsize=140, grp=None):
-    """Download OHLC oldest -> newest. Crypto uses Bybit; Forex/CFD keep Twelve Data."""
+    """Download OHLC oldest -> newest. Forex and key CFDs use FXCM; Crypto uses Bybit; other data uses Twelve Data."""
     cache_key = (grp or "", symbol.upper().strip(), interval)
     now = time.time()
     ttl = ohlc_cache_seconds(interval)
@@ -3019,6 +3038,39 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
             print("FOREX market source", symbol, "-> FXCM private service")
             return fxcm_candles[-outputsize:], None
         return None, fxcm_error
+
+    # CFD: for the US indices Edo checks on FXCM, use the SAME broker-native
+    # FXCM Bid candles instead of Twelve Data ETF proxies (SPY/DIA/QQQ).
+    # This prevents a proxy ETF candle sequence from creating a Trend Pullback
+    # that is not visible on Edo's FXCM SPX500/US30/NAS100 chart.
+    if grp == "CFD" and interval in {"4h", "8h", "1day"}:
+        fxcm_symbol = fxcm_cfd_symbol(symbol)
+        fxcm_candles, fxcm_error = fxcm_service_get_ohlc(
+            fxcm_symbol, interval, outputsize
+        )
+        if fxcm_candles:
+            for c in fxcm_candles:
+                c["_source_symbol"] = fxcm_symbol
+                c["_source_label"] = f"FXCM {fxcm_symbol} Bid"
+            if len(fxcm_candles) < min(40, outputsize):
+                return None, (
+                    f"Not enough valid {interval} FXCM CFD candles returned "
+                    f"for {fxcm_symbol}."
+                )
+            with _CACHE_LOCK:
+                _OHLC_CACHE[cache_key] = {
+                    "saved_at": now,
+                    "candles": fxcm_candles
+                }
+            print("CFD market source", symbol, "-> FXCM", fxcm_symbol)
+            return fxcm_candles[-outputsize:], None
+
+        # IMPORTANT: do not silently fall back to SPY/DIA/QQQ for these signal
+        # timeframes. A proxy can have different candles and create false visual
+        # matches. Show a data error instead of issuing a mismatched signal.
+        return None, (
+            f"FXCM CFD chart data unavailable for {fxcm_symbol}: {fxcm_error}"
+        )
 
     # Crypto uses the same Bybit USDT perpetual market Edo trades.
     # The newest raw candle may still be forming. Signal logic continues to
