@@ -30,6 +30,11 @@ FOREX_FACTORY_CALENDAR_FALLBACK_URL = os.environ.get(
 NEWS_REFRESH_SECONDS = int(os.environ.get('NEWS_REFRESH_SECONDS', '1800'))
 NEWS_WARNING_MINUTES = int(os.environ.get('NEWS_WARNING_MINUTES', '5'))
 NEWS_PUSH_SOUND = os.environ.get('NEWS_PUSH_SOUND', 'persistent')
+# Edo alert sounds:
+# - NEWS_PUSH_SOUND: long/persistent warning about 5 minutes before major news.
+# - READY_PUSH_SOUND: distinctive siren / "whoop-whoop" when a NEW 4H READY
+#   setup starts the HOME icon blinking.
+READY_PUSH_SOUND = os.environ.get('READY_PUSH_SOUND', 'siren')
 
 # Edo Major News filter: Forex Factory can label events High even when they
 # are not normally the kind of release Edo wants to stop new entries for.
@@ -511,12 +516,14 @@ h2{font-size:18px}
 .price-action-btn{
     width:32px!important;height:32px!important;min-width:32px!important;
     padding:0!important;border-radius:9px!important;background:#07111f!important;
-    border:1px solid #20c9ff!important;box-shadow:0 0 7px rgba(32,201,255,.25);
+    border:1px solid #f2c94c!important;box-shadow:0 0 7px rgba(242,201,76,.25);
     display:inline-flex;align-items:center;justify-content:center;
 }
 .price-action-icon{width:24px;height:24px;display:block}
 .price-action-btn.ready-buy{border-color:#35e28a!important;box-shadow:0 0 10px rgba(53,226,138,.75);animation:edoReadyBlink 1s infinite}
 .price-action-btn.ready-sell{border-color:#ff5f73!important;box-shadow:0 0 10px rgba(255,95,115,.75);animation:edoReadyBlink 1s infinite}
+.price-action-btn.ready-buy.acknowledged,
+.price-action-btn.ready-sell.acknowledged{animation:none!important}
 @keyframes edoReadyBlink{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.28;transform:scale(.92)}}
 .trend-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-top:12px}
 .trend-box{background:#12263b;border-radius:12px;padding:10px;text-align:center}
@@ -6008,7 +6015,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         # Duplicate protection in pattern_notifications means the same confirmed
         # setup cannot make the phone sound repeatedly. Other timeframe pattern
         # notifications keep the normal Pushover sound.
-        ready_sound = "siren" if interval == "4h" else "cashregister"
+        ready_sound = READY_PUSH_SOUND if interval == "4h" else "cashregister"
         ready_priority = 1 if interval == "4h" else 0
 
         send_push(
@@ -7405,10 +7412,18 @@ def home():
             ).fetchall()
             price_action_statuses = {}
             for r in pa_rows:
-                if r['status'] == 'READY' and r['direction'] == 'BUY' and r['acknowledged_date'] != r['confirmation_date']:
-                    price_action_statuses[r['symbol']] = {'css':'ready-buy','label':'Price Action — READY BUY'}
-                elif r['status'] == 'READY' and r['direction'] == 'SELL' and r['acknowledged_date'] != r['confirmation_date']:
-                    price_action_statuses[r['symbol']] = {'css':'ready-sell','label':'Price Action — READY SELL'}
+                if r['status'] == 'READY' and r['direction'] == 'BUY':
+                    is_new = r['acknowledged_date'] != r['confirmation_date']
+                    price_action_statuses[r['symbol']] = {
+                        'css': 'ready-buy' if is_new else 'ready-buy acknowledged',
+                        'label': 'Price Action — READY BUY' + (' — NEW' if is_new else ' — REVIEWED')
+                    }
+                elif r['status'] == 'READY' and r['direction'] == 'SELL':
+                    is_new = r['acknowledged_date'] != r['confirmation_date']
+                    price_action_statuses[r['symbol']] = {
+                        'css': 'ready-sell' if is_new else 'ready-sell acknowledged',
+                        'label': 'Price Action — READY SELL' + (' — NEW' if is_new else ' — REVIEWED')
+                    }
                 else:
                     price_action_statuses[r['symbol']] = {'css':'','label':'Price Action — WAIT'}
 
