@@ -35,6 +35,10 @@ NEWS_PUSH_SOUND = os.environ.get('NEWS_PUSH_SOUND', 'persistent')
 # - READY_PUSH_SOUND: distinctive siren / "whoop-whoop" when a NEW 4H READY
 #   setup starts the HOME icon blinking.
 READY_PUSH_SOUND = os.environ.get('READY_PUSH_SOUND', 'siren')
+# Distinct trailing-stop HIT sound. Pushover has no sound literally named
+# "growl", so use its low, growling-style "alien" alert by default.
+# Railway can override this with TRAILING_STOP_PUSH_SOUND if Edo prefers another.
+TRAILING_STOP_PUSH_SOUND = os.environ.get('TRAILING_STOP_PUSH_SOUND', 'alien')
 
 # Edo Major News filter: Forex Factory can label events High even when they
 # are not normally the kind of release Edo wants to stop new entries for.
@@ -7257,7 +7261,7 @@ def trailing_stop_monitor():
                     hit=(side=='BUY' and bearish_closed and close<=old_stop) or (side=='SELL' and bullish_closed and close>=old_stop); perth_time=format_closed_candle_close_perth(candle,t['interval'])
                     if hit:
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET triggered=1,last_candle_start=?,last_candle_time=? WHERE id=?',(candle_start,perth_time,t['id'])); c.commit()
-                        send_push(f"🟠 {t['symbol']} TRAILING STOP HIT", f"{side} candle-close trail hit.\nClosed candle: {perth_time} Perth\nCandle close: {close:.5f}\nTrail level: {old_stop:.5f}\nOpposite-colour candle fully closed beyond the trail. Wicks/spikes were ignored.\nNote: {t['note'] or '-'}", sound="none")
+                        send_push(f"🟠 {t['symbol']} TRAILING STOP HIT", f"{side} candle-close trail hit.\nClosed candle: {perth_time} Perth\nCandle close: {close:.5f}\nTrail level: {old_stop:.5f}\nOpposite-colour candle fully closed beyond the trail. Wicks/spikes were ignored.\nNote: {t['note'] or '-'}", sound=TRAILING_STOP_PUSH_SOUND, priority=1)
                     else:
                         candidate=close-dist if side=='BUY' else close+dist; new_stop=max(old_stop,candidate) if side=='BUY' else min(old_stop,candidate)
                         with db_conn() as c: c.execute('UPDATE trailing_stops SET stop_price=?,last_candle_start=?,last_candle_time=? WHERE id=?',(new_stop,candle_start,perth_time,t['id'])); c.commit()
