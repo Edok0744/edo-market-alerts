@@ -2956,6 +2956,9 @@ def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
                 "close": float(row["close"]),
                 "_source_symbol": symbol,
                 "_source_label": "FXCM Bid",
+                # Mark these as broker-native FXCM candles. Their labels must
+                # not be shifted/rebucketed by generic UTC candle logic.
+                "_fxcm_native": True,
             })
 
         candles.sort(key=lambda x: x["datetime"])
@@ -2985,6 +2988,16 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
     if grp == "FOREX" and interval in {"4h", "8h", "12h", "1day"}:
         fxcm_candles, fxcm_error = fxcm_service_get_ohlc(symbol, interval, outputsize)
         if fxcm_candles:
+            # Keep FXCM H4/D1 candles exactly as supplied by the broker service.
+            # Weekend notification suppression is handled separately and does
+            # not alter the historical candle sequence.
+
+            if len(fxcm_candles) < min(40, outputsize):
+                return None, (
+                    f"Not enough valid {interval} FXCM Forex session candles "
+                    f"returned for {symbol}."
+                )
+
             with _CACHE_LOCK:
                 _OHLC_CACHE[cache_key] = {
                     "saved_at": now,
@@ -3199,6 +3212,14 @@ def fully_closed_candles(candles, interval, now_utc=None):
     closed = []
 
     for c in candles:
+        # FXCM rows already represent the broker's native chart candles.
+        # Preserve those exact H4/D1 candle groupings instead of applying the
+        # generic UTC start+duration rule, which can shift the broker session
+        # and create a colour sequence that does not match the FXCM chart.
+        if c.get("_fxcm_native"):
+            closed.append(c)
+            continue
+
         start = parse_candle_utc(c.get("datetime", ""))
         if start is None:
             continue
