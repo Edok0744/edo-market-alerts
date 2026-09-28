@@ -2964,6 +2964,12 @@ def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
         candles.sort(key=lambda x: x["datetime"])
         if not candles:
             return None, "FXCM service returned no candles."
+
+        # FXCM's newest row is the current live broker candle while Forex is
+        # open. It must never confirm a setup.
+        if not forex_weekend_closed():
+            candles[-1]["_fxcm_forming"] = True
+
         return candles[-outputsize:], None
 
     except Exception as e:
@@ -3217,6 +3223,10 @@ def fully_closed_candles(candles, interval, now_utc=None):
         # generic UTC start+duration rule, which can shift the broker session
         # and create a colour sequence that does not match the FXCM chart.
         if c.get("_fxcm_native"):
+            # Preserve FXCM's exact broker candle grouping, but exclude the
+            # newest live/forming candle from every signal calculation.
+            if c.get("_fxcm_forming"):
+                continue
             closed.append(c)
             continue
 
