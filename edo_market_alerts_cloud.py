@@ -2545,8 +2545,14 @@ def _post_news_overall_bias(symbol, grp, event_time_utc):
         else:
             event_dt = event_dt.astimezone(timezone.utc)
 
-        candles = get_ohlc(symbol, "8h", 140, grp)
-        closed = fully_closed_candles(candles, "8h", grp)
+        # get_ohlc() returns (candles, error).  Unpack it before applying the
+        # closed-candle filter; passing the tuple itself made Overall 8H remain
+        # stuck on WAITING even after the FXCM H8 candle had closed.
+        candles, candle_error = get_ohlc(symbol, "8h", 140, grp)
+        if candle_error or not candles:
+            return "WAITING", "MIXED", "8H bias data temporarily unavailable"
+
+        closed = fully_closed_candles(candles, "8h")
         if not closed:
             return "WAITING", "MIXED", "Waiting for a fully closed 8H candle after the news event"
 
@@ -2557,9 +2563,11 @@ def _post_news_overall_bias(symbol, grp, event_time_utc):
             if start_dt is None:
                 continue
             close_dt = start_dt + timedelta(hours=8)
-            # Use the first completed 8H candle whose close occurs after the news.
-            # This includes the 8H candle that was already open when the event occurred.
-            if close_dt > event_dt:
+            # Post-news Overall uses the first complete broker-native H8 candle
+            # that STARTS at/after the release.  This gives the news a full H8
+            # candle to develop and never uses the H8 candle already in progress
+            # when the announcement was released.
+            if start_dt >= event_dt:
                 target_index = i
                 target_close_time = close_dt
                 break
