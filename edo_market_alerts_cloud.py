@@ -2537,7 +2537,7 @@ def economic_news_reaction_monitor():
 
 
 def _post_news_overall_bias(symbol, grp, event_time_utc):
-    """Information-only post-news bias from the first fully CLOSED 8H candle after the event."""
+    """Information-only post-news bias from the first FXCM 8H candle that fully closes after the event."""
     try:
         event_dt = datetime.fromisoformat(str(event_time_utc).replace("Z", "+00:00"))
         if event_dt.tzinfo is None:
@@ -2563,24 +2563,25 @@ def _post_news_overall_bias(symbol, grp, event_time_utc):
             if start_dt is None:
                 continue
             close_dt = start_dt + timedelta(hours=8)
-            # Post-news Overall uses the first complete broker-native H8 candle
-            # that STARTS at/after the release.  This gives the news a full H8
-            # candle to develop and never uses the H8 candle already in progress
-            # when the announcement was released.
-            if start_dt >= event_dt:
+            # Post-news Overall uses the first broker-native H8 candle that
+            # CLOSES after the release.  If the news occurs during an FXCM H8
+            # candle, that same candle becomes eligible only AFTER it is fully
+            # closed.  This follows the actual FXCM H8 boundary instead of
+            # forcing Edo to wait for an additional full 8-hour candle.
+            if close_dt > event_dt:
                 target_index = i
                 target_close_time = close_dt
                 break
 
         if target_index is None:
-            return "WAITING", "MIXED", "Waiting for the first fully closed 8H candle after the news event"
+            return "WAITING", "MIXED", "Waiting for the FXCM 8H candle containing/following the news to close"
 
         trend = str(local_structure_trend(closed, target_index) or "mixed").upper()
         bias = trend if trend in ("BULLISH", "BEARISH") else "UNCLEAR"
         close_text = target_close_time.astimezone(PERTH).strftime("%d %b %Y %H:%M Perth") if target_close_time else ""
         if bias == "UNCLEAR":
-            return "UNCLEAR", "MIXED", f"First post-news closed 8H candle ({close_text}) does not give a clear broader structure"
-        return bias, bias, f"First post-news fully closed 8H candle ({close_text}) gives {bias.lower()} broader structure"
+            return "UNCLEAR", "MIXED", f"First FXCM 8H close after news ({close_text}) does not give a clear broader structure"
+        return bias, bias, f"First FXCM 8H close after news ({close_text}) gives {bias.lower()} broader structure"
     except Exception as e:
         print("post-news overall bias error", symbol, grp, e)
         return "WAITING", "MIXED", "8H bias data temporarily unavailable"
