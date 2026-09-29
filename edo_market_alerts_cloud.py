@@ -74,7 +74,7 @@ CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 # to kill a worker. The limiter now uses a tiny file + Linux file lock.
 # This keeps the API protection shared between workers on the same service
 # without holding the main EdoSignal database open.
-TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '45'))
+TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '5'))
 TWELVE_CALL_WINDOW = 60.0
 
 _API_LIMIT_FILE = os.environ.get(
@@ -2040,8 +2040,8 @@ def refresh_economic_news():
             if event_dt is None:
                 continue
 
-            # Keep just-passed events briefly plus all upcoming events in this week.
-            if event_dt < now_utc - timedelta(hours=2):
+            # Keep completed Edo-major events for 12 hours plus all upcoming events in this week.
+            if event_dt < now_utc - timedelta(hours=12):
                 continue
 
             event_id = f"{currency}|{event_name}|{event_dt.isoformat()}"
@@ -2570,7 +2570,7 @@ def news_reaction_payload():
                 WHERE n.event_time_utc >= ?
                 ORDER BY n.event_time_utc ASC
                 """,
-                ((datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),)
+                ((datetime.now(timezone.utc) - timedelta(hours=12)).isoformat(),)
             ).fetchall()
 
         result = {}
@@ -2716,7 +2716,7 @@ def cached_home_news(limit=6):
                 LIMIT ?
                 """,
                 (
-                    (now_utc - timedelta(hours=2)).isoformat(),
+                    (now_utc - timedelta(hours=12)).isoformat(),
                     max(40, int(limit) * 8),
                 ),
             ).fetchall()
