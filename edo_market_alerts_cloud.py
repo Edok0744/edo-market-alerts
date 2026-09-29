@@ -6494,6 +6494,39 @@ def save_trend_snapshot(symbol, states):
         c.commit()
 
 
+def full_trend_at_structural_sr(symbol, grp, direction):
+    """Edo FULL TREND S/R gate.
+
+    FULL BULLISH is actionable only when the newest fully CLOSED candle is
+    confirming a meaningful SUPPORT retest/bounce. FULL BEARISH is actionable
+    only at a meaningful RESISTANCE retest/rejection.
+
+    Check 8H first, then Daily. These are structural context timeframes; the
+    existing FULL TREND timeframe-alignment rules remain unchanged.
+    """
+    wanted = "bullish" if str(direction).upper() == "BULLISH" else "bearish"
+    wanted_name = "SUPPORT" if wanted == "bullish" else "RESISTANCE"
+
+    for label, interval in (("8H", "8h"), ("Daily", "1day")):
+        candles, err = get_candles(symbol, interval, outputsize=140, grp=grp)
+        if err:
+            continue
+        closed = fully_closed_candles(candles, interval)
+        if len(closed) < 30:
+            continue
+        reactions = detect_support_resistance_signal(closed)
+        for reaction in reactions:
+            if reaction.get("direction") == wanted:
+                return True, {
+                    "kind": wanted_name,
+                    "level": reaction.get("level"),
+                    "timeframe": label,
+                    "confirmation_date": reaction.get("confirmation_date", ""),
+                }
+
+    return False, None
+
+
 def build_full_alignment(symbol, grp=None):
     """
     Edo direct-candlestick alignment signal.
@@ -6558,10 +6591,16 @@ def build_full_alignment(symbol, grp=None):
     save_trend_snapshot(symbol, {"Weekly": weekly_state, **signal_states})
 
     if all(v == "Bullish" for v in signal_states.values()):
-        return "FULL BULLISH", None
+        at_sr, _ = full_trend_at_structural_sr(symbol, grp, "BULLISH")
+        if at_sr:
+            return "FULL BULLISH", None
+        return "", None
 
     if all(v == "Bearish" for v in signal_states.values()):
-        return "FULL BEARISH", None
+        at_sr, _ = full_trend_at_structural_sr(symbol, grp, "BEARISH")
+        if at_sr:
+            return "FULL BEARISH", None
+        return "", None
 
     return "", None
 
@@ -7218,18 +7257,31 @@ def build_trend_scan(symbol, grp=None):
             "closed_time_perth": format_closed_candle_perth(closed, interval),
         })
 
+    # FULL TREND is only labelled FULL when the aligned direction is also
+    # confirmed at meaningful structural S/R. No Pushover is sent for this.
+    full_bull_sr, full_bull_sr_info = full_trend_at_structural_sr(symbol, grp, "BULLISH")
+    full_bear_sr, full_bear_sr_info = full_trend_at_structural_sr(symbol, grp, "BEARISH")
+
     if is_cfd:
         signal_labels = ("Daily", "8H", "4H")
         weights = {"Daily": 3, "8H": 2, "4H": 1}
         score = sum(weights[x] if states[x] == "Bullish" else -weights[x] if states[x] == "Bearish" else 0 for x in signal_labels)
         full_bull = all(states[x] == "Bullish" for x in signal_labels)
         full_bear = all(states[x] == "Bearish" for x in signal_labels)
-        if full_bull:
+        if full_bull and full_bull_sr:
             summary, icon, css = "FULL BULLISH", "🟢", "bull"
-            detail = "Last CLOSED candles on 4H, 8H and Daily are all GREEN. Weekly is reference only."
-        elif full_bear:
+            info = full_bull_sr_info or {}
+            detail = f"4H, 8H and Daily are all GREEN and price is confirming SUPPORT on {info.get('timeframe','8H/Daily')}. Weekly is reference only."
+        elif full_bear and full_bear_sr:
             summary, icon, css = "FULL BEARISH", "🔴", "bear"
-            detail = "Last CLOSED candles on 4H, 8H and Daily are all RED. Weekly is reference only."
+            info = full_bear_sr_info or {}
+            detail = f"4H, 8H and Daily are all RED and price is confirming RESISTANCE on {info.get('timeframe','8H/Daily')}. Weekly is reference only."
+        elif full_bull:
+            summary, icon, css = "BULLISH — WAIT FOR SUPPORT", "🟡", "mixed"
+            detail = "4H, 8H and Daily are aligned bullish, but price is not confirming meaningful structural SUPPORT yet."
+        elif full_bear:
+            summary, icon, css = "BEARISH — WAIT FOR RESISTANCE", "🟡", "mixed"
+            detail = "4H, 8H and Daily are aligned bearish, but price is not confirming meaningful structural RESISTANCE yet."
         elif score >= 4:
             summary, icon, css = "BULLISH", "🟢", "bull"
             detail = "4H, 8H and Daily lean bullish but are not fully aligned. Weekly is reference only."
@@ -7245,12 +7297,20 @@ def build_trend_scan(symbol, grp=None):
         score = sum(weights[x] if states[x] == "Bullish" else -weights[x] if states[x] == "Bearish" else 0 for x in signal_labels)
         full_bull = all(states[x] == "Bullish" for x in signal_labels)
         full_bear = all(states[x] == "Bearish" for x in signal_labels)
-        if full_bull:
+        if full_bull and full_bull_sr:
             summary, icon, css = "FULL BULLISH", "🟢", "bull"
-            detail = "Last CLOSED candles on 12H, 8H, 4H and 3H are all GREEN. Bullish possibility."
-        elif full_bear:
+            info = full_bull_sr_info or {}
+            detail = f"12H, 8H, 4H and 3H are all GREEN and price is confirming SUPPORT on {info.get('timeframe','8H/Daily')}."
+        elif full_bear and full_bear_sr:
             summary, icon, css = "FULL BEARISH", "🔴", "bear"
-            detail = "Last CLOSED candles on 12H, 8H, 4H and 3H are all RED. Bearish possibility."
+            info = full_bear_sr_info or {}
+            detail = f"12H, 8H, 4H and 3H are all RED and price is confirming RESISTANCE on {info.get('timeframe','8H/Daily')}."
+        elif full_bull:
+            summary, icon, css = "BULLISH — WAIT FOR SUPPORT", "🟡", "mixed"
+            detail = "12H, 8H, 4H and 3H are aligned bullish, but price is not confirming meaningful structural SUPPORT yet."
+        elif full_bear:
+            summary, icon, css = "BEARISH — WAIT FOR RESISTANCE", "🟡", "mixed"
+            detail = "12H, 8H, 4H and 3H are aligned bearish, but price is not confirming meaningful structural RESISTANCE yet."
         elif states["12H"] == "Bullish" and any(states[x] == "Bearish" for x in ("8H", "4H", "3H")):
             summary, icon, css = "BULLISH — LOWER-TIMEFRAME PULLBACK", "🟡", "mixed"
             detail = "12H is bullish, but one or more lower signal timeframes are pulling back."
