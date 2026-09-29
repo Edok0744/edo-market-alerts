@@ -990,9 +990,13 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
 
             const overall = document.createElement('span');
             overall.className = 'news-reaction reading';
-            const ob = pair.overall_bias || 'UNCLEAR';
-            paintReactionBadge(overall, ob === 'UNCLEAR' ? 'MIXED' : ob, 'OVERALL', 'CHECKING');
-            overall.title = '4H: ' + (pair.bias_4h || 'MIXED') + ' | 8H: ' + (pair.bias_8h || 'MIXED') + ' | ' + (pair.bias_detail || '');
+            const ob = pair.overall_bias || 'WAITING';
+            if (ob === 'WAITING') {
+                paintReactionBadge(overall, '', 'OVERALL 8H', 'WAITING FOR 8H CLOSE');
+            } else {
+                paintReactionBadge(overall, ob === 'UNCLEAR' ? 'MIXED' : ob, 'OVERALL 8H', 'CHECKING');
+            }
+            overall.title = '8H: ' + (pair.bias_8h || 'MIXED') + ' | ' + (pair.bias_detail || '');
 
             row.appendChild(symbol);
             row.appendChild(b15);
@@ -2532,28 +2536,46 @@ def economic_news_reaction_monitor():
         time.sleep(60)
 
 
-def _post_news_overall_bias(symbol, grp):
-    """Information-only broader bias from fully closed 4H + 8H structure."""
+def _post_news_overall_bias(symbol, grp, event_time_utc):
+    """Information-only post-news bias from the first fully CLOSED 8H candle after the event."""
     try:
-        readings={}
-        for interval in ("4h","8h"):
-            candles=get_ohlc(symbol,interval,140,grp)
-            closed=fully_closed_candles(candles,interval,grp)
-            if not closed:
-                readings[interval]="MIXED"; continue
-            trend=str(local_structure_trend(closed,len(closed)-1) or "mixed").upper()
-            readings[interval]=trend if trend in ("BULLISH","BEARISH") else "MIXED"
-        t4,t8=readings.get("4h","MIXED"),readings.get("8h","MIXED")
-        if t4==t8 and t4 in ("BULLISH","BEARISH"):
-            return t4,t4,t8,"4H and 8H closed-candle structure agree"
-        if t8 in ("BULLISH","BEARISH") and t4=="MIXED":
-            return t8,t4,t8,"8H structure intact; 4H is unclear"
-        if t4 in ("BULLISH","BEARISH") and t8 in ("BULLISH","BEARISH") and t4!=t8:
-            return "UNCLEAR",t4,t8,"4H and 8H structure disagree"
-        return "UNCLEAR",t4,t8,"Broader structure is not clear enough"
+        event_dt = datetime.fromisoformat(str(event_time_utc).replace("Z", "+00:00"))
+        if event_dt.tzinfo is None:
+            event_dt = event_dt.replace(tzinfo=timezone.utc)
+        else:
+            event_dt = event_dt.astimezone(timezone.utc)
+
+        candles = get_ohlc(symbol, "8h", 140, grp)
+        closed = fully_closed_candles(candles, "8h", grp)
+        if not closed:
+            return "WAITING", "MIXED", "Waiting for a fully closed 8H candle after the news event"
+
+        target_index = None
+        target_close_time = None
+        for i, candle in enumerate(closed):
+            start_dt = parse_candle_utc(candle.get("datetime", ""))
+            if start_dt is None:
+                continue
+            close_dt = start_dt + timedelta(hours=8)
+            # Use the first completed 8H candle whose close occurs after the news.
+            # This includes the 8H candle that was already open when the event occurred.
+            if close_dt > event_dt:
+                target_index = i
+                target_close_time = close_dt
+                break
+
+        if target_index is None:
+            return "WAITING", "MIXED", "Waiting for the first fully closed 8H candle after the news event"
+
+        trend = str(local_structure_trend(closed, target_index) or "mixed").upper()
+        bias = trend if trend in ("BULLISH", "BEARISH") else "UNCLEAR"
+        close_text = target_close_time.astimezone(PERTH).strftime("%d %b %Y %H:%M Perth") if target_close_time else ""
+        if bias == "UNCLEAR":
+            return "UNCLEAR", "MIXED", f"First post-news closed 8H candle ({close_text}) does not give a clear broader structure"
+        return bias, bias, f"First post-news fully closed 8H candle ({close_text}) gives {bias.lower()} broader structure"
     except Exception as e:
-        print("post-news overall bias error",symbol,grp,e)
-        return "UNCLEAR","MIXED","MIXED","Bias data temporarily unavailable"
+        print("post-news overall bias error", symbol, grp, e)
+        return "WAITING", "MIXED", "8H bias data temporarily unavailable"
 
 
 def news_reaction_payload():
@@ -2606,7 +2628,7 @@ def news_reaction_payload():
             with db_conn() as c:
                 pair_rows = c.execute(
                     f"""
-                    SELECT event_id,display_symbol,reaction_15,score_15,reaction_30,score_30
+                    SELECT event_id,display_symbol,symbol,grp,reaction_15,score_15,reaction_30,score_30
                     FROM economic_news_pair_reactions
                     WHERE event_id IN ({placeholders})
                     ORDER BY display_symbol
@@ -2619,17 +2641,27 @@ def news_reaction_payload():
                     continue
                 result[pr["event_id"]]["pairs"].append({
                     "symbol": pr["display_symbol"],
+                    "market_symbol": pr["symbol"],
+                    "grp": pr["grp"],
                     "reaction_15": pr["reaction_15"] or "",
                     "reaction_30": pr["reaction_30"] or "",
                     "score_15": pr["score_15"],
                     "score_30": pr["score_30"],
                 })
 
-        # Overall Bias is information only; existing 15M/30M readings remain unchanged.
-        for _event in result.values():
+        # Overall 8H is information only; existing 15M/30M readings remain unchanged.
+        # It is event-specific and uses ONLY the first fully closed 8H candle after that news event.
+        for _event_id, _event in result.items():
+            _event_time = next((r["event_time_utc"] for r in rows if r["event_id"] == _event_id), "")
             for _pair in _event.get("pairs", []):
-                _b,_b4,_b8,_why=_post_news_overall_bias(_pair.get("symbol",""),_pair.get("grp","FOREX"))
-                _pair["overall_bias"],_pair["bias_4h"],_pair["bias_8h"],_pair["bias_detail"]=_b,_b4,_b8,_why
+                _b,_b8,_why = _post_news_overall_bias(
+                    _pair.get("market_symbol", _pair.get("symbol", "")),
+                    _pair.get("grp", "FOREX"),
+                    _event_time,
+                )
+                _pair["overall_bias"] = _b
+                _pair["bias_8h"] = _b8
+                _pair["bias_detail"] = _why
 
         return result
 
