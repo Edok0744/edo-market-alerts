@@ -988,9 +988,16 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
                 ageMin < 30 ? 'WAIT' : 'CHECKING'
             );
 
+            const overall = document.createElement('span');
+            overall.className = 'news-reaction reading';
+            const ob = pair.overall_bias || 'UNCLEAR';
+            paintReactionBadge(overall, ob === 'UNCLEAR' ? 'MIXED' : ob, 'OVERALL', 'CHECKING');
+            overall.title = '4H: ' + (pair.bias_4h || 'MIXED') + ' | 8H: ' + (pair.bias_8h || 'MIXED') + ' | ' + (pair.bias_detail || '');
+
             row.appendChild(symbol);
             row.appendChild(b15);
             row.appendChild(b30);
+            row.appendChild(overall);
             holder.appendChild(row);
         });
     }
@@ -2525,6 +2532,30 @@ def economic_news_reaction_monitor():
         time.sleep(60)
 
 
+def _post_news_overall_bias(symbol, grp):
+    """Information-only broader bias from fully closed 4H + 8H structure."""
+    try:
+        readings={}
+        for interval in ("4h","8h"):
+            candles=get_ohlc(symbol,interval,140,grp)
+            closed=fully_closed_candles(candles,interval,grp)
+            if not closed:
+                readings[interval]="MIXED"; continue
+            trend=str(local_structure_trend(closed,len(closed)-1) or "mixed").upper()
+            readings[interval]=trend if trend in ("BULLISH","BEARISH") else "MIXED"
+        t4,t8=readings.get("4h","MIXED"),readings.get("8h","MIXED")
+        if t4==t8 and t4 in ("BULLISH","BEARISH"):
+            return t4,t4,t8,"4H and 8H closed-candle structure agree"
+        if t8 in ("BULLISH","BEARISH") and t4=="MIXED":
+            return t8,t4,t8,"8H structure intact; 4H is unclear"
+        if t4 in ("BULLISH","BEARISH") and t8 in ("BULLISH","BEARISH") and t4!=t8:
+            return "UNCLEAR",t4,t8,"4H and 8H structure disagree"
+        return "UNCLEAR",t4,t8,"Broader structure is not clear enough"
+    except Exception as e:
+        print("post-news overall bias error",symbol,grp,e)
+        return "UNCLEAR","MIXED","MIXED","Bias data temporarily unavailable"
+
+
 def news_reaction_payload():
     """Small DB-only payload used by the home page for live reaction badges."""
     try:
@@ -2593,6 +2624,12 @@ def news_reaction_payload():
                     "score_15": pr["score_15"],
                     "score_30": pr["score_30"],
                 })
+
+        # Overall Bias is information only; existing 15M/30M readings remain unchanged.
+        for _event in result.values():
+            for _pair in _event.get("pairs", []):
+                _b,_b4,_b8,_why=_post_news_overall_bias(_pair.get("symbol",""),_pair.get("grp","FOREX"))
+                _pair["overall_bias"],_pair["bias_4h"],_pair["bias_8h"],_pair["bias_detail"]=_b,_b4,_b8,_why
 
         return result
 
