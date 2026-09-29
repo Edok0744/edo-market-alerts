@@ -2292,7 +2292,7 @@ def _saved_news_markets(currency):
 
 def _news_pair_reaction(symbol, grp, event_dt, minutes_after):
     """Actual price direction of one affected saved market after the release."""
-    candles, error = get_ohlc(symbol, "1min", outputsize=120, grp=grp)
+    candles, error = get_ohlc(symbol, "1min", outputsize=max(120, int(minutes_after) + 30), grp=grp)
     if not candles:
         return None, None
 
@@ -2537,7 +2537,7 @@ def economic_news_reaction_monitor():
 
 
 def _post_news_overall_bias(symbol, grp, event_time_utc):
-    """Information-only post-news bias from the first FXCM 8H candle that fully closes after the event."""
+    """Information-only 8H post-news reaction using the SAME method as 15M/30M."""
     try:
         event_dt = datetime.fromisoformat(str(event_time_utc).replace("Z", "+00:00"))
         if event_dt.tzinfo is None:
@@ -2545,47 +2545,26 @@ def _post_news_overall_bias(symbol, grp, event_time_utc):
         else:
             event_dt = event_dt.astimezone(timezone.utc)
 
-        # get_ohlc() returns (candles, error).  Unpack it before applying the
-        # closed-candle filter; passing the tuple itself made Overall 8H remain
-        # stuck on WAITING even after the FXCM H8 candle had closed.
-        candles, candle_error = get_ohlc(symbol, "8h", 140, grp)
-        if candle_error or not candles:
-            return "WAITING", "MIXED", "8H bias data temporarily unavailable"
+        now_utc = datetime.now(timezone.utc)
+        target_dt = event_dt + timedelta(hours=8)
+        if now_utc < target_dt:
+            return "WAITING", "MIXED", "Waiting until 8 hours after the news release"
 
-        closed = fully_closed_candles(candles, "8h")
-        if not closed:
-            return "WAITING", "MIXED", "Waiting for a fully closed 8H candle after the news event"
+        # Reuse the exact proven pair-reaction principle used by 15M and 30M:
+        # compare the last fully closed 1-minute price at the release with the
+        # last fully closed 1-minute price at +8 hours.  No prediction and no
+        # special H8 candle-boundary inference.
+        reaction, move = _news_pair_reaction(symbol, grp, event_dt, 480)
+        if not reaction:
+            return "WAITING", "MIXED", "8H reaction data temporarily unavailable"
 
-        target_index = None
-        target_close_time = None
-        for i, candle in enumerate(closed):
-            start_dt = parse_candle_utc(candle.get("datetime", ""))
-            if start_dt is None:
-                continue
-            close_dt = start_dt + timedelta(hours=8)
-            # Post-news Overall uses the first broker-native H8 candle that
-            # CLOSES after the release.  If the news occurs during an FXCM H8
-            # candle, that same candle becomes eligible only AFTER it is fully
-            # closed.  This follows the actual FXCM H8 boundary instead of
-            # forcing Edo to wait for an additional full 8-hour candle.
-            if close_dt > event_dt:
-                target_index = i
-                target_close_time = close_dt
-                break
-
-        if target_index is None:
-            return "WAITING", "MIXED", "Waiting for the FXCM 8H candle containing/following the news to close"
-
-        trend = str(local_structure_trend(closed, target_index) or "mixed").upper()
-        bias = trend if trend in ("BULLISH", "BEARISH") else "UNCLEAR"
-        close_text = target_close_time.astimezone(PERTH).strftime("%d %b %Y %H:%M Perth") if target_close_time else ""
-        if bias == "UNCLEAR":
-            return "UNCLEAR", "MIXED", f"First FXCM 8H close after news ({close_text}) does not give a clear broader structure"
-        return bias, bias, f"First FXCM 8H close after news ({close_text}) gives {bias.lower()} broader structure"
+        pct = float(move or 0.0) * 100.0
+        if reaction == "MIXED":
+            return "UNCLEAR", "MIXED", f"8H post-news price reaction is mixed ({pct:+.3f}%)"
+        return reaction, reaction, f"8H post-news price reaction is {reaction.lower()} ({pct:+.3f}%)"
     except Exception as e:
         print("post-news overall bias error", symbol, grp, e)
-        return "WAITING", "MIXED", "8H bias data temporarily unavailable"
-
+        return "WAITING", "MIXED", "8H reaction data temporarily unavailable"
 
 def news_reaction_payload():
     """Small DB-only payload used by the home page for live reaction badges."""
