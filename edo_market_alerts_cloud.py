@@ -5937,6 +5937,24 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
     if not latest_closed_date:
         return
 
+    # Final fail-safe: an automatic alert must belong to a recent candle.
+    # Even if persistent monitor state was delayed, never send a historical
+    # H4/H8/Daily FXCM setup as though it had just happened.
+    if str(grp).upper() in {"FOREX", "CFD"} and interval in {"4h", "8h", "1day"}:
+        close_utc = pattern_candle_close_utc(latest_closed_date, interval)
+        if close_utc is not None:
+            now_utc = datetime.now(timezone.utc)
+            seconds = interval_seconds(interval) or 0
+            age_seconds = (now_utc - close_utc).total_seconds()
+            if age_seconds > seconds + 120:
+                _save_pattern_monitor_baseline(grp, symbol, interval, latest_closed_date)
+                print(
+                    "stale FXCM pattern push suppressed/baselined",
+                    grp, symbol, interval, latest_closed_date,
+                    "age_seconds", int(age_seconds)
+                )
+                return
+
     # Never turn an old candle into a "new" push just because Railway restarted.
     close_utc = pattern_candle_close_utc(latest_closed_date, interval)
     if close_utc is not None and close_utc <= PROCESS_STARTED_UTC:
@@ -6155,6 +6173,21 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         return None, None, f"Not enough fully closed {interval} candle history returned."
 
     latest_closed_date = closed_candles[-1].get("datetime", "")
+
+    # HARD FRESHNESS RULE FOR FXCM SIGNALS:
+    # Never turn an old broker candle into a current READY/phone alert.
+    # This specifically protects US30/SPX500/NAS100 (and FXCM Forex) from
+    # delayed/stale helper data after a Railway/API interruption.  The newest
+    # fully closed broker candle must still be fresh for this timeframe.
+    if str(grp).upper() in {"FOREX", "CFD"} and interval in {"4h", "8h", "1day"}:
+        newest_closed = closed_candles[-1]
+        if not closed_candle_is_fresh(newest_closed, interval):
+            print(
+                "stale FXCM candle suppressed",
+                grp, symbol, interval, latest_closed_date
+            )
+            return [], latest_closed_date, None
+
     found = []
 
     # A) NORMAL Trend Pullback — 4H, 8H, Daily and Weekly, NO 50% rule.
