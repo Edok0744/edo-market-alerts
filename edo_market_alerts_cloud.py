@@ -3546,20 +3546,23 @@ def recent_confirmations(candles, lookback=6):
 
 def local_structure_trend(candles, end_index):
     """
-    Simple price-structure direction before a pullback.
-    Uses recent close progress plus swing structure. No EMA/RSI.
+    Edo recent price-structure direction BEFORE the pullback.
+
+    Important: an older large move must not keep controlling the trend after
+    price has established a genuine newer structure change.  Confirmed recent
+    swing highs/lows therefore have priority over the older-window close move.
+    No EMA/RSI is used.
     """
     if end_index < 12:
         return "mixed"
 
-    start = max(0, end_index - 28)
+    # Use enough history to confirm structural swings, but judge direction from
+    # the NEWEST confirmed swing pair.  This lets HH+HL / LH+LL establish a new
+    # regime even when an older impulse in the same window was very large.
+    start = max(0, end_index - 36)
     part = candles[start:end_index]
     if len(part) < 10:
         return "mixed"
-
-    first_close = sum(c["close"] for c in part[:4]) / 4.0
-    last_close = sum(c["close"] for c in part[-4:]) / 4.0
-    move = (last_close - first_close) / first_close if first_close else 0.0
 
     highs = swing_points(part, "high")
     lows = swing_points(part, "low")
@@ -3569,10 +3572,29 @@ def local_structure_trend(candles, end_index):
     lh = len(highs) >= 2 and highs[-1][1] < highs[-2][1]
     ll = len(lows) >= 2 and lows[-1][1] < lows[-2][1]
 
-    if (hh and hl) or move > 0.004:
+    # Strongest evidence: the latest confirmed highs AND lows agree.
+    if hh and hl:
         return "bullish"
-    if (lh and ll) or move < -0.004:
+    if lh and ll:
         return "bearish"
+
+    # If only one side has printed a newer swing, do not fall back to the old
+    # 28-candle impulse.  Use only recent price progress as supporting evidence.
+    recent = part[-14:]
+    first_n = min(3, max(1, len(recent) // 3))
+    first_close = sum(c["close"] for c in recent[:first_n]) / first_n
+    last_close = sum(c["close"] for c in recent[-first_n:]) / first_n
+    recent_move = last_close - first_close
+    recent_range = avg_range(recent, end=len(recent), length=len(recent))
+    meaningful = max(recent_range * 1.25, abs(first_close) * 0.0015)
+
+    # One matching structural swing + meaningful recent progress is enough to
+    # recognise an established change; contradictory swing evidence stays MIXED.
+    if recent_move > meaningful and (hh or hl) and not (lh or ll):
+        return "bullish"
+    if recent_move < -meaningful and (lh or ll) and not (hh or hl):
+        return "bearish"
+
     return "mixed"
 
 
