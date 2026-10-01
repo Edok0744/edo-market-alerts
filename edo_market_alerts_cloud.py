@@ -4071,7 +4071,15 @@ def detect_bounce_retest(candles, conf):
     (
         old_i, old_price, separation, closeness, moved_away,
         zone_centre, retest_depth_pct, departure_extreme, target1, take_profit
-    ) = max(candidates, key=lambda x: (x[3], x[2]))
+    ) = min(
+        candidates,
+        # Edo rule: use the CLOSEST valid previous structural S/R level.
+        # BUY  -> closest qualifying historical swing LOW / support.
+        # SELL -> closest qualifying historical swing HIGH / resistance.
+        # If two levels are effectively equally close in price, prefer the
+        # most recent structural swing rather than an older level.
+        key=lambda x: (abs(float(x[1]) - float(retest_price)), -int(x[0]))
+    )
 
     score = 6.0
     score += min(3.0, separation / 15.0)
