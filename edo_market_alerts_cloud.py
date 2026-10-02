@@ -5430,6 +5430,98 @@ def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
     return None, states, None
 
 
+def eight_hour_gap_higher_trend(symbol, grp="FOREX"):
+    """
+    Direction context ONLY for the 8H S/R Gap-Retest signal.
+
+    Edo rule:
+      1) Daily structure is checked first.
+      2) If Daily is mixed/ranging, Weekly is checked as the higher reference.
+      3) If neither Daily nor Weekly has a clear trend, the market is treated
+         as ranging and the existing 8H Gap-Retest may signal either direction.
+
+    This does not change Gap-Retest detection, confirmation, S/R, targets, or
+    any other signal. Fully CLOSED higher-timeframe candles are used.
+    """
+    states = {}
+
+    daily, err = get_ohlc(symbol, "1day", outputsize=80, grp=grp)
+    if err:
+        return None, states, err
+    daily_closed = fully_closed_candles(daily, "1day")
+    if len(daily_closed) < 12:
+        return None, states, "Not enough completed Daily candle data for 8H Gap-Retest trend context."
+
+    daily_trend = local_structure_trend(daily_closed, len(daily_closed))
+    states["1D"] = daily_trend.capitalize()
+    if daily_trend in ("bullish", "bearish"):
+        states["Used"] = "1D"
+        states["Market"] = "Trending"
+        return daily_trend, states, None
+
+    weekly, err = get_ohlc(symbol, "1week", outputsize=80, grp=grp)
+    if err:
+        return None, states, err
+    weekly_closed = fully_closed_candles(weekly, "1week")
+    if len(weekly_closed) < 12:
+        return None, states, "Not enough completed Weekly candle data for 8H Gap-Retest trend context."
+
+    weekly_trend = local_structure_trend(weekly_closed, len(weekly_closed))
+    states["1W"] = weekly_trend.capitalize()
+    if weekly_trend in ("bullish", "bearish"):
+        states["Used"] = "1W"
+        states["Market"] = "Trending"
+        return weekly_trend, states, None
+
+    states["Used"] = "8H Range"
+    states["Market"] = "Ranging"
+    return None, states, None
+
+
+def apply_8h_gap_trend_filter(symbol, grp, interval, setups):
+    """
+    Keep the existing 8H S/R Gap-Retest exactly as detected, but when Daily
+    (or Weekly fallback) has a clear trend, allow only Gap-Retests in that
+    direction. If both are mixed/ranging, allow the normal 8H range signals
+    in either direction. Other setup types and other timeframes are untouched.
+    """
+    if interval != "8h":
+        return setups, None, None
+
+    gap_setups = [p for p in setups if p.get("name") == "S/R GAP RETEST SETUP"]
+    if not gap_setups:
+        return setups, None, None
+
+    higher_direction, states, error = eight_hour_gap_higher_trend(symbol, grp)
+    if error:
+        return [], states, error
+
+    filtered = []
+    for p in setups:
+        if p.get("name") != "S/R GAP RETEST SETUP":
+            filtered.append(p)
+            continue
+
+        # Ranging/mixed higher timeframes: preserve Edo's existing 8H
+        # Gap-Retest exactly, including BUY support and SELL resistance setups.
+        if higher_direction is None:
+            q = dict(p)
+            q["gap_trend_filter"] = "ranging"
+            q["gap_higher_tf_states"] = dict(states)
+            filtered.append(q)
+            continue
+
+        # Clear higher-timeframe trend: continuation direction only.
+        if p.get("direction") == higher_direction:
+            q = dict(p)
+            q["gap_trend_filter"] = "with_trend"
+            q["gap_higher_tf_direction"] = higher_direction
+            q["gap_higher_tf_states"] = dict(states)
+            filtered.append(q)
+
+    return filtered, states, None
+
+
 def apply_strong_trend_filter(symbol, grp, interval, setups):
     """
     4H Trend Pullback signals are continuation-only signals.
@@ -5760,6 +5852,17 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             return None, htf_error
 
         found = normal_found + other_found
+
+    # Edo 8H S/R Gap-Retest direction filter ONLY. The Gap-Retest itself is
+    # unchanged. In a clear Daily trend (Weekly fallback when Daily is mixed),
+    # keep only setups with that trend. If both are mixed/ranging, keep the
+    # normal 8H range setups in either direction.
+    if interval == "8h":
+        found, gap_higher_tf_states, gap_htf_error = apply_8h_gap_trend_filter(
+            symbol, grp, interval, found
+        )
+        if gap_htf_error:
+            return None, gap_htf_error
 
     # Use the same final confirmation-room rule as the automatic monitor.
     # This keeps the manual SIGNAL page and phone alerts in agreement.
