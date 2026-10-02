@@ -3598,6 +3598,80 @@ def local_structure_trend(candles, end_index):
     return "mixed"
 
 
+
+def trend_pullback_structure_trend(candles, end_index):
+    """
+    Trend direction used ONLY by the normal TREND PULLBACK detector.
+
+    Purpose: identify the dominant RECENT structure before the pullback starts,
+    without letting an old large impulse dominate after market structure has
+    genuinely changed.  No EMA/RSI and no changes to other EdoSignal signals.
+
+    Evidence is deliberately recent and layered:
+      1) newest confirmed swing highs/lows (HH+HL or LH+LL),
+      2) directional progress across 12/20/28-candle windows,
+      3) conflicting evidence returns MIXED rather than forcing a direction.
+    """
+    if end_index < 12:
+        return "mixed"
+
+    history = candles[:end_index]
+    if len(history) < 12:
+        return "mixed"
+
+    # Structural vote from the newest confirmed swings.  Use at most the last
+    # 28 pre-pullback candles so a much older trend cannot control a new regime.
+    structural = history[-28:]
+    highs = swing_points(structural, "high", left=2, right=2)
+    lows = swing_points(structural, "low", left=2, right=2)
+
+    swing_vote = None
+    if len(highs) >= 2 and len(lows) >= 2:
+        hh = highs[-1][1] > highs[-2][1]
+        hl = lows[-1][1] > lows[-2][1]
+        lh = highs[-1][1] < highs[-2][1]
+        ll = lows[-1][1] < lows[-2][1]
+        if hh and hl:
+            swing_vote = "bullish"
+        elif lh and ll:
+            swing_vote = "bearish"
+
+    # Recent-progress votes.  Averaging three closes at each end reduces the
+    # chance that one spike/wick or one unusually large candle flips the trend.
+    progress_votes = []
+    for n in (12, 20, 28):
+        if len(history) < n:
+            continue
+        part = history[-n:]
+        first = sum(float(c["close"]) for c in part[:3]) / 3.0
+        last = sum(float(c["close"]) for c in part[-3:]) / 3.0
+        move = last - first
+        ar = avg_range(part, end=len(part), length=len(part))
+        threshold = max(ar * 1.10, abs(first) * 0.0010)
+        if move > threshold:
+            progress_votes.append("bullish")
+        elif move < -threshold:
+            progress_votes.append("bearish")
+
+    bulls = progress_votes.count("bullish")
+    bears = progress_votes.count("bearish")
+
+    # A confirmed newest HH+HL / LH+LL has priority unless recent price
+    # progress clearly contradicts it in at least two windows.
+    if swing_vote == "bullish" and bears < 2:
+        return "bullish"
+    if swing_vote == "bearish" and bulls < 2:
+        return "bearish"
+
+    # Without a complete swing pair, require agreement from at least two recent
+    # windows.  Otherwise stay MIXED and suppress the Trend Pullback signal.
+    if bulls >= 2 and bears == 0:
+        return "bullish"
+    if bears >= 2 and bulls == 0:
+        return "bearish"
+
+    return "mixed"
+
 def previous_target(candles, direction, before_index, search_back=60):
     """
     BUY target = previous significant swing high.
@@ -4505,7 +4579,9 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     if not clean_ok:
         return None
 
-    trend = local_structure_trend(candles, run_start)
+    # Trend Pullback ONLY: use the dominant recent-structure classifier.
+    # Other EdoSignal signal families continue using their existing logic.
+    trend = trend_pullback_structure_trend(candles, run_start)
     if require_local_trend and trend != required_trend:
         return None
 
