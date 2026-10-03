@@ -2967,6 +2967,7 @@ PATTERN_BASELINE_CLOSED = {}
 PATTERN_TIMEFRAMES = [
     {"label": "4H", "value": "4h"},
     {"label": "8H", "value": "8h"},
+    {"label": "12H", "value": "12h"},
     {"label": "1D", "value": "1day"},
     {"label": "1W", "value": "1week"},
 ]
@@ -2974,6 +2975,12 @@ PATTERN_TIMEFRAMES = [
 # Edo's exact signal timeframes.
 NORMAL_PULLBACK_INTERVALS = {"4h", "8h", "1day", "1week"}
 SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
+
+def sr_gap_retest_interval_enabled(grp, interval):
+    """Edo Gap-Retest timeframes: Crypto uses 12H/Daily/Weekly; others use 8H/Daily/Weekly."""
+    if str(grp or "").upper() == "CRYPTO":
+        return interval in {"12h", "1day", "1week"}
+    return interval in SR_GAP_RETEST_INTERVALS
 
 # Alias retained for older helper code.
 CORE_PATTERN_INTERVALS = SR_GAP_RETEST_INTERVALS
@@ -5485,7 +5492,8 @@ def apply_8h_gap_trend_filter(symbol, grp, interval, setups):
     direction. If both are mixed/ranging, allow the normal 8H range signals
     in either direction. Other setup types and other timeframes are untouched.
     """
-    if interval != "8h":
+    filter_interval = "12h" if str(grp or "").upper() == "CRYPTO" else "8h"
+    if interval != filter_interval:
         return setups, None, None
 
     gap_setups = [p for p in setups if p.get("name") == "S/R GAP RETEST SETUP"]
@@ -5799,7 +5807,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    Established high/low on the left -> clear move away / separation ->
     #    later retest of the same zone -> opposite-colour CLOSED confirmation.
     #    The 50% previous-candle BODY rule applies ONLY to this signal.
-    if interval in SR_GAP_RETEST_INTERVALS:
+    if sr_gap_retest_interval_enabled(grp, interval):
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
@@ -5820,8 +5828,10 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     elif interval == "8h":
         found = [
             p for p in found
-            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
+            if p.get("name") in (("TREND PULLBACK SETUP",) if str(grp).upper() == "CRYPTO" else ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP"))
         ]
+    elif interval == "12h":
+        found = [p for p in found if str(grp).upper() == "CRYPTO" and p.get("name") == "S/R GAP RETEST SETUP"]
     elif interval == "1day":
         found = [
             p for p in found
@@ -5857,7 +5867,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     # unchanged. In a clear Daily trend (Weekly fallback when Daily is mixed),
     # keep only setups with that trend. If both are mixed/ranging, keep the
     # normal 8H range setups in either direction.
-    if interval == "8h":
+    if interval == ("12h" if str(grp).upper() == "CRYPTO" else "8h"):
         found, gap_higher_tf_states, gap_htf_error = apply_8h_gap_trend_filter(
             symbol, grp, interval, found
         )
@@ -6429,7 +6439,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     # B) S/R GAP-AND-RETEST — 8H, Daily and Weekly, WITH 50% rule.
     #    Messy lower-timeframe structures are suppressed so Daily/Weekly can
     #    supply the cleaner version of the same price structure.
-    if interval in SR_GAP_RETEST_INTERVALS:
+    if sr_gap_retest_interval_enabled(grp, interval):
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
@@ -6449,8 +6459,10 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     elif interval == "8h":
         setups = [
             p for p in setups
-            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
+            if p.get("name") in (("TREND PULLBACK SETUP",) if str(grp).upper() == "CRYPTO" else ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP"))
         ]
+    elif interval == "12h":
+        setups = [p for p in setups if str(grp).upper() == "CRYPTO" and p.get("name") == "S/R GAP RETEST SETUP"]
     elif interval == "1day":
         setups = [
             p for p in setups
@@ -6482,6 +6494,15 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             return None, latest_closed_date, htf_error
 
         setups = normal_setups + other_setups
+
+    # Gap-Retest higher-timeframe direction filter only:
+    # Forex/CFD use 8H; Bybit Crypto uses 12H. Detection rules are unchanged.
+    if interval == ("12h" if str(grp).upper() == "CRYPTO" else "8h"):
+        setups, gap_higher_tf_states, gap_htf_error = apply_8h_gap_trend_filter(
+            symbol, grp, interval, setups
+        )
+        if gap_htf_error:
+            return None, latest_closed_date, gap_htf_error
 
     # Reject overextended 4H/8H confirmations that have already arrived at
     # the next important historical S/R level. Rejected setups do NOT Push.
@@ -6603,6 +6624,9 @@ def pattern_signal_monitor():
 
                 for tf in PATTERN_TIMEFRAMES:
                     interval = tf["value"]
+                    # 12H automatic pattern scan is only for Bybit Crypto Gap-Retest.
+                    if interval == "12h" and grp != "CRYPTO":
+                        continue
                     key = (grp, symbol, interval)
                     previous = last_checked.get(key, 0.0)
                     due = due_seconds.get(interval, 30 * 60)
