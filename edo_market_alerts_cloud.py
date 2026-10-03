@@ -1387,7 +1387,7 @@ a{text-decoration:none}
 <body>
 <div class="wrap">
     <h1>📊 {{ symbol }} PRICE ACTION</h1>
-    <div class="small">{{ group }} • Price Action status • Trend Pullback: 4H / 8H / 1D • consecutive adjacent 2+ candles • clean retracement required • S/R Gap-Retest: 8H / 1D / 1W • Closed candles only • Manual trade decision</div>
+    <div class="small">{{ group }} • Price Action status • Trend Pullback: 4H / 8H / 1D • consecutive adjacent 2+ candles • clean retracement required • S/R Gap-Retest: {% if group == 'CRYPTO' %}12H / 1D / 1W{% else %}8H / 1D / 1W{% endif %} • Closed candles only • Manual trade decision</div>
 
     <div class="tfrow">
         {% for tf in timeframes %}
@@ -8092,11 +8092,18 @@ def signal(i):
     if not f or f['grp'] not in ('FOREX', 'CRYPTO', 'CFD'):
         return redirect('/')
 
-    allowed = {x["value"]: x["label"] for x in PATTERN_TIMEFRAMES}
-    selected_tf = request.args.get("tf", "8h")
+    # Edo UI rule: Crypto no longer exposes the 8H manual signal timeframe.
+    # This is display/navigation only; no other market group's timeframes change.
+    signal_timeframes = (
+        [x for x in PATTERN_TIMEFRAMES if x["value"] != "8h"]
+        if f['grp'] == 'CRYPTO'
+        else PATTERN_TIMEFRAMES
+    )
+    allowed = {x["value"]: x["label"] for x in signal_timeframes}
+    selected_tf = request.args.get("tf", "4h" if f['grp'] == 'CRYPTO' else "8h")
 
     if selected_tf not in allowed:
-        selected_tf = "8h"
+        selected_tf = "4h" if f['grp'] == 'CRYPTO' else "8h"
 
     force_refresh = request.args.get('refresh') == '1'
     data, error = build_pattern_signal(
@@ -8134,7 +8141,7 @@ def signal(i):
             symbol=f['symbol'],
             group=f['grp'],
             fav_id=f['id'],
-            timeframes=PATTERN_TIMEFRAMES,
+            timeframes=signal_timeframes,
             selected_tf=selected_tf,
             selected_label=allowed[selected_tf],
             price='—',
@@ -8156,7 +8163,7 @@ def signal(i):
         symbol=f['symbol'],
         group=f['grp'],
         fav_id=f['id'],
-        timeframes=PATTERN_TIMEFRAMES,
+        timeframes=signal_timeframes,
         selected_tf=selected_tf,
         selected_label=allowed[selected_tf],
         price=f"{data['price']:.5f}",
