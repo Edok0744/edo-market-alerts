@@ -221,6 +221,7 @@ def ohlc_cache_seconds(interval):
         "2h": 180,
         "3h": 210,
         "4h": 240,
+        "6h": 270,
         "8h": 300,
         "12h": 360,
         "1day": 600,
@@ -788,7 +789,7 @@ Target {{m['direction']}} {{m['target']}}
 <div class="alerttrend">
     <div class="alerttrend-title">TREND • Weekly reference only</div>
     <div class="alerttrend-grid">
-        {% set alert_tfs = ['Weekly','Daily','8H','4H'] if m['grp'] == 'CFD' else ['Weekly','12H','8H','4H','3H'] %}
+        {% set alert_tfs = ['Weekly','Daily','8H','6H'] if m['grp'] == 'CFD' else ['Weekly','12H','8H','6H'] %}
         {% for tf in alert_tfs %}
         {% set st = snap.get(tf, '') %}
         <div>
@@ -1257,7 +1258,7 @@ a{text-decoration:none}
 
         <div class="small" style="margin-top:12px">
             Trend is calculated from fully closed candlesticks only. FULL BULLISH / FULL BEARISH
-            requires 12H, 8H, 4H and 3H to all agree. Weekly is shown for reference only and does
+            requires 12H, 8H and 6H to all agree. The 6H state requires two consecutive fully closed candles in the same direction. Weekly is shown for reference only and does
             not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
         </div>
     {% endif %}
@@ -1757,7 +1758,7 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
-        # Full Trend migration: 3H replaces the old 1H trigger timeframe.
+        # Full Trend uses 6H instead of the old 4H component; 3H is no longer part of Full Trend.
         # Adding h3 is our one-time migration marker. Clear the old FULL status
         # so a badge calculated under the previous 1H rule is never shown as
         # if it were a 3H result after deployment.
@@ -3302,6 +3303,7 @@ def interval_seconds(interval):
         "2h": 2 * 60 * 60,
         "3h": 3 * 60 * 60,
         "4h": 4 * 60 * 60,
+        "6h": 6 * 60 * 60,
         "8h": 8 * 60 * 60,
         "12h": 12 * 60 * 60,
         "1day": 24 * 60 * 60,
@@ -6769,7 +6771,7 @@ def save_trend_snapshot(symbol, states):
                 states.get("Daily", ""),
                 states.get("12H", ""),
                 states.get("8H", ""),
-                states.get("4H", ""),
+                states.get("6H", ""),
                 states.get("3H", ""),
                 datetime.utcnow().isoformat(),
             )
@@ -6815,10 +6817,13 @@ def build_full_alignment(symbol, grp=None):
     Edo direct-candlestick alignment signal.
 
     CFD trigger timeframes:
-      4H + 8H + Daily
+      6H + 8H + Daily
 
-    FOREX / CRYPTO trigger timeframes remain:
-      12H + 8H + 4H + 3H
+    FOREX / CRYPTO trigger timeframes:
+      12H + 8H + 6H
+
+    The 6H component is valid only after TWO consecutive fully closed 6H
+    candles agree in direction.
 
     Weekly is display/reference only for every market group.
     All decisions use the last fully CLOSED candle.
@@ -6829,17 +6834,16 @@ def build_full_alignment(symbol, grp=None):
         intervals = {
             "Daily": "1day",
             "8H": "8h",
-            "4H": "4h",
+            "6H": "6h",
         }
-        refresh_intervals = {"1day", "4h", "8h"}
+        refresh_intervals = {"1day", "1h", "8h"}
     else:
         intervals = {
             "12H": "12h",
             "8H": "8h",
-            "4H": "4h",
-            "3H": "3h",
+            "6H": "6h",
         }
-        refresh_intervals = {"1h", "4h", "8h"}
+        refresh_intervals = {"1h", "8h"}
 
     signal_states = {}
 
@@ -6861,7 +6865,7 @@ def build_full_alignment(symbol, grp=None):
             stamp = closed.get("datetime", "unknown")
             return "", f"Waiting for fresh completed {label} candle data (latest {stamp})."
 
-        signal_states[label] = analyse_candle(closed)
+        signal_states[label] = analyse_two_closed_6h(candles) if interval == "6h" else analyse_candle(closed)
 
     # Weekly is reference-only and never decides FULL BULLISH / FULL BEARISH.
     weekly_state = ""
@@ -6995,8 +6999,7 @@ TREND_INTERVALS = [
     ("1W", "1week"),
     ("1D", "1day"),
     ("8H", "8h"),
-    ("4H", "4h"),
-    ("3H", "3h"),
+    ("6H", "6h"),
 ]
 
 
@@ -7205,6 +7208,56 @@ def _aggregate_1h_to_3h(candles_1h):
     return synthetic
 
 
+def _aggregate_1h_to_6h(candles_1h):
+    """Build synthetic 6H candles from 6 consecutive 1H candles.
+
+    Used ONLY by the FULL BULLISH / FULL BEARISH trend display/alignment.
+    Existing 4H Trend Pullback and every other signal remain unchanged.
+    """
+    from collections import Counter
+    from datetime import timedelta
+
+    parsed = []
+    for c in candles_1h or []:
+        dt = parse_candle_utc(c.get("datetime", ""))
+        if dt is not None:
+            parsed.append((dt, c))
+    if not parsed:
+        return []
+    parsed.sort(key=lambda item: item[0])
+
+    phase_counts = Counter(dt.hour % 6 for dt, _ in parsed)
+    phase = phase_counts.most_common(1)[0][0]
+    buckets = {}
+    for dt, c in parsed:
+        shifted = dt - timedelta(hours=phase)
+        bucket_hour = (shifted.hour // 6) * 6
+        bucket_shifted = shifted.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
+        bucket_start = bucket_shifted + timedelta(hours=phase)
+        buckets.setdefault(bucket_start, []).append((dt, c))
+
+    synthetic = []
+    for bucket_start in sorted(buckets):
+        group = sorted(buckets[bucket_start], key=lambda item: item[0])
+        if len(group) != 6:
+            continue
+        expected = [bucket_start + timedelta(hours=i) for i in range(6)]
+        if [dt for dt, _ in group] != expected:
+            continue
+        parts = [c for _, c in group]
+        synthetic.append({
+            "datetime": bucket_start.strftime("%Y-%m-%d %H:%M:%S"),
+            "open": parts[0]["open"],
+            "high": max(x["high"] for x in parts),
+            "low": min(x["low"] for x in parts),
+            "close": parts[-1]["close"],
+            "_parts": 6,
+            "_source_symbol": parts[0].get("_source_symbol", ""),
+            "_source_label": parts[0].get("_source_label", ""),
+        })
+    return synthetic
+
+
 def _aggregate_4h_to_8h(candles_4h):
     """Build synthetic 8H candles from two consecutive Bybit 4H candles."""
     from collections import Counter
@@ -7353,6 +7406,17 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
             return None, "Not enough 1H candle history to build completed 3H candles."
         return candles_3h[-outputsize:], None
 
+    if interval == "6h":
+        # FULL TREND only: construct 6H from six consecutive 1H source candles.
+        source_size = max(80, outputsize * 6 + 18)
+        candles_1h, error = get_ohlc(symbol, "1h", outputsize=source_size, grp=grp)
+        if error:
+            return None, error
+        candles_6h = _aggregate_1h_to_6h(candles_1h)
+        if len(candles_6h) < 2:
+            return None, "Not enough 1H candle history to build two completed 6H candles."
+        return candles_6h[-outputsize:], None
+
     if interval == "8h" and grp == "CRYPTO":
         # Bybit V5 does not provide a native 8H kline.
         # Build 8H from two consecutive Bybit 4H candles.
@@ -7467,6 +7531,18 @@ def analyse_candle(candle):
     return "Mixed"
 
 
+def analyse_two_closed_6h(candles):
+    """FULL TREND 6H rule: two consecutive fully CLOSED candles must agree."""
+    closed = fully_closed_candles(candles, "6h")
+    if len(closed) < 2:
+        return "Mixed"
+    a = analyse_candle(closed[-2])
+    b = analyse_candle(closed[-1])
+    if a == b and a in ("Bullish", "Bearish"):
+        return a
+    return "Mixed"
+
+
 def analyse_closes(candles, interval):
     """
     Analyse ONLY the newest truly fully closed candlestick colour.
@@ -7489,20 +7565,20 @@ def build_trend_scan(symbol, grp=None):
     reference_intervals = [("Weekly", "1week")]
     is_cfd = str(grp or "").upper() == "CFD"
 
-    # CFD uses no timeframe below 4H: 4H + 8H + Daily decide FULL TREND.
-    # Weekly remains visible as reference only. FOREX / CRYPTO are unchanged.
+    # FULL TREND uses 6H instead of the old 4H component.
+    # The 6H state requires two consecutive fully closed candles in one direction.
+    # Weekly remains visible as reference only.
     if is_cfd:
         signal_intervals = [
             ("Daily", "1day"),
             ("8H", "8h"),
-            ("4H", "4h"),
+            ("6H", "6h"),
         ]
     else:
         signal_intervals = [
             ("12H", "12h"),
             ("8H", "8h"),
-            ("4H", "4h"),
-            ("3H", "3h"),
+            ("6H", "6h"),
         ]
 
     states = {}
@@ -7530,7 +7606,7 @@ def build_trend_scan(symbol, grp=None):
         closed = last_closed_candle(candles, interval)
         if closed is None:
             return None, f"Not enough completed {label} candle data."
-        state = analyse_candle(closed)
+        state = analyse_two_closed_6h(candles) if interval == "6h" else analyse_candle(closed)
         states[label] = state
         icon, css = state_info[state]
         results.append({
@@ -7546,69 +7622,69 @@ def build_trend_scan(symbol, grp=None):
     full_bear_sr, full_bear_sr_info = full_trend_at_structural_sr(symbol, grp, "BEARISH")
 
     if is_cfd:
-        signal_labels = ("Daily", "8H", "4H")
-        weights = {"Daily": 3, "8H": 2, "4H": 1}
+        signal_labels = ("Daily", "8H", "6H")
+        weights = {"Daily": 3, "8H": 2, "6H": 1}
         score = sum(weights[x] if states[x] == "Bullish" else -weights[x] if states[x] == "Bearish" else 0 for x in signal_labels)
         full_bull = all(states[x] == "Bullish" for x in signal_labels)
         full_bear = all(states[x] == "Bearish" for x in signal_labels)
         if full_bull and full_bull_sr:
             summary, icon, css = "FULL BULLISH", "🟢", "bull"
             info = full_bull_sr_info or {}
-            detail = f"4H, 8H and Daily are all GREEN and price is confirming SUPPORT on {info.get('timeframe','8H/Daily')}. Weekly is reference only."
+            detail = f"6H, 8H and Daily are all GREEN and price is confirming SUPPORT on {info.get('timeframe','8H/Daily')}. Weekly is reference only."
         elif full_bear and full_bear_sr:
             summary, icon, css = "FULL BEARISH", "🔴", "bear"
             info = full_bear_sr_info or {}
-            detail = f"4H, 8H and Daily are all RED and price is confirming RESISTANCE on {info.get('timeframe','8H/Daily')}. Weekly is reference only."
+            detail = f"6H, 8H and Daily are all RED and price is confirming RESISTANCE on {info.get('timeframe','8H/Daily')}. Weekly is reference only."
         elif full_bull:
             summary, icon, css = "BULLISH — WAIT FOR SUPPORT", "🟡", "mixed"
-            detail = "4H, 8H and Daily are aligned bullish, but price is not confirming meaningful structural SUPPORT yet."
+            detail = "6H, 8H and Daily are aligned bullish, but price is not confirming meaningful structural SUPPORT yet."
         elif full_bear:
             summary, icon, css = "BEARISH — WAIT FOR RESISTANCE", "🟡", "mixed"
-            detail = "4H, 8H and Daily are aligned bearish, but price is not confirming meaningful structural RESISTANCE yet."
+            detail = "6H, 8H and Daily are aligned bearish, but price is not confirming meaningful structural RESISTANCE yet."
         elif score >= 4:
             summary, icon, css = "BULLISH", "🟢", "bull"
-            detail = "4H, 8H and Daily lean bullish but are not fully aligned. Weekly is reference only."
+            detail = "6H, 8H and Daily lean bullish but are not fully aligned. Weekly is reference only."
         elif score <= -4:
             summary, icon, css = "BEARISH", "🔴", "bear"
-            detail = "4H, 8H and Daily lean bearish but are not fully aligned. Weekly is reference only."
+            detail = "6H, 8H and Daily lean bearish but are not fully aligned. Weekly is reference only."
         else:
             summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
-            detail = "4H, 8H and Daily are not aligned strongly enough. Weekly is reference only."
+            detail = "6H, 8H and Daily are not aligned strongly enough. Weekly is reference only."
     else:
-        signal_labels = ("12H", "8H", "4H", "3H")
-        weights = {"12H": 4, "8H": 3, "4H": 2, "3H": 1}
+        signal_labels = ("12H", "8H", "6H")
+        weights = {"12H": 3, "8H": 2, "6H": 1}
         score = sum(weights[x] if states[x] == "Bullish" else -weights[x] if states[x] == "Bearish" else 0 for x in signal_labels)
         full_bull = all(states[x] == "Bullish" for x in signal_labels)
         full_bear = all(states[x] == "Bearish" for x in signal_labels)
         if full_bull and full_bull_sr:
             summary, icon, css = "FULL BULLISH", "🟢", "bull"
             info = full_bull_sr_info or {}
-            detail = f"12H, 8H, 4H and 3H are all GREEN and price is confirming SUPPORT on {info.get('timeframe','8H/Daily')}."
+            detail = f"12H, 8H and 6H are all GREEN and price is confirming SUPPORT on {info.get('timeframe','8H/Daily')}."
         elif full_bear and full_bear_sr:
             summary, icon, css = "FULL BEARISH", "🔴", "bear"
             info = full_bear_sr_info or {}
-            detail = f"12H, 8H, 4H and 3H are all RED and price is confirming RESISTANCE on {info.get('timeframe','8H/Daily')}."
+            detail = f"12H, 8H and 6H are all RED and price is confirming RESISTANCE on {info.get('timeframe','8H/Daily')}."
         elif full_bull:
             summary, icon, css = "BULLISH — WAIT FOR SUPPORT", "🟡", "mixed"
-            detail = "12H, 8H, 4H and 3H are aligned bullish, but price is not confirming meaningful structural SUPPORT yet."
+            detail = "12H, 8H and 6H are aligned bullish, but price is not confirming meaningful structural SUPPORT yet."
         elif full_bear:
             summary, icon, css = "BEARISH — WAIT FOR RESISTANCE", "🟡", "mixed"
-            detail = "12H, 8H, 4H and 3H are aligned bearish, but price is not confirming meaningful structural RESISTANCE yet."
-        elif states["12H"] == "Bullish" and any(states[x] == "Bearish" for x in ("8H", "4H", "3H")):
+            detail = "12H, 8H and 6H are aligned bearish, but price is not confirming meaningful structural RESISTANCE yet."
+        elif states["12H"] == "Bullish" and any(states[x] == "Bearish" for x in ("8H", "6H")):
             summary, icon, css = "BULLISH — LOWER-TIMEFRAME PULLBACK", "🟡", "mixed"
             detail = "12H is bullish, but one or more lower signal timeframes are pulling back."
-        elif states["12H"] == "Bearish" and any(states[x] == "Bullish" for x in ("8H", "4H", "3H")):
+        elif states["12H"] == "Bearish" and any(states[x] == "Bullish" for x in ("8H", "6H")):
             summary, icon, css = "BEARISH — LOWER-TIMEFRAME BOUNCE", "🟡", "mixed"
             detail = "12H is bearish, but one or more lower signal timeframes are bouncing."
-        elif score >= 6:
+        elif score >= 4:
             summary, icon, css = "BULLISH", "🟢", "bull"
-            detail = "12H, 8H, 4H and 3H lean bullish."
-        elif score <= -6:
+            detail = "12H, 8H and 6H lean bullish."
+        elif score <= -4:
             summary, icon, css = "BEARISH", "🔴", "bear"
-            detail = "12H, 8H, 4H and 3H lean bearish."
+            detail = "12H, 8H and 6H lean bearish."
         else:
             summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
-            detail = "12H, 8H, 4H and 3H are not aligned strongly enough."
+            detail = "12H, 8H and 6H are not aligned strongly enough."
 
     return {
         "results": results, "summary": summary, "summary_icon": icon,
@@ -7743,7 +7819,7 @@ def monitor():
                                 f"{a['symbol']} is {p}\n"
                                 f"Target: {a['direction']} {a['target']}\n"
                                 f"{trend_line}\n"
-                                f"12H + 8H + 4H + 3H use CLOSED candles only.\n"
+                                f"12H + 8H + 6H use CLOSED candles only.\n"
                                 f"Weekly is reference only.\n"
                                 f"Note: {a['note'] or '-'}"
                             )
@@ -7889,7 +7965,7 @@ def home():
                     'Daily': r['daily'] or '',
                     '12H': r['h12'] or '',
                     '8H': r['h8'] or '',
-                    '4H': r['h4'] or '',
+                    '6H': r['h4'] or '',
                     '3H': r['h3'] or '',
                     'updated': r['updated'] or ''
                 }
