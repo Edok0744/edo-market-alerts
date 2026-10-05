@@ -3665,6 +3665,37 @@ def trend_pullback_structure_trend(candles, end_index):
     bulls = progress_votes.count("bullish")
     bears = progress_votes.count("bearish")
 
+    # Recent-regime override for Trend Pullback only.  A strong fresh move can
+    # establish a new trend before the slower 20/28-candle swing structure has
+    # fully caught up.  This prevents an older bearish/bullish leg from causing
+    # a pullback alert in the wrong direction after a clear reversal.
+    recent_n = min(12, len(history))
+    recent = history[-recent_n:]
+    if len(recent) >= 8:
+        k = min(3, max(2, len(recent) // 4))
+        first_recent = sum(float(c["close"]) for c in recent[:k]) / k
+        last_recent = sum(float(c["close"]) for c in recent[-k:]) / k
+        recent_move = last_recent - first_recent
+        recent_ar = avg_range(recent, end=len(recent), length=len(recent))
+        strong_move = max(recent_ar * 2.25, abs(first_recent) * 0.0015)
+
+        up_steps = sum(
+            1 for j in range(1, len(recent))
+            if float(recent[j]["close"]) > float(recent[j-1]["close"])
+        )
+        down_steps = sum(
+            1 for j in range(1, len(recent))
+            if float(recent[j]["close"]) < float(recent[j-1]["close"])
+        )
+        step_need = max(4, (len(recent) - 1) // 2 + 1)
+
+        # Require both substantial displacement and a majority of progressing
+        # closes, so one oversized candle alone cannot flip the trend.
+        if recent_move > strong_move and up_steps >= step_need and up_steps > down_steps:
+            return "bullish"
+        if recent_move < -strong_move and down_steps >= step_need and down_steps > up_steps:
+            return "bearish"
+
     # A confirmed newest HH+HL / LH+LL has priority unless recent price
     # progress clearly contradicts it in at least two windows.
     if swing_vote == "bullish" and bears < 2:
