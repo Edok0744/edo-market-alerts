@@ -4559,6 +4559,67 @@ def clean_pullback_run(candles, run_start, confirm_index, run_colour):
     return True, ""
 
 
+
+def trend_pullback_retracement_preserves_structure(candles, run_start, confirm_index, trend):
+    """
+    Trend Pullback ONLY: reject a 2+ candle counter-trend run when that run has
+    already broken the pre-existing trend structure.  The trend is measured
+    strictly BEFORE run_start; the retracement itself is never allowed to
+    manufacture the trend it is supposed to be pulling back against.
+
+    Bearish continuation stays valid only while the bullish retracement does
+    not close above the newest confirmed pre-pullback swing high.
+    Bullish continuation stays valid only while the bearish retracement does
+    not close below the newest confirmed pre-pullback swing low.
+
+    A small average-range buffer avoids cancelling a valid pullback for a
+    marginal/rounding touch.  If no confirmed swing is available, a very large
+    counter-trend displacement is treated conservatively as a structure break.
+    """
+    if run_start < 4 or confirm_index <= run_start:
+        return False
+
+    pre = candles[:run_start]
+    run = candles[run_start:confirm_index]
+    if not pre or not run:
+        return False
+
+    recent_pre = pre[-24:]
+    ar = avg_range(recent_pre, end=len(recent_pre), length=len(recent_pre))
+    if ar <= 0:
+        ar = avg_range(candles, end=run_start, length=20)
+    buffer = ar * 0.10 if ar > 0 else 0.0
+
+    highs = swing_points(recent_pre, "high", left=2, right=2)
+    lows = swing_points(recent_pre, "low", left=2, right=2)
+    run_closes = [float(c["close"]) for c in run]
+
+    if trend == "bearish":
+        if highs:
+            last_swing_high = float(highs[-1][1])
+            if max(run_closes) > last_swing_high + buffer:
+                return False
+        else:
+            start_price = float(run[0]["open"])
+            progress = max(run_closes) - start_price
+            if ar > 0 and progress > ar * 3.0:
+                return False
+
+    elif trend == "bullish":
+        if lows:
+            last_swing_low = float(lows[-1][1])
+            if min(run_closes) < last_swing_low - buffer:
+                return False
+        else:
+            start_price = float(run[0]["open"])
+            progress = start_price - min(run_closes)
+            if ar > 0 and progress > ar * 3.0:
+                return False
+    else:
+        return False
+
+    return True
+
 def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local_trend=True):
     """
     Edo Trend Pullback rule — NO 50% penetration requirement.
@@ -4623,6 +4684,14 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     # Other EdoSignal signal families continue using their existing logic.
     trend = trend_pullback_structure_trend(candles, run_start)
     if require_local_trend and trend != required_trend:
+        return None
+
+    # The counter-trend run must remain a retracement.  If it has already
+    # broken the pre-pullback swing structure, the old trend is invalidated and
+    # the confirmation candle must NOT create a continuation signal.
+    if not trend_pullback_retracement_preserves_structure(
+        candles, run_start, i, required_trend
+    ):
         return None
 
     score = 6.0 + min(3.0, (run_count - 2) * 0.75)
