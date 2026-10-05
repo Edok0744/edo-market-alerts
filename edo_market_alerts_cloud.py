@@ -4172,28 +4172,23 @@ def detect_bounce_retest(candles, conf):
         target1_source = "structural" if target1 is not None else None
         take_profit_source = "structural" if take_profit is not None else None
 
-        # If the market does not provide clear swing levels, still give Edo a
-        # realistic price-action target rather than leaving the setup blank.
-        calc_t1, calc_tp = sr_calculated_targets(
-            direction, confirm_close, zone_centre, departure_extreme, ar
-        )
-        if target1 is None:
-            target1 = calc_t1
-            target1_source = "calculated"
-        if take_profit is None:
-            take_profit = calc_tp
-            take_profit_source = "calculated"
-
+        # Edo rule: Gap-Retest targets must come from real previous swing
+        # structure only. Never invent/calculates a target when the chart does
+        # not provide a meaningful swing level. Target 1 may be absent, and
+        # Take Profit may be absent when there is no second valid swing.
         target_near_tol = ar * 0.35
-        target1 = float(target1)
-        if direction == "bullish":
-            if target1 > zone_centre and confirm_extreme >= target1 - target_near_tol:
-                continue
-        else:
-            if target1 < zone_centre and confirm_extreme <= target1 + target_near_tol:
-                continue
+        if target1 is not None:
+            target1 = float(target1)
+        if target1 is not None:
+            if direction == "bullish":
+                if target1 > zone_centre and confirm_extreme >= target1 - target_near_tol:
+                    continue
+            else:
+                if target1 < zone_centre and confirm_extreme <= target1 + target_near_tol:
+                    continue
 
-        take_profit = float(take_profit)
+        if take_profit is not None:
+            take_profit = float(take_profit)
 
         closeness = 1.0 - min(1.0, abs(old_price - retest_price) / zone_tolerance)
         candidates.append((
