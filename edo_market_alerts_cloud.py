@@ -5092,10 +5092,10 @@ def detect_weekly_spike(closed_weekly):
     (recent close progress + swing highs/lows). No moving averages, RSI, etc.
 
     The wick itself must also be clearly out of ordinary:
-      - at least 3.0x the recent median same-side wick
-      - at least 55% of the recent median weekly range
-      - at least 25% of the current candle's full range
-      - at least 1.5x the current candle body
+      - at least 4.0x the recent median same-side wick
+      - at least 75% of the recent median weekly range
+      - at least 35% of the current candle's full range
+      - at least 2.0x the current candle body
 
     Requiring both a strong historical ratio AND meaningful absolute size
     prevents a small wick from looking abnormal only because recent same-side
@@ -5152,16 +5152,16 @@ def detect_weekly_spike(closed_weekly):
     # The current-range test protects against inflated ratios caused by a tiny
     # historical same-side wick median.
     upper_hit = (
-        upper_ratio >= 3.0
-        and upper >= med_range * 0.55
-        and upper >= current_range * 0.25
-        and upper >= body_floor * 1.5
+        upper_ratio >= 4.0
+        and upper >= med_range * 0.75
+        and upper >= current_range * 0.35
+        and upper >= body_floor * 2.0
     )
     lower_hit = (
-        lower_ratio >= 3.0
-        and lower >= med_range * 0.55
-        and lower >= current_range * 0.25
-        and lower >= body_floor * 1.5
+        lower_ratio >= 4.0
+        and lower >= med_range * 0.75
+        and lower >= current_range * 0.35
+        and lower >= body_floor * 2.0
     )
 
     # Directional reversal filter:
