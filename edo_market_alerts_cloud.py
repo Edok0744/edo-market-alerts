@@ -7115,6 +7115,11 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
     daily_starts = [parse_candle_utc(c.get("datetime")) for c in daily]
     eight_starts = [parse_candle_utc(c.get("datetime")) for c in eight]
     state, event = "", None
+    # Optional FULL TREND replay audit; never changes the trading decision.
+    # Enable EDO_FULL_TREND_AUDIT=1 in Railway to inspect historical crossings.
+    import os
+    audit = os.environ.get("EDO_FULL_TREND_AUDIT", "").strip() == "1"
+    audit_rows = []
 
     for i, candle in enumerate(eight):
         start = eight_starts[i]
@@ -7154,6 +7159,13 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
                          and previous_close <= high_mid and close > high_mid)
         bearish_cross = (low_mid is not None and previous_close is not None
                          and previous_close >= low_mid and close < low_mid)
+        if audit and (bullish_cross or bearish_cross):
+            audit_rows.append((str(start), "BULLISH" if bullish_cross else "BEARISH",
+                               "NEW" if (bullish_cross and state != "FULL BULLISH") or
+                               (bearish_cross and state != "FULL BEARISH") else "CONTINUATION",
+                               round(close, 6),
+                               round(high_mid if bullish_cross else low_mid, 6),
+                               str(daily_starts[hi_idx if bullish_cross else lo_idx])))
         if bullish_cross and state != "FULL BULLISH":
             state = "FULL BULLISH"
             event = {"direction": "BULLISH", "level": high_mid,
@@ -7164,6 +7176,11 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
             event = {"direction": "BEARISH", "level": low_mid,
                      "swing_index": lo_idx, "break_index": i,
                      "break_candle": candle, "level_method": "daily_low_lower_wick_50pct_8h_close"}
+    if audit:
+        print("EDO FULL TREND REPLAY AUDIT: crossings (UTC candle start, side, event, 8H close, Daily wick midpoint, swing date):", audit_rows, flush=True)
+        print("EDO FULL TREND REPLAY AUDIT: final state:", state,
+              "start:", event["break_candle"].get("datetime") if event else None,
+              "daily bars:", len(daily), "8H bars:", len(eight), flush=True)
     return state, event
 
 
@@ -7873,6 +7890,67 @@ def analyse_closes(candles, interval):
         return "Mixed"
     return analyse_candle(closed)
 
+def weekly_card_completed_candles(candles, now_utc=None):
+    """Weekly card only: exclude the current (unfinished) calendar/trading week.
+
+    Independently verify weekly candle timestamps even if an upstream feed
+    labels its latest bar closed. Never use a partially formed weekly bar.
+    This filter is display-only; it does not change other signal calculations.
+    """
+    from datetime import datetime, timezone, timedelta
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    now_utc = now_utc.astimezone(timezone.utc)
+    current_week_start = (now_utc - timedelta(days=now_utc.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    completed = []
+    for candle in candles or []:
+        start = parse_candle_utc(candle.get("datetime"))
+        if start is None:
+            continue
+        # The current week is excluded even if a provider prematurely marks
+        # its row closed. A previous week can be used after Monday 00:00 UTC.
+        if start >= current_week_start:
+            continue
+        if start + timedelta(days=7) > now_utc:
+            continue
+        if candle.get("_fxcm_forming"):
+            continue
+        completed.append(candle)
+    return completed
+
+
+def weekly_display_structure_trend(closed_weekly):
+    """Independent Weekly card direction; never infer trend from one candle colour.
+
+    This function is DISPLAY ONLY. Other signal filters and their existing
+    weekly calculations are not modified.
+    """
+    if len(closed_weekly) < 12:
+        return "Mixed"
+    trend = local_structure_trend(closed_weekly, len(closed_weekly))
+    if trend in ("bullish", "bearish"):
+        return trend.capitalize()
+
+    # When the latest confirmed swing pair is still incomplete, require
+    # sustained weekly price progress rather than treating one green/red
+    # candle as a reversal. Compare two adjacent four-week blocks.
+    recent = closed_weekly[-8:]
+    earlier = recent[:4]
+    later = recent[4:]
+    earlier_close = sum(float(c["close"]) for c in earlier) / 4
+    later_close = sum(float(c["close"]) for c in later) / 4
+    typical_range = avg_range(recent, end=len(recent), length=len(recent))
+    threshold = max(typical_range * 0.65, abs(earlier_close) * 0.0015)
+    if later_close < earlier_close - threshold and float(later[-1]["close"]) < float(earlier[-1]["close"]):
+        return "Bearish"
+    if later_close > earlier_close + threshold and float(later[-1]["close"]) > float(earlier[-1]["close"]):
+        return "Bullish"
+    return "Mixed"
+
+
 def build_trend_scan(symbol, grp=None):
     """Display Daily swing mid-wick levels with 8H close confirmation."""
     results = []
@@ -7884,13 +7962,14 @@ def build_trend_scan(symbol, grp=None):
 
     # Weekly remains reference-only; Daily structure is now the sole authority
     # for FULL BULLISH / FULL BEARISH across Forex, CFD and Crypto.
-    weekly_candles, error = get_candles(symbol, "1week", outputsize=3, grp=grp)
+    weekly_candles, error = get_candles(symbol, "1week", outputsize=52, grp=grp)
     if error:
         return None, error
-    weekly_closed = last_closed_candle(weekly_candles, "1week")
-    if weekly_closed is None:
+    weekly_history = weekly_card_completed_candles(weekly_candles)
+    if len(weekly_history) < 12:
         return None, "Not enough completed Weekly candle data."
-    weekly_state = analyse_candle(weekly_closed)
+    weekly_closed = weekly_history[-1]  # Most recent FULLY completed week only
+    weekly_state = weekly_display_structure_trend(weekly_history)
     _, weekly_css = state_info[weekly_state]
     results.append({
         "label": "Weekly", "interval": "1week", "state": weekly_state,
