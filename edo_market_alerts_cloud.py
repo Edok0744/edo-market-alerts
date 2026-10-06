@@ -7088,14 +7088,10 @@ def full_trend_clear_daily_swings(daily, kind, left=4, right=4):
         if baseline <= 0 or min(approach, departure) < 1.5 * baseline:
             continue
 
-        # If two nearby same-side pivots occur at practically the same level,
-        # keep the more prominent one; never treat both as fresh breaks.
-        if points and i-points[-1][0] <= 8 and abs(pivot-points[-1][1]) < baseline:
-            previous_i, previous_v = points[-1]
-            stronger = pivot > previous_v if kind == "high" else pivot < previous_v
-            if stronger:
-                points[-1] = (i, pivot)
-            continue
+        # Keep every independently qualified historical pivot. Replacing an
+        # earlier pivot with a later, stronger one uses future information and
+        # can erase the very level that an earlier 8H candle broke. During
+        # replay the latest pivot *known at that time* is selected instead.
         points.append((i, pivot))
     return points
 
@@ -7132,15 +7128,18 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
         known_lows = [(j, v) for j, v in lows
                       if j + 4 < len(daily) and daily_starts[j + 4] is not None
                       and daily_starts[j + 4] + timedelta(days=1) <= close_time]
-        if not known_highs or not known_lows:
-            continue
-
-        hi_idx = known_highs[-1][0]
-        lo_idx = known_lows[-1][0]
-        high_c = daily[hi_idx]
-        low_c = daily[lo_idx]
-        high_mid = (float(high_c["high"]) + max(float(high_c["open"]), float(high_c["close"]))) / 2.0
-        low_mid = (float(low_c["low"]) + min(float(low_c["open"]), float(low_c["close"]))) / 2.0
+        # A bullish break needs a confirmed high, not an unrelated confirmed
+        # low (and vice versa). Requiring both silently skips valid breakouts.
+        hi_idx = known_highs[-1][0] if known_highs else None
+        lo_idx = known_lows[-1][0] if known_lows else None
+        high_mid = None
+        low_mid = None
+        if hi_idx is not None:
+            high_c = daily[hi_idx]
+            high_mid = (float(high_c["high"]) + max(float(high_c["open"]), float(high_c["close"]))) / 2.0
+        if lo_idx is not None:
+            low_c = daily[lo_idx]
+            low_mid = (float(low_c["low"]) + min(float(low_c["open"]), float(low_c["close"]))) / 2.0
         close = float(candle["close"])
         previous_close = float(eight[i - 1]["close"]) if i else None
 
@@ -7148,17 +7147,12 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
         # Repeated breaks of later same-direction swing levels are continuation,
         # not a fresh Full Trend start. Replay history chronologically so a
         # restart or rescan cannot replace the original event with today's date.
-        previous_time = (eight_starts[i - 1] + timedelta(hours=8)
-                         if i and eight_starts[i - 1] is not None else None)
-        high_known_before = (previous_time is not None and
-                             daily_starts[hi_idx + 4] is not None and
-                             daily_starts[hi_idx + 4] + timedelta(days=1) <= previous_time)
-        low_known_before = (previous_time is not None and
-                            daily_starts[lo_idx + 4] is not None and
-                            daily_starts[lo_idx + 4] + timedelta(days=1) <= previous_time)
-        bullish_cross = (high_known_before and previous_close is not None
+        # The pivot is already confirmed at this candle's close. The prior
+        # 8H close only establishes which side of the level price came from;
+        # it need not precede the instant the Daily pivot became confirmed.
+        bullish_cross = (high_mid is not None and previous_close is not None
                          and previous_close <= high_mid and close > high_mid)
-        bearish_cross = (low_known_before and previous_close is not None
+        bearish_cross = (low_mid is not None and previous_close is not None
                          and previous_close >= low_mid and close < low_mid)
         if bullish_cross and state != "FULL BULLISH":
             state = "FULL BULLISH"
