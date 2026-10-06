@@ -707,7 +707,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 </a>
 
 {% set pa = price_action_statuses.get(f['symbol'], {}) %}
-<a class="price-action-link" href="/signal/{{f['id']}}?tf={{ pa.get('unread_tf','4h') }}" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
+<a class="price-action-link" href="/signal/{{f['id']}}" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
 <button class="price-action-btn {{ pa.get('css', '') }}" type="button" aria-label="{{ pa.get('label', 'Price Action — WAIT') }}">
 <svg class="price-action-icon" viewBox="0 0 32 32" role="img" aria-hidden="true">
   <rect x="1.5" y="1.5" width="29" height="29" rx="7" fill="#07111f" stroke="#20c9ff" stroke-width="1.5"/>
@@ -1394,7 +1394,7 @@ a{text-decoration:none}
     </style>
     <div class="tfrow">
         {% for tf in timeframes %}
-        <a href="/signal/{{ fav_id }}?tf={{ tf['value'] }}">
+        <a href="/signal/{{ fav_id }}?tf={{ tf['value'] }}&view=1">
             <button class="{{ 'tfactive' if tf['value'] == selected_tf else 'tfbtn' }}">
                 {{ tf['label'] }}
                 {% if tf['value'] in new_timeframes %}<span class="tf-new">● NEW</span>{% endif %}
@@ -8617,7 +8617,9 @@ def signal(i):
         else PATTERN_TIMEFRAMES
     )
     allowed = {x["value"]: x["label"] for x in signal_timeframes}
-    selected_tf = request.args.get("tf", "4h" if f['grp'] == 'CRYPTO' else "8h")
+    unread_on_entry = unread_timeframes(f['grp'], f['symbol'])
+    default_tf = next((x["value"] for x in signal_timeframes if x["value"] in unread_on_entry), "4h" if f['grp'] == 'CRYPTO' else "8h")
+    selected_tf = request.args.get("tf", default_tf)
 
     if selected_tf not in allowed:
         selected_tf = "4h" if f['grp'] == 'CRYPTO' else "8h"
@@ -8640,10 +8642,12 @@ def signal(i):
             print("manual pattern notification error", f['symbol'], selected_tf, setup_error)
         else:
             save_timeframe_ready_status(f['grp'], f['symbol'], selected_tf, setups, latest_closed_date)
-            acknowledge_timeframe_ready(f['grp'], f['symbol'], selected_tf)
+            if request.args.get("view") == "1":
+                acknowledge_timeframe_ready(f['grp'], f['symbol'], selected_tf)
             if selected_tf == "4h":
                 save_price_action_status(f['grp'], f['symbol'], setups, latest_closed_date)
-                acknowledge_price_action(f['grp'], f['symbol'])
+                if request.args.get("view") == "1":
+                    acknowledge_price_action(f['grp'], f['symbol'])
             notify_new_pattern_setups(
                 f['symbol'],
                 selected_tf,
