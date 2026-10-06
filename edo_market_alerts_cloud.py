@@ -1309,6 +1309,7 @@ a{text-decoration:none}
 .wait{color:#f2c94c}
 .neutral{color:#8ca7bf}
 .entry4h{color:#aeb8c2}
+.rrblue{color:#4da3ff}
 .error{color:#ff8a96;font-weight:800}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .tfrow{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
@@ -5058,13 +5059,118 @@ def format_signal_time_perth(value):
         return str(value)
 
 
+def detect_audusd_daily_railway_tracks(candles, confirmation_index):
+    """
+    Edo RR (Railway Tracks) reversal signal.
+
+    Scope is enforced by the callers: AUD/USD, FOREX, Daily only.
+    Pattern rules:
+      - two adjacent fully closed candles of opposite colour;
+      - real bodies are roughly similar (smaller >= 60% of larger);
+      - both bodies are meaningful versus recent Daily bodies;
+      - the pair appears after a clear directional run of at least 3 of the
+        previous 5 candles, with net progress in that run direction;
+      - bearish RR = bullish run then GREEN/RED pair near the run high;
+      - bullish RR = bearish run then RED/GREEN pair near the run low.
+    """
+    i = int(confirmation_index)
+    if i < 8 or i >= len(candles):
+        return None
+
+    first = candles[i - 1]
+    second = candles[i]
+    c1 = candle_colour(first)
+    c2 = candle_colour(second)
+    if c1 not in ("green", "red") or c2 not in ("green", "red") or c1 == c2:
+        return None
+
+    body1 = abs(float(first["close"]) - float(first["open"]))
+    body2 = abs(float(second["close"]) - float(second["open"]))
+    larger = max(body1, body2)
+    smaller = min(body1, body2)
+    if larger <= 0 or smaller / larger < 0.60:
+        return None
+
+    prior = candles[max(0, i - 8): i - 1]
+    prior_bodies = [abs(float(c["close"]) - float(c["open"])) for c in prior]
+    normal_body = median_value(prior_bodies)
+    if normal_body > 0 and min(body1, body2) < normal_body * 0.70:
+        return None
+
+    run = candles[i - 6:i - 1]  # five candles immediately before first RR candle
+    greens = sum(candle_colour(c) == "green" for c in run)
+    reds = sum(candle_colour(c) == "red" for c in run)
+    start_close = float(run[0]["close"])
+    end_close = float(run[-1]["close"])
+    recent_ranges = [max(0.0, float(c["high"]) - float(c["low"])) for c in prior]
+    normal_range = median_value(recent_ranges)
+    progress = abs(end_close - start_close)
+    if normal_range > 0 and progress < normal_range * 1.25:
+        return None
+
+    if c1 == "green" and c2 == "red":
+        if greens < 3 or end_close <= start_close:
+            return None
+        # Pair must be at the end/top of the bullish run, as in Edo's chart.
+        run_high = max(float(c["high"]) for c in run)
+        pair_high = max(float(first["high"]), float(second["high"]))
+        tolerance = normal_range * 0.60 if normal_range > 0 else 0.0
+        if pair_high + tolerance < run_high:
+            return None
+        direction = "bearish"
+        run_direction = "bullish"
+    elif c1 == "red" and c2 == "green":
+        if reds < 3 or end_close >= start_close:
+            return None
+        # Pair must be at the end/bottom of the bearish run.
+        run_low = min(float(c["low"]) for c in run)
+        pair_low = min(float(first["low"]), float(second["low"]))
+        tolerance = normal_range * 0.60 if normal_range > 0 else 0.0
+        if pair_low - tolerance > run_low:
+            return None
+        direction = "bullish"
+        run_direction = "bearish"
+    else:
+        return None
+
+    return {
+        "name": "RR — RAILWAY TRACKS",
+        "direction": direction,
+        "confirmation_date": second.get("datetime", ""),
+        "confirmation_close": float(second["close"]),
+        "first_date": first.get("datetime", ""),
+        "first_colour": c1,
+        "second_colour": c2,
+        "body_similarity_pct": (smaller / larger) * 100.0,
+        "run_direction": run_direction,
+        "score": 90.0 + (smaller / larger) * 10.0,
+    }
+
+
 def describe_setup(p, interval=None):
     bullish = p["direction"] == "bullish"
     icon = "🟢" if bullish else "🔴"
     css = "buy" if bullish else "sell"
     direction_word = "Bullish" if bullish else "Bearish"
 
-    if p["name"] == "S/R GAP RETEST SETUP":
+    if p["name"] == "RR — RAILWAY TRACKS":
+        icon = "🔵"
+        css = "rrblue"
+        side = "BUY" if bullish else "SELL"
+        detail = (
+            f"AUD/USD Daily RR — Railway Tracks {side} reversal on "
+            f"{format_signal_time_perth(p['confirmation_date'])}. "
+            f"Two adjacent fully CLOSED opposite-colour Daily candles formed at the end of a clear "
+            f"{p.get('run_direction','')} run. Their real bodies are roughly similar "
+            f"({p.get('body_similarity_pct',0):.0f}% size match)."
+        )
+        level_text = (
+            f"First RR candle: {format_signal_time_perth(p.get('first_date',''))} • "
+            f"Second/confirmation candle: {format_signal_time_perth(p.get('confirmation_date',''))} • "
+            f"Confirmation close: {p['confirmation_close']:.5f}"
+        )
+
+    elif p["name"] == "S/R GAP RETEST SETUP":
         weak_text = " Weakness was also detected in the retest candles." if p["weak_retest"] else ""
         detail = (
             f"{direction_word} S/R Gap-Retest confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
@@ -5864,6 +5970,14 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = []
 
+    # AUD/USD only: separate Daily RR (Railway Tracks) reversal signal.
+    # This does not alter any existing Trend Pullback or Gap-Retest rules.
+    if str(grp).upper() == "FOREX" and str(symbol).upper() == "AUD/USD" and interval == "1day":
+        for rr_conf in recent_confirmations(closed_candles, lookback=9):
+            rr = detect_audusd_daily_railway_tracks(closed_candles, rr_conf)
+            if rr:
+                found.append(rr)
+
     # A) NORMAL Edo Trend Pullback — 4H, 8H, Daily and Weekly.
     #    Minimum 2 same-colour fully CLOSED pullback candles,
     #    then an opposite-colour fully CLOSED confirmation.
@@ -5932,7 +6046,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     elif interval == "1day":
         found = [
             p for p in found
-            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
+            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP", "RR — RAILWAY TRACKS")
+            and (p.get("name") != "RR — RAILWAY TRACKS" or (str(grp).upper() == "FOREX" and str(symbol).upper() == "AUD/USD"))
         ]
     elif interval == "1week":
         found = [
@@ -6008,8 +6123,15 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     bullish = [p for p in current_patterns if p["direction"] == "bullish"]
     bearish = [p for p in current_patterns if p["direction"] == "bearish"]
+    current_rr = [p for p in current_patterns if p.get("name") == "RR — RAILWAY TRACKS"]
 
-    if bullish and not bearish:
+    if current_rr and len(current_patterns) == len(current_rr):
+        rr = current_rr[0]
+        rr_side = "BUY" if rr.get("direction") == "bullish" else "SELL"
+        signal = f"RR DAILY — {rr_side}"
+        icon, css = "🔵", "rrblue"
+        summary = "AUD/USD Daily Railway Tracks reversal confirmed on the newest fully CLOSED Daily candle."
+    elif bullish and not bearish:
         if interval == "4h":
             signal = "4H PULLBACK ENTRY — BUY"
             icon, css = "⚪", "entry4h"
@@ -6103,6 +6225,8 @@ def pattern_signal_family(p):
     """
     name = str(p.get("name", "")).upper()
 
+    if "RR" in name and "RAILWAY" in name:
+        return "RR_RAILWAY_TRACKS"
     if "S/R GAP RETEST" in name:
         return "SR_GAP_RETEST"
     if "TREND PULLBACK" in name:
@@ -6120,6 +6244,8 @@ def pattern_push_priority(p):
     """
     name = str(p.get("name", "")).upper()
 
+    if "RR" in name and "RAILWAY" in name:
+        return 30
     if "S/R GAP RETEST" in name:
         return 25
     if "TREND PULLBACK" in name:
@@ -6391,7 +6517,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
             continue
 
         bullish = p["direction"] == "bullish"
-        icon = "🟢" if bullish else "🔴"
+        icon = "🔵" if p.get("name") == "RR — RAILWAY TRACKS" else ("🟢" if bullish else "🔴")
         direction_word = "BULLISH" if bullish else "BEARISH"
 
         if interval == "4h" and p.get("higher_tf_filter"):
@@ -6405,7 +6531,17 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         else:
             trend_line = ""
 
-        if p.get("name") == "S/R GAP RETEST SETUP":
+        if p.get("name") == "RR — RAILWAY TRACKS":
+            rr_side = "BUY" if bullish else "SELL"
+            push_body = (
+                f"RR — RAILWAY TRACKS confirmed on AUD/USD DAILY "
+                f"({format_signal_time_perth(confirmation_date)}). "
+                f"Two adjacent fully CLOSED opposite-colour Daily candles formed at the end of a clear "
+                f"{p.get('run_direction','')} run with roughly similar real bodies "
+                f"({p.get('body_similarity_pct',0):.0f}% size match). "
+                f"Possible {rr_side} reversal. Review the chart before trading."
+            )
+        elif p.get("name") == "S/R GAP RETEST SETUP":
             zone_word = "SUPPORT" if p["direction"] == "bullish" else "RESISTANCE"
             target_lines = ""
             if p.get("target1") is not None:
@@ -6506,6 +6642,13 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     found = []
 
+    # AUD/USD only: separate Daily RR (Railway Tracks) reversal signal.
+    if str(grp).upper() == "FOREX" and str(symbol).upper() == "AUD/USD" and interval == "1day":
+        for rr_conf in recent_confirmations(closed_candles, lookback=9):
+            rr = detect_audusd_daily_railway_tracks(closed_candles, rr_conf)
+            if rr:
+                found.append(rr)
+
     # A) NORMAL Trend Pullback — 4H, 8H, Daily and Weekly, NO 50% rule.
     #    4H is the entry/re-entry signal: higher-timeframe trend alignment is
     #    required, but S/R proximity is NOT a mandatory blocker.
@@ -6563,7 +6706,8 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     elif interval == "1day":
         setups = [
             p for p in setups
-            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
+            if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP", "RR — RAILWAY TRACKS")
+            and (p.get("name") != "RR — RAILWAY TRACKS" or (str(grp).upper() == "FOREX" and str(symbol).upper() == "AUD/USD"))
         ]
     elif interval == "1week":
         setups = [
