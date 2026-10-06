@@ -7923,32 +7923,52 @@ def weekly_card_completed_candles(candles, now_utc=None):
 
 
 def weekly_display_structure_trend(closed_weekly):
-    """Independent Weekly card direction; never infer trend from one candle colour.
+    """Weekly card ONLY: closed-week structural breaks override stale swing labels.
 
-    This function is DISPLAY ONLY. Other signal filters and their existing
-    weekly calculations are not modified.
+    No other trend or trading-signal function uses this calculation. A current
+    forming weekly candle is filtered out by weekly_card_completed_candles().
     """
     if len(closed_weekly) < 12:
         return "Mixed"
-    trend = local_structure_trend(closed_weekly, len(closed_weekly))
-    if trend in ("bullish", "bearish"):
-        return trend.capitalize()
 
-    # When the latest confirmed swing pair is still incomplete, require
-    # sustained weekly price progress rather than treating one green/red
-    # candle as a reversal. Compare two adjacent four-week blocks.
-    recent = closed_weekly[-8:]
-    earlier = recent[:4]
-    later = recent[4:]
-    earlier_close = sum(float(c["close"]) for c in earlier) / 4
-    later_close = sum(float(c["close"]) for c in later) / 4
-    typical_range = avg_range(recent, end=len(recent), length=len(recent))
-    threshold = max(typical_range * 0.65, abs(earlier_close) * 0.0015)
-    if later_close < earlier_close - threshold and float(later[-1]["close"]) < float(earlier[-1]["close"]):
+    history = closed_weekly[-36:]
+    last_close = float(history[-1]["close"])
+    # Pivot points require two *subsequent fully closed* weeks to confirm.
+    # Do not allow the newest week's own high/low to become a prior pivot.
+    prior_highs = swing_points(history, "high", left=2, right=2)
+    prior_lows = swing_points(history, "low", left=2, right=2)
+    recent_high = float(prior_highs[-1][1]) if prior_highs else None
+    recent_low = float(prior_lows[-1][1]) if prior_lows else None
+
+    # A completed weekly close through an already-confirmed swing invalidates
+    # the old structure direction even if two fresh pivot pairs have not formed.
+    if recent_low is not None and last_close < recent_low:
         return "Bearish"
-    if later_close > earlier_close + threshold and float(later[-1]["close"]) > float(earlier[-1]["close"]):
+    if recent_high is not None and last_close > recent_high:
         return "Bullish"
-    return "Mixed"
+
+    # Compare the latest four completed weeks with the four preceding them.
+    # Sustained progress can identify a new regime before new swings confirm.
+    # Require a meaningful move AND most recent closes to agree, not one bar.
+    recent = history[-8:]
+    earlier, later = recent[:4], recent[4:]
+    early_mean = sum(float(c["close"]) for c in earlier) / 4
+    late_mean = sum(float(c["close"]) for c in later) / 4
+    typical_range = avg_range(recent, end=len(recent), length=len(recent))
+    threshold = max(typical_range * 0.65, abs(early_mean) * 0.0015)
+    if (late_mean < early_mean - threshold
+            and float(later[-1]["close"]) < float(earlier[-1]["close"])
+            and sum(float(c["close"]) < float(c["open"]) for c in later) >= 2):
+        return "Bearish"
+    if (late_mean > early_mean + threshold
+            and float(later[-1]["close"]) > float(earlier[-1]["close"])
+            and sum(float(c["close"]) > float(c["open"]) for c in later) >= 2):
+        return "Bullish"
+
+    # Without a confirmed reversal, retain the latest independent weekly
+    # swing structure rather than borrowing the Daily/8H FULL TREND status.
+    structure = local_structure_trend(history, len(history))
+    return structure.capitalize() if structure in ("bullish", "bearish") else "Mixed"
 
 
 def build_trend_scan(symbol, grp=None):
