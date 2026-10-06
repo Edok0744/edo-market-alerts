@@ -387,6 +387,9 @@ h2{font-size:18px}
     font-weight:900;
     white-space:nowrap;
 }
+.saved-fulltrend{text-decoration:none;cursor:pointer}
+.saved-fulltrend:hover{filter:brightness(1.18)}
+.saved-fulltrend:focus-visible{outline:2px solid #ffffff;outline-offset:3px}
 .saved-fulltrend.bull{background:#153d32;color:#45e0a8}
 .saved-fulltrend.bear{background:#4a2028;color:#ff7488}
 
@@ -692,19 +695,15 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <b>{{f['symbol']}}</b>
 {% set saved_ts = trend_statuses.get(f['symbol'], '') %}
 {% if saved_ts == 'FULL BULLISH' %}
-<span class="saved-fulltrend bull">🟢 FULL BULLISH{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</span>
+<a class="saved-fulltrend bull" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bullish trend" title="Open Trend page">🟢 ▲{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
 {% elif saved_ts == 'FULL BEARISH' %}
-<span class="saved-fulltrend bear">🔴 FULL BEARISH{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</span>
+<a class="saved-fulltrend bear" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bearish trend" title="Open Trend page">🔴 ▼{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
 {% endif %}
 </div>
 
 <div class="saved-actions forex-actions">
 <a href="/favorite/use/{{f['id']}}">
 <button>USE</button>
-</a>
-
-<a href="/trend/{{f['id']}}">
-<button class="trendbtn">📊 TREND</button>
 </a>
 
 {% set pa = price_action_statuses.get(f['symbol'], {}) %}
