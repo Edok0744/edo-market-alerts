@@ -7219,6 +7219,10 @@ def save_trend_status(symbol, status):
     """
     now_iso = datetime.utcnow().isoformat()
     cached_status, event = _FULL_TREND_CONFIRMED_EVENTS.get(symbol, (None, None))
+    # A scan timestamp is not a historical break timestamp.  Do not invent a
+    # confirmation date when the detector has no verified break candle.
+    if status in ("FULL BULLISH", "FULL BEARISH") and not (cached_status == status and event and event.get("break_candle")):
+        return None
     if cached_status == status and event and event.get("break_candle"):
         from datetime import timedelta
         candle_start = parse_candle_utc(event["break_candle"].get("datetime"))
@@ -8552,7 +8556,11 @@ def trend(i):
                 (f['symbol'],)
             ).fetchone()
         stored_status = row['status'] if row else None
-        if stored_status != current_full:
+        # Reconcile the historical confirmation timestamp on every successful
+        # manual scan, even when the trend direction has not changed.  The old
+        # status-only guard left previously stored scan dates untouched.
+        if (stored_status != current_full or
+                (current_full and _FULL_TREND_CONFIRMED_EVENTS.get(f['symbol'], (None, None))[1])):
             save_trend_status(f['symbol'], current_full)
             with db_conn() as c:
                 row = c.execute(
