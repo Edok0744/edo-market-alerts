@@ -7048,6 +7048,8 @@ def full_trend_at_structural_sr(symbol, grp, direction):
     return False, None
 
 
+_FULL_TREND_CONFIRMED_EVENTS = {}
+
 def daily_structure_break_state(daily_candles, eight_hour_candles):
     """FULL TREND ONLY: Daily confirmed swing mid-wicks, 8H closed-candle breaks.
 
@@ -7090,13 +7092,18 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
         high_mid = (float(high_c["high"]) + max(float(high_c["open"]), float(high_c["close"]))) / 2.0
         low_mid = (float(low_c["low"]) + min(float(low_c["open"]), float(low_c["close"]))) / 2.0
         close = float(candle["close"])
+        previous_close = float(eight[i - 1]["close"]) if i else None
 
-        if close > high_mid and state != "FULL BULLISH":
+        # A NEW structural break requires an actual closed-candle crossing.
+        # Staying below/above a previously broken level is not a new event.
+        if (previous_close is not None and previous_close <= high_mid
+                and close > high_mid and state != "FULL BULLISH"):
             state = "FULL BULLISH"
             event = {"direction": "BULLISH", "level": high_mid,
                      "swing_index": hi_idx, "break_index": i,
                      "break_candle": candle, "level_method": "daily_high_upper_wick_50pct_8h_close"}
-        elif close < low_mid and state != "FULL BEARISH":
+        elif (previous_close is not None and previous_close >= low_mid
+                and close < low_mid and state != "FULL BEARISH"):
             state = "FULL BEARISH"
             event = {"direction": "BEARISH", "level": low_mid,
                      "swing_index": lo_idx, "break_index": i,
@@ -7123,6 +7130,7 @@ def build_full_alignment(symbol, grp=None):
         return "", f"Waiting for fresh completed 8H candle data (latest {stamp})."
 
     status, event = daily_structure_break_state(daily, eight)
+    _FULL_TREND_CONFIRMED_EVENTS[symbol] = (status, event)
     weekly_state = ""
     weekly_candles, weekly_err = get_candles(symbol, "1week", outputsize=3, grp=grp)
     if not weekly_err:
@@ -7148,6 +7156,12 @@ def save_trend_status(symbol, status):
     Pushover twice.
     """
     now_iso = datetime.utcnow().isoformat()
+    cached_status, event = _FULL_TREND_CONFIRMED_EVENTS.get(symbol, (None, None))
+    if cached_status == status and event and event.get("break_candle"):
+        from datetime import timedelta
+        candle_start = parse_candle_utc(event["break_candle"].get("datetime"))
+        if candle_start is not None:
+            now_iso = (candle_start + timedelta(hours=8)).replace(tzinfo=None).isoformat()
     with db_conn() as c:
         c.execute("BEGIN IMMEDIATE")
         row = c.execute(
@@ -7166,7 +7180,11 @@ def save_trend_status(symbol, status):
                 "UPDATE trend_status SET status=?, updated=? WHERE symbol=?",
                 (status, now_iso, symbol)
             )
-        # If unchanged, leave `updated` untouched: it records when this state began.
+        elif (status in ("FULL BULLISH", "FULL BEARISH") and
+              cached_status == status and event and row["updated"] != now_iso):
+            # Repair old scan-time timestamps from previous deployments.
+            c.execute("UPDATE trend_status SET updated=? WHERE symbol=?", (now_iso, symbol))
+        # If unchanged, preserve the actual candle confirmation timestamp.
         c.commit()
 
     return previous
@@ -7835,6 +7853,7 @@ def build_trend_scan(symbol, grp=None):
     if len(eight_closed) < 2:
         return None, "Not enough completed 8H candle data."
     status, event = daily_structure_break_state(daily_candles, eight_candles)
+    _FULL_TREND_CONFIRMED_EVENTS[symbol] = (status, event)
     daily_state = "Bullish" if status == "FULL BULLISH" else "Bearish" if status == "FULL BEARISH" else "Mixed"
     daily_icon, daily_css = state_info[daily_state]
     results.append({
@@ -7846,17 +7865,24 @@ def build_trend_scan(symbol, grp=None):
 
     save_trend_snapshot(symbol, {"Weekly": weekly_state, "Daily": daily_state})
 
+    event_time = ""
+    if event and event.get("break_candle"):
+        from datetime import timedelta
+        event_start = parse_candle_utc(event["break_candle"].get("datetime"))
+        if event_start:
+            event_time = (event_start + timedelta(hours=8)).astimezone(ZoneInfo("Australia/Perth")).strftime("%d %b %Y %H:%M Perth")
+
     if status == "FULL BULLISH":
         summary, icon, css = "FULL BULLISH", "🟢", "bull"
         if event:
-            detail = f"Main trend is bullish: a fully closed 8H candle broke above the Daily swing-high mid-wick level at {event['level']:.5f}. It stays bullish until an opposite 8H close below the Daily swing-low mid-wick level is confirmed."
+            detail = f"Main trend is bullish: a fully closed 8H candle broke above the Daily swing-high mid-wick level at {event['level']:.5f} on {event_time}. It stays bullish until an opposite 8H close below the Daily swing-low mid-wick level is confirmed."
         else:
             detail = "Main trend remains bullish from the latest 8H close above a Daily swing-high mid-wick level. It stays bullish until an opposite 8H close below the Daily swing-low mid-wick level is confirmed."
         score = 1
     elif status == "FULL BEARISH":
         summary, icon, css = "FULL BEARISH", "🔴", "bear"
         if event:
-            detail = f"Main trend is bearish: a fully closed 8H candle broke below the Daily swing-low mid-wick level at {event['level']:.5f}. It stays bearish until an opposite 8H close above the Daily swing-high mid-wick level is confirmed."
+            detail = f"Main trend is bearish: a fully closed 8H candle broke below the Daily swing-low mid-wick level at {event['level']:.5f} on {event_time}. It stays bearish until an opposite 8H close above the Daily swing-high mid-wick level is confirmed."
         else:
             detail = "Main trend remains bearish from the latest 8H close below a Daily swing-low mid-wick level. It stays bearish until an opposite 8H close above the Daily swing-high mid-wick level is confirmed."
         score = -1
