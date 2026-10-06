@@ -707,7 +707,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 </a>
 
 {% set pa = price_action_statuses.get(f['symbol'], {}) %}
-<a class="price-action-link" href="/signal/{{f['id']}}?tf=4h&ack=1" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
+<a class="price-action-link" href="/signal/{{f['id']}}?tf={{ pa.get('unread_tf','4h') }}" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
 <button class="price-action-btn {{ pa.get('css', '') }}" type="button" aria-label="{{ pa.get('label', 'Price Action — WAIT') }}">
 <svg class="price-action-icon" viewBox="0 0 32 32" role="img" aria-hidden="true">
   <rect x="1.5" y="1.5" width="29" height="29" rx="7" fill="#07111f" stroke="#20c9ff" stroke-width="1.5"/>
@@ -1388,11 +1388,16 @@ a{text-decoration:none}
     <h1>📊 {{ symbol }} PRICE ACTION</h1>
     <div class="small">{{ group }} • Price Action status • Trend Pullback: 4H / 8H / 1D • consecutive adjacent 2+ candles • clean retracement required • S/R Gap-Retest: {% if group == 'CRYPTO' %}12H / 1D / 1W{% else %}8H / 1D / 1W{% endif %} • Closed candles only • Manual trade decision</div>
 
+    <style>
+      .tf-new{display:block;color:#5dff9a;font-size:10px;font-weight:900;animation:tf-new-blink 1s step-end infinite}
+      @keyframes tf-new-blink{50%{opacity:.12}}
+    </style>
     <div class="tfrow">
         {% for tf in timeframes %}
         <a href="/signal/{{ fav_id }}?tf={{ tf['value'] }}">
             <button class="{{ 'tfactive' if tf['value'] == selected_tf else 'tfbtn' }}">
                 {{ tf['label'] }}
+                {% if tf['value'] in new_timeframes %}<span class="tf-new">● NEW</span>{% endif %}
             </button>
         </a>
         {% endfor %}
@@ -1623,6 +1628,16 @@ def init_db():
             acknowledged_date TEXT NOT NULL DEFAULT '',
             updated TEXT,
             PRIMARY KEY(grp, symbol)
+        )
+        """)
+
+        # Independent unread READY state for each Price Action timeframe.
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS price_action_timeframe_status(
+            grp TEXT NOT NULL, symbol TEXT NOT NULL, interval TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'WAIT', direction TEXT NOT NULL DEFAULT '',
+            confirmation_date TEXT NOT NULL DEFAULT '', acknowledged_date TEXT NOT NULL DEFAULT '',
+            updated TEXT, PRIMARY KEY(grp,symbol,interval)
         )
         """)
 
@@ -6592,8 +6607,8 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         # Duplicate protection in pattern_notifications means the same confirmed
         # setup cannot make the phone sound repeatedly. Other timeframe pattern
         # notifications keep the normal Pushover sound.
-        ready_sound = READY_PUSH_SOUND if interval == "4h" else "cashregister"
-        ready_priority = 1 if interval == "4h" else 0
+        ready_sound = READY_PUSH_SOUND
+        ready_priority = 1
 
         send_push(
             f"{icon} {symbol} [{grp}] — {p['name']}",
@@ -6790,6 +6805,48 @@ def save_price_action_status(grp, symbol, setups, latest_closed_date):
         c.commit()
 
 
+def save_timeframe_ready_status(grp, symbol, interval, setups, latest_closed_date):
+    """Store independent unread status; only fully closed current-candle setups count."""
+    current = [p for p in (setups or []) if p.get('confirmation_date') == latest_closed_date]
+    buy = any(p.get('direction') == 'bullish' for p in current)
+    sell = any(p.get('direction') == 'bearish' for p in current)
+    status = 'READY' if buy != sell else 'WAIT'
+    direction = 'BUY' if buy and not sell else ('SELL' if sell and not buy else '')
+    with db_conn() as c:
+        c.execute("""
+            INSERT INTO price_action_timeframe_status
+                (grp,symbol,interval,status,direction,confirmation_date,updated)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(grp,symbol,interval) DO UPDATE SET
+                status=excluded.status, direction=excluded.direction,
+                acknowledged_date=CASE
+                    WHEN price_action_timeframe_status.confirmation_date=excluded.confirmation_date
+                    THEN price_action_timeframe_status.acknowledged_date ELSE '' END,
+                confirmation_date=excluded.confirmation_date, updated=excluded.updated
+        """, (grp,symbol,interval,status,direction,latest_closed_date or '',datetime.utcnow().isoformat()))
+        c.commit()
+
+
+def acknowledge_timeframe_ready(grp, symbol, interval):
+    """Opening one timeframe clears only its unread indicator."""
+    with db_conn() as c:
+        c.execute("""
+            UPDATE price_action_timeframe_status SET acknowledged_date=confirmation_date,updated=?
+            WHERE grp=? AND symbol=? AND interval=? AND status='READY'
+        """, (datetime.utcnow().isoformat(),grp,symbol,interval))
+        c.commit()
+
+
+def unread_timeframes(grp, symbol):
+    with db_conn() as c:
+        rows=c.execute("""
+            SELECT interval FROM price_action_timeframe_status
+            WHERE grp=? AND symbol=? AND status='READY'
+              AND confirmation_date != acknowledged_date
+        """,(grp,symbol)).fetchall()
+    return {r['interval'] for r in rows}
+
+
 def acknowledge_price_action(grp, symbol):
     """Stop HOME icon blinking for the current READY setup after Edo opens it."""
     with db_conn() as c:
@@ -6900,6 +6957,7 @@ def pattern_signal_monitor():
             if error:
                 print("pattern monitor error", symbol, interval, error)
             else:
+                save_timeframe_ready_status(grp, symbol, interval, setups, latest_closed_date)
                 if interval == "4h":
                     save_price_action_status(grp, symbol, setups, latest_closed_date)
                 notify_new_pattern_setups(
@@ -8306,6 +8364,22 @@ def home():
                 else:
                     price_action_statuses[r['symbol']] = {'css':'','label':'Price Action — WAIT'}
 
+            # Any unread READY timeframe lights the HOME Price Action icon.
+            unread_rows = c.execute("""
+                SELECT grp,symbol,interval,direction FROM price_action_timeframe_status
+                WHERE status='READY' AND confirmation_date != acknowledged_date
+            """).fetchall()
+            for ur in unread_rows:
+                existing=price_action_statuses.get(ur['symbol'], {})
+                css='ready-buy' if ur['direction']=='BUY' else 'ready-sell'
+                if 'acknowledged' not in existing.get('css','') and existing.get('css','').startswith('ready-'):
+                    css=existing['css']
+                price_action_statuses[ur['symbol']]={
+                    'css':css,
+                    'label':'Price Action — NEW ' + ur['interval'].upper() + ' ' + ur['direction'],
+                    'unread_tf':ur['interval']
+                }
+
             trailing_stops = c.execute('SELECT * FROM trailing_stops ORDER BY triggered,id DESC').fetchall()
 
             trend_rows = c.execute(
@@ -8565,10 +8639,11 @@ def signal(i):
         if setup_error:
             print("manual pattern notification error", f['symbol'], selected_tf, setup_error)
         else:
+            save_timeframe_ready_status(f['grp'], f['symbol'], selected_tf, setups, latest_closed_date)
+            acknowledge_timeframe_ready(f['grp'], f['symbol'], selected_tf)
             if selected_tf == "4h":
                 save_price_action_status(f['grp'], f['symbol'], setups, latest_closed_date)
-                if request.args.get('ack') == '1':
-                    acknowledge_price_action(f['grp'], f['symbol'])
+                acknowledge_price_action(f['grp'], f['symbol'])
             notify_new_pattern_setups(
                 f['symbol'],
                 selected_tf,
@@ -8578,6 +8653,8 @@ def signal(i):
             )
 
 
+    new_timeframes = unread_timeframes(f['grp'], f['symbol'])
+
     if error:
         return render_template_string(
             SIGNAL_HTML,
@@ -8585,6 +8662,7 @@ def signal(i):
             group=f['grp'],
             fav_id=f['id'],
             timeframes=signal_timeframes,
+            new_timeframes=new_timeframes,
             selected_tf=selected_tf,
             selected_label=allowed[selected_tf],
             price='—',
@@ -8607,6 +8685,7 @@ def signal(i):
         group=f['grp'],
         fav_id=f['id'],
         timeframes=signal_timeframes,
+        new_timeframes=new_timeframes,
         selected_tf=selected_tf,
         selected_label=allowed[selected_tf],
         price=f"{data['price']:.5f}",
