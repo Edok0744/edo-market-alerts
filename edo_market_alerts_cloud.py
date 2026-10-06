@@ -7049,10 +7049,61 @@ def full_trend_at_structural_sr(symbol, grp, direction):
 
 _FULL_TREND_CONFIRMED_EVENTS = {}
 
+
+def full_trend_clear_daily_swings(daily, kind, left=4, right=4):
+    """FULL TREND ONLY: reject minor pivots buried in overlapping Daily candles.
+
+    A level needs a locally prominent extreme, a meaningful approach and
+    departure, and sufficient separation from nearby same-side pivots.
+    Uses only candles through pivot + right, avoiding future information.
+    """
+    points = []
+    key = "high" if kind == "high" else "low"
+    opposite = "low" if kind == "high" else "high"
+    for i in range(left, len(daily) - right):
+        window = daily[i-left:i+right+1]
+        pivot = float(daily[i][key])
+        before = daily[i-left:i]
+        after = daily[i+1:i+right+1]
+        if kind == "high":
+            if not (pivot > max(float(c[key]) for c in before) and
+                    pivot > max(float(c[key]) for c in after)):
+                continue
+            approach = pivot - min(float(c[opposite]) for c in before)
+            departure = pivot - min(float(c[opposite]) for c in after)
+        else:
+            if not (pivot < min(float(c[key]) for c in before) and
+                    pivot < min(float(c[key]) for c in after)):
+                continue
+            approach = max(float(c[opposite]) for c in before) - pivot
+            departure = max(float(c[opposite]) for c in after) - pivot
+
+        # A visible structural turn must be larger than the ordinary Daily
+        # candle fluctuations on both sides, not just a two-bar wiggle.
+        historical = daily[max(0, i-20):i]
+        normal_range = sorted(float(c["high"])-float(c["low"]) for c in historical)
+        if not normal_range:
+            continue
+        baseline = normal_range[len(normal_range)//2]
+        if baseline <= 0 or min(approach, departure) < 1.5 * baseline:
+            continue
+
+        # If two nearby same-side pivots occur at practically the same level,
+        # keep the more prominent one; never treat both as fresh breaks.
+        if points and i-points[-1][0] <= 8 and abs(pivot-points[-1][1]) < baseline:
+            previous_i, previous_v = points[-1]
+            stronger = pivot > previous_v if kind == "high" else pivot < previous_v
+            if stronger:
+                points[-1] = (i, pivot)
+            continue
+        points.append((i, pivot))
+    return points
+
+
 def daily_structure_break_state(daily_candles, eight_hour_candles):
     """FULL TREND ONLY: Daily confirmed swing mid-wicks, 8H closed-candle breaks.
 
-    A Daily pivot is usable only after both right-hand Daily candles have closed.
+    A Daily pivot is usable only after all four right-hand Daily candles have closed.
     Replaying the 8H history never uses a Daily pivot that was not yet known.
     The main trend persists until an opposite confirmed 8H break.
     """
@@ -7063,8 +7114,8 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
     if len(daily) < 12 or len(eight) < 2:
         return "", None
 
-    highs = swing_points(daily, "high", left=2, right=2)
-    lows = swing_points(daily, "low", left=2, right=2)
+    highs = full_trend_clear_daily_swings(daily, "high")
+    lows = full_trend_clear_daily_swings(daily, "low")
     daily_starts = [parse_candle_utc(c.get("datetime")) for c in daily]
     eight_starts = [parse_candle_utc(c.get("datetime")) for c in eight]
     state, event = "", None
@@ -7074,13 +7125,13 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
         if start is None:
             continue
         close_time = start + timedelta(hours=8)
-        # Pivot's two right-hand Daily candles must have ended before this 8H close.
+        # Pivot's four right-hand Daily candles must have ended before this 8H close.
         known_highs = [(j, v) for j, v in highs
-                       if j + 2 < len(daily) and daily_starts[j + 2] is not None
-                       and daily_starts[j + 2] + timedelta(days=1) <= close_time]
+                       if j + 4 < len(daily) and daily_starts[j + 4] is not None
+                       and daily_starts[j + 4] + timedelta(days=1) <= close_time]
         known_lows = [(j, v) for j, v in lows
-                      if j + 2 < len(daily) and daily_starts[j + 2] is not None
-                      and daily_starts[j + 2] + timedelta(days=1) <= close_time]
+                      if j + 4 < len(daily) and daily_starts[j + 4] is not None
+                      and daily_starts[j + 4] + timedelta(days=1) <= close_time]
         if not known_highs or not known_lows:
             continue
 
