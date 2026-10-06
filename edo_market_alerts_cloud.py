@@ -1257,9 +1257,7 @@ a{text-decoration:none}
         {% endif %}
 
         <div class="small" style="margin-top:12px">
-            Trend is calculated from fully closed candlesticks only. FULL BULLISH / FULL BEARISH
-            requires 12H and 4H to agree for Forex/Crypto, or Daily and 4H for CFD. The 4H state requires two consecutive fully closed candles in the same direction. Weekly is shown for reference only and does
-            not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
+            Trend is calculated from fully closed Daily candlesticks only. FULL BULLISH is confirmed when a Daily candle fully closes above the 50% midpoint of the previous meaningful Daily swing-high wick; FULL BEARISH is confirmed when a Daily candle fully closes below the 50% midpoint of the previous meaningful Daily swing-low wick. A wick crossing the line alone does not count. The confirmed main trend remains in force until an opposite Daily structure break is fully closed. Weekly is shown for reference only and does not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
         </div>
     {% endif %}
     </div>
@@ -7050,60 +7048,101 @@ def full_trend_at_structural_sr(symbol, grp, direction):
     return False, None
 
 
+def daily_structure_break_state(candles):
+    """FULL TREND ONLY: derive the main trend from confirmed Daily structure.
+
+    Edo's mid-wick rule:
+      * Use the previous confirmed meaningful Daily swing wick as the structure
+        reference, with the break line at 50% of that wick.
+      * For a swing HIGH, the line is halfway between the candle-body top and
+        the candle high (upper-wick midpoint).
+      * For a swing LOW, the line is halfway between the candle low and the
+        candle-body bottom (lower-wick midpoint).
+      * FULL BULLISH only after a fully CLOSED Daily candle closes ABOVE the
+        previous swing-high mid-wick line.
+      * FULL BEARISH only after a fully CLOSED Daily candle closes BELOW the
+        previous swing-low mid-wick line.
+      * A wick crossing the line does not count; the Daily CLOSE confirms it.
+      * Once established, the state persists until an opposite confirmed Daily
+        mid-wick structure break occurs.
+
+    Swing points use the existing 2-left / 2-right definition. A swing is not
+    eligible until its two right-hand candles already exist, so this never uses
+    future information.
+    """
+    closed = fully_closed_candles(candles, "1day")
+    if len(closed) < 12:
+        return "", None
+
+    highs = swing_points(closed, "high", left=2, right=2)
+    lows = swing_points(closed, "low", left=2, right=2)
+    state = ""
+    event = None
+
+    def upper_wick_mid(candle):
+        body_top = max(float(candle["open"]), float(candle["close"]))
+        return (float(candle["high"]) + body_top) / 2.0
+
+    def lower_wick_mid(candle):
+        body_bottom = min(float(candle["open"]), float(candle["close"]))
+        return (float(candle["low"]) + body_bottom) / 2.0
+
+    for i in range(4, len(closed)):
+        eligible_highs = [(idx, level) for idx, level in highs if idx + 2 < i]
+        eligible_lows = [(idx, level) for idx, level in lows if idx + 2 < i]
+        if not eligible_highs or not eligible_lows:
+            continue
+
+        high_idx, _ = eligible_highs[-1]
+        low_idx, _ = eligible_lows[-1]
+        bullish_level = upper_wick_mid(closed[high_idx])
+        bearish_level = lower_wick_mid(closed[low_idx])
+        close = float(closed[i]["close"])
+
+        if close > bullish_level:
+            if state != "FULL BULLISH":
+                event = {
+                    "direction": "BULLISH",
+                    "level": bullish_level,
+                    "swing_index": high_idx,
+                    "break_index": i,
+                    "break_candle": closed[i],
+                    "level_method": "swing_high_upper_wick_50pct",
+                }
+            state = "FULL BULLISH"
+        elif close < bearish_level:
+            if state != "FULL BEARISH":
+                event = {
+                    "direction": "BEARISH",
+                    "level": bearish_level,
+                    "swing_index": low_idx,
+                    "break_index": i,
+                    "break_candle": closed[i],
+                    "level_method": "swing_low_lower_wick_50pct",
+                }
+            state = "FULL BEARISH"
+
+    return state, event
+
+
 def build_full_alignment(symbol, grp=None):
-    """
-    Edo direct-candlestick alignment signal.
+    """Edo FULL TREND: Daily mid-wick swing-structure break confirmed by candle close."""
+    clear_ohlc_cache_for_symbol(symbol, grp, intervals={"1day"})
+    candles, err = get_candles(symbol, "1day", outputsize=220, grp=grp)
+    if err:
+        return "", err
 
-    CFD trigger timeframes:
-      Daily + 4H
-
-    FOREX / CRYPTO trigger timeframes:
-      12H + 4H
-
-    The 4H component is valid only after TWO consecutive fully closed 4H
-    candles agree in direction.
-
-    Weekly is display/reference only for every market group.
-    All decisions use the last fully CLOSED candle.
-    """
-    is_cfd = str(grp or "").upper() == "CFD"
-
-    if is_cfd:
-        intervals = {
-            "Daily": "1day",
-            "4H": "4h",
-        }
-        refresh_intervals = {"1day", "4h"}
-    else:
-        intervals = {
-            "12H": "12h",
-            "4H": "4h",
-        }
-        refresh_intervals = {"4h", "12h"}
-
-    signal_states = {}
-
-    clear_ohlc_cache_for_symbol(symbol, grp, intervals=refresh_intervals)
+    closed = fully_closed_candles(candles, "1day")
+    if len(closed) < 12:
+        return "", "Not enough completed Daily candle data."
 
     from datetime import timezone
-    now_utc = datetime.now(timezone.utc)
+    if not closed_candle_is_fresh(closed[-1], "1day", now_utc=datetime.now(timezone.utc)):
+        stamp = closed[-1].get("datetime", "unknown")
+        return "", f"Waiting for fresh completed Daily candle data (latest {stamp})."
 
-    for label, interval in intervals.items():
-        candles, err = get_candles(symbol, interval, outputsize=3, grp=grp)
-        if err:
-            return "", err
+    status, event = daily_structure_break_state(candles)
 
-        closed = last_closed_candle(candles, interval)
-        if closed is None:
-            return "", f"Not enough completed {label} candle data."
-
-        if not closed_candle_is_fresh(closed, interval, now_utc=now_utc):
-            stamp = closed.get("datetime", "unknown")
-            return "", f"Waiting for fresh completed {label} candle data (latest {stamp})."
-
-        signal_states[label] = analyse_two_closed_4h(candles) if interval == "4h" else analyse_candle(closed)
-
-    # Weekly is reference-only and never decides FULL BULLISH / FULL BEARISH.
     weekly_state = ""
     weekly_candles, weekly_err = get_candles(symbol, "1week", outputsize=3, grp=grp)
     if not weekly_err:
@@ -7111,21 +7150,9 @@ def build_full_alignment(symbol, grp=None):
         if weekly_closed is not None:
             weekly_state = analyse_candle(weekly_closed)
 
-    save_trend_snapshot(symbol, {"Weekly": weekly_state, **signal_states})
-
-    if all(v == "Bullish" for v in signal_states.values()):
-        at_sr, _ = full_trend_at_structural_sr(symbol, grp, "BULLISH")
-        if at_sr:
-            return "FULL BULLISH", None
-        return "", None
-
-    if all(v == "Bearish" for v in signal_states.values()):
-        at_sr, _ = full_trend_at_structural_sr(symbol, grp, "BEARISH")
-        if at_sr:
-            return "FULL BEARISH", None
-        return "", None
-
-    return "", None
+    daily_state = "Bullish" if status == "FULL BULLISH" else "Bearish" if status == "FULL BEARISH" else "Mixed"
+    save_trend_snapshot(symbol, {"Weekly": weekly_state, "Daily": daily_state})
+    return status, None
 
 
 def save_trend_status(symbol, status):
@@ -7790,135 +7817,68 @@ def analyse_closes(candles, interval):
     return analyse_candle(closed)
 
 def build_trend_scan(symbol, grp=None):
+    """Display Edo's Daily swing-break FULL TREND state."""
     results = []
-
     state_info = {
         "Bullish": ("🟢", "bull"),
         "Bearish": ("🔴", "bear"),
         "Mixed": ("🟡", "mixed"),
     }
 
-    reference_intervals = [("Weekly", "1week")]
-    is_cfd = str(grp or "").upper() == "CFD"
+    # Weekly remains reference-only; Daily structure is now the sole authority
+    # for FULL BULLISH / FULL BEARISH across Forex, CFD and Crypto.
+    weekly_candles, error = get_candles(symbol, "1week", outputsize=3, grp=grp)
+    if error:
+        return None, error
+    weekly_closed = last_closed_candle(weekly_candles, "1week")
+    if weekly_closed is None:
+        return None, "Not enough completed Weekly candle data."
+    weekly_state = analyse_candle(weekly_closed)
+    _, weekly_css = state_info[weekly_state]
+    results.append({
+        "label": "Weekly", "interval": "1week", "state": weekly_state,
+        "icon": "", "css": weekly_css, "reference_only": True,
+        "closed_time": weekly_closed.get("datetime", ""),
+        "closed_time_perth": format_closed_candle_perth(weekly_closed, "1week"),
+    })
 
-    # FULL TREND uses 4H as the lower-timeframe component.
-    # The 4H state requires two consecutive fully closed candles in one direction.
-    # Weekly remains visible as reference only.
-    if is_cfd:
-        signal_intervals = [
-            ("Daily", "1day"),
-            ("4H", "4h"),
-        ]
-    else:
-        signal_intervals = [
-            ("12H", "12h"),
-            ("4H", "4h"),
-        ]
+    daily_candles, error = get_candles(symbol, "1day", outputsize=220, grp=grp)
+    if error:
+        return None, error
+    daily_closed = fully_closed_candles(daily_candles, "1day")
+    if len(daily_closed) < 12:
+        return None, "Not enough completed Daily candle data."
 
-    states = {}
+    status, event = daily_structure_break_state(daily_candles)
+    daily_state = "Bullish" if status == "FULL BULLISH" else "Bearish" if status == "FULL BEARISH" else "Mixed"
+    daily_icon, daily_css = state_info[daily_state]
+    results.append({
+        "label": "Daily Structure", "interval": "1day", "state": daily_state,
+        "icon": daily_icon, "css": daily_css, "reference_only": False,
+        "closed_time": daily_closed[-1].get("datetime", ""),
+        "closed_time_perth": format_closed_candle_perth(daily_closed[-1], "1day"),
+    })
 
-    for label, interval in reference_intervals:
-        candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
-        if error:
-            return None, error
-        closed = last_closed_candle(candles, interval)
-        if closed is None:
-            return None, f"Not enough completed {label} candle data."
-        state = analyse_candle(closed)
-        _, css = state_info[state]
-        results.append({
-            "label": label, "interval": interval, "state": state,
-            "icon": "", "css": css, "reference_only": True,
-            "closed_time": closed.get("datetime", ""),
-            "closed_time_perth": format_closed_candle_perth(closed, interval),
-        })
+    save_trend_snapshot(symbol, {"Weekly": weekly_state, "Daily": daily_state})
 
-    for label, interval in signal_intervals:
-        candles, error = get_candles(symbol, interval, outputsize=3, grp=grp)
-        if error:
-            return None, error
-        closed = last_closed_candle(candles, interval)
-        if closed is None:
-            return None, f"Not enough completed {label} candle data."
-        state = analyse_two_closed_4h(candles) if interval == "4h" else analyse_candle(closed)
-        states[label] = state
-        icon, css = state_info[state]
-        results.append({
-            "label": label, "interval": interval, "state": state,
-            "icon": icon, "css": css, "reference_only": False,
-            "closed_time": closed.get("datetime", ""),
-            "closed_time_perth": format_closed_candle_perth(closed, interval),
-        })
-
-    # FULL TREND is only labelled FULL when the aligned direction is also
-    # confirmed at meaningful structural S/R. No Pushover is sent for this.
-    full_bull_sr, full_bull_sr_info = full_trend_at_structural_sr(symbol, grp, "BULLISH")
-    full_bear_sr, full_bear_sr_info = full_trend_at_structural_sr(symbol, grp, "BEARISH")
-
-    if is_cfd:
-        signal_labels = ("Daily", "4H")
-        weights = {"Daily": 2, "4H": 1}
-        score = sum(weights[x] if states[x] == "Bullish" else -weights[x] if states[x] == "Bearish" else 0 for x in signal_labels)
-        full_bull = all(states[x] == "Bullish" for x in signal_labels)
-        full_bear = all(states[x] == "Bearish" for x in signal_labels)
-        if full_bull and full_bull_sr:
-            summary, icon, css = "FULL BULLISH", "🟢", "bull"
-            info = full_bull_sr_info or {}
-            detail = f"4H and Daily are both GREEN and price is confirming SUPPORT on {info.get('timeframe','4H/Daily')}. Weekly is reference only."
-        elif full_bear and full_bear_sr:
-            summary, icon, css = "FULL BEARISH", "🔴", "bear"
-            info = full_bear_sr_info or {}
-            detail = f"4H and Daily are both RED and price is confirming RESISTANCE on {info.get('timeframe','4H/Daily')}. Weekly is reference only."
-        elif full_bull:
-            summary, icon, css = "BULLISH — WAIT FOR SUPPORT", "🟡", "mixed"
-            detail = "4H and Daily are aligned bullish, but price is not confirming meaningful structural SUPPORT yet."
-        elif full_bear:
-            summary, icon, css = "BEARISH — WAIT FOR RESISTANCE", "🟡", "mixed"
-            detail = "4H and Daily are aligned bearish, but price is not confirming meaningful structural RESISTANCE yet."
-        elif score >= 2:
-            summary, icon, css = "BULLISH", "🟢", "bull"
-            detail = "Daily and 4H lean bullish but are not fully aligned. Weekly is reference only."
-        elif score <= -2:
-            summary, icon, css = "BEARISH", "🔴", "bear"
-            detail = "Daily and 4H lean bearish but are not fully aligned. Weekly is reference only."
+    if status == "FULL BULLISH":
+        summary, icon, css = "FULL BULLISH", "🟢", "bull"
+        if event:
+            detail = f"Daily main trend is bullish: a fully closed Daily candle broke above the previous swing high at {event['level']:.5f}. It stays bullish until an opposite Daily swing-low break is confirmed."
         else:
-            summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
-            detail = "Daily and 4H are not aligned strongly enough. Weekly is reference only."
-    else:
-        signal_labels = ("12H", "4H")
-        weights = {"12H": 2, "4H": 1}
-        score = sum(weights[x] if states[x] == "Bullish" else -weights[x] if states[x] == "Bearish" else 0 for x in signal_labels)
-        full_bull = all(states[x] == "Bullish" for x in signal_labels)
-        full_bear = all(states[x] == "Bearish" for x in signal_labels)
-        if full_bull and full_bull_sr:
-            summary, icon, css = "FULL BULLISH", "🟢", "bull"
-            info = full_bull_sr_info or {}
-            detail = f"12H and 4H are both GREEN and price is confirming SUPPORT on {info.get('timeframe','4H/Daily')}."
-        elif full_bear and full_bear_sr:
-            summary, icon, css = "FULL BEARISH", "🔴", "bear"
-            info = full_bear_sr_info or {}
-            detail = f"12H and 4H are both RED and price is confirming RESISTANCE on {info.get('timeframe','4H/Daily')}."
-        elif full_bull:
-            summary, icon, css = "BULLISH — WAIT FOR SUPPORT", "🟡", "mixed"
-            detail = "12H and 4H are aligned bullish, but price is not confirming meaningful structural SUPPORT yet."
-        elif full_bear:
-            summary, icon, css = "BEARISH — WAIT FOR RESISTANCE", "🟡", "mixed"
-            detail = "12H and 4H are aligned bearish, but price is not confirming meaningful structural RESISTANCE yet."
-        elif states["12H"] == "Bullish" and states["4H"] == "Bearish":
-            summary, icon, css = "BULLISH — LOWER-TIMEFRAME PULLBACK", "🟡", "mixed"
-            detail = "12H is bullish, but 4H is pulling back."
-        elif states["12H"] == "Bearish" and states["4H"] == "Bullish":
-            summary, icon, css = "BEARISH — LOWER-TIMEFRAME BOUNCE", "🟡", "mixed"
-            detail = "12H is bearish, but 4H is bouncing."
-        elif score >= 2:
-            summary, icon, css = "BULLISH", "🟢", "bull"
-            detail = "12H and 4H lean bullish."
-        elif score <= -2:
-            summary, icon, css = "BEARISH", "🔴", "bear"
-            detail = "12H and 4H lean bearish."
+            detail = "Daily main trend remains bullish from the latest confirmed swing-high break. It stays bullish until an opposite Daily swing-low break is confirmed."
+        score = 1
+    elif status == "FULL BEARISH":
+        summary, icon, css = "FULL BEARISH", "🔴", "bear"
+        if event:
+            detail = f"Daily main trend is bearish: a fully closed Daily candle broke below the previous swing low at {event['level']:.5f}. It stays bearish until an opposite Daily swing-high break is confirmed."
         else:
-            summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
-            detail = "12H and 4H are not aligned strongly enough."
+            detail = "Daily main trend remains bearish from the latest confirmed swing-low break. It stays bearish until an opposite Daily swing-high break is confirmed."
+        score = -1
+    else:
+        summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
+        detail = "No confirmed Daily close has established a main trend by breaking a previous meaningful Daily swing high or swing low yet."
+        score = 0
 
     return {
         "results": results, "summary": summary, "summary_icon": icon,
