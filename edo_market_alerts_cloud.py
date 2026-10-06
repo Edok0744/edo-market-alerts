@@ -1248,7 +1248,7 @@ a{text-decoration:none}
         </div>
 
         {% if full_trend_since and summary in ('FULL BULLISH', 'FULL BEARISH') %}
-        <div class="since">{{ summary }} since: {{ full_trend_since }}</div>
+        <div class="since">{{ summary }} latest structural confirmation: {{ full_trend_since }}</div>
         {% endif %}
 
         {% if detail %}
@@ -7144,16 +7144,31 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
         close = float(candle["close"])
         previous_close = float(eight[i - 1]["close"]) if i else None
 
-        # A NEW structural break requires an actual closed-candle crossing.
-        # Staying below/above a previously broken level is not a new event.
-        if (previous_close is not None and previous_close <= high_mid
-                and close > high_mid and state != "FULL BULLISH"):
+        # Record a new confirmation for a DIFFERENT meaningful Daily swing,
+        # even if the established trend is already in that direction.
+        # Require a genuine 8H close-to-close crossing; the swing must have
+        # been confirmed before the preceding 8H candle closed, so a newly
+        # discovered pivot cannot create a retrospective false break.
+        previous_time = (eight_starts[i - 1] + timedelta(hours=8)
+                         if i and eight_starts[i - 1] is not None else None)
+        high_known_before = (previous_time is not None and
+                             daily_starts[hi_idx + 4] is not None and
+                             daily_starts[hi_idx + 4] + timedelta(days=1) <= previous_time)
+        low_known_before = (previous_time is not None and
+                            daily_starts[lo_idx + 4] is not None and
+                            daily_starts[lo_idx + 4] + timedelta(days=1) <= previous_time)
+        if (high_known_before and previous_close is not None
+                and previous_close <= high_mid and close > high_mid
+                and not (event and event['direction'] == 'BULLISH'
+                         and event['swing_index'] == hi_idx)):
             state = "FULL BULLISH"
             event = {"direction": "BULLISH", "level": high_mid,
                      "swing_index": hi_idx, "break_index": i,
                      "break_candle": candle, "level_method": "daily_high_upper_wick_50pct_8h_close"}
-        elif (previous_close is not None and previous_close >= low_mid
-                and close < low_mid and state != "FULL BEARISH"):
+        elif (low_known_before and previous_close is not None
+                and previous_close >= low_mid and close < low_mid
+                and not (event and event['direction'] == 'BEARISH'
+                         and event['swing_index'] == lo_idx)):
             state = "FULL BEARISH"
             event = {"direction": "BEARISH", "level": low_mid,
                      "swing_index": lo_idx, "break_index": i,
