@@ -7919,8 +7919,11 @@ def build_trend_scan(symbol, grp=None):
     results.append({
         "label": "Daily Swing / 8H Close", "interval": "8h", "state": daily_state,
         "icon": daily_icon, "css": daily_css, "reference_only": False,
-        "closed_time": eight_closed[-1].get("datetime", ""),
-        "closed_time_perth": format_closed_candle_perth(eight_closed[-1], "8h"),
+        # Show the historical FULL TREND confirmation, not the latest 8H scan.
+        "closed_time": (event["break_candle"].get("datetime", "")
+                        if event and event.get("break_candle") else ""),
+        "closed_time_perth": (format_closed_candle_perth(event["break_candle"], "8h")
+                              if event and event.get("break_candle") else "Awaiting verified breakout"),
     })
 
     save_trend_snapshot(symbol, {"Weekly": weekly_state, "Daily": daily_state})
