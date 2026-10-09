@@ -8031,9 +8031,9 @@ def weekly_display_structure_trend(closed_weekly):
 
 
 def build_trend_scan(symbol, grp=None):
-    f"""Display Daily swing mid-wick levels with {confirm_label} close confirmation."""
+    """Display Daily swing mid-wick levels with timeframe-specific close confirmation."""
     confirm_tf = "12h" if grp == "CRYPTO" else "8h"
-    confirm_label = f"12H" if confirm_tf == "12h" else "{confirm_label}"
+    confirm_label = "12H" if confirm_tf == "12h" else "8H"
     results = []
     state_info = {
         "Bullish": ("🟢", "bull"),
