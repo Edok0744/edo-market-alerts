@@ -8646,7 +8646,17 @@ def signal(i):
         else:
             save_timeframe_ready_status(f['grp'], f['symbol'], selected_tf, setups, latest_closed_date)
             if request.args.get("view") == "1":
-                acknowledge_timeframe_ready(f['grp'], f['symbol'], selected_tf)
+                # Restore original HOME-icon behaviour: opening the blinking icon
+                # acknowledges the current READY alerts for this pair at once.
+                # This does not change pattern detection or confirmation logic.
+                with db_conn() as ack_db:
+                    ack_db.execute("""
+                        UPDATE price_action_timeframe_status
+                        SET acknowledged_date=confirmation_date, updated=?
+                        WHERE grp=? AND symbol=? AND status='READY'
+                    """, (datetime.utcnow().isoformat(), f['grp'], f['symbol']))
+                    ack_db.commit()
+                acknowledge_price_action(f['grp'], f['symbol'])
             if selected_tf == "4h":
                 save_price_action_status(f['grp'], f['symbol'], setups, latest_closed_date)
                 if request.args.get("view") == "1":
