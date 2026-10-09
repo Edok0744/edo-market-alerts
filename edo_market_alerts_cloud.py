@@ -707,7 +707,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 </a>
 
 {% set pa = price_action_statuses.get(f['symbol'], {}) %}
-<a class="price-action-link" href="/signal/{{f['id']}}" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
+<a class="price-action-link" href="/signal/{{f['id']}}?view=1" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
 <button class="price-action-btn {{ pa.get('css', '') }}" type="button" aria-label="{{ pa.get('label', 'Price Action — WAIT') }}">
 <svg class="price-action-icon" viewBox="0 0 32 32" role="img" aria-hidden="true">
   <rect x="1.5" y="1.5" width="29" height="29" rx="7" fill="#07111f" stroke="#20c9ff" stroke-width="1.5"/>
