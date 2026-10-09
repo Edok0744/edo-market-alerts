@@ -1256,7 +1256,7 @@ a{text-decoration:none}
         {% endif %}
 
         <div class="small" style="margin-top:12px">
-            Daily swing highs/lows define the 50% midpoint of the relevant swing wick. FULL BULLISH is confirmed by a fully closed 8H candle above the previous Daily swing-high mid-wick line; FULL BEARISH by a fully closed 8H candle below the previous Daily swing-low mid-wick line. A wick crossing alone does not count. The main trend persists until an opposite confirmed 8H close beyond the Daily structure level. Weekly is shown for reference only and does not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
+            Daily swing highs/lows define the 50% midpoint of the relevant swing wick. FULL BULLISH is confirmed by a fully closed confirmation candle above the previous Daily swing-high mid-wick line; FULL BEARISH by a fully closed confirmation candle below the previous Daily swing-low mid-wick line. Crypto uses 12H confirmation; FXCM Forex and CFDs use 8H. A wick crossing alone does not count. The main trend persists until an opposite confirmed close beyond the Daily structure level. Weekly is shown for reference only and does not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
         </div>
     {% endif %}
     </div>
@@ -7154,7 +7154,7 @@ def full_trend_clear_daily_swings(daily, kind, left=4, right=4):
     return points
 
 
-def daily_structure_break_state(daily_candles, eight_hour_candles):
+def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_interval="8h"):
     """FULL TREND ONLY: Daily confirmed swing mid-wicks, 8H closed-candle breaks.
 
     A Daily pivot is usable only after all four right-hand Daily candles have closed.
@@ -7164,7 +7164,7 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
     from datetime import timedelta
 
     daily = fully_closed_candles(daily_candles, "1day")
-    eight = fully_closed_candles(eight_hour_candles, "8h")
+    eight = fully_closed_candles(eight_hour_candles, confirmation_interval)
     if len(daily) < 12 or len(eight) < 2:
         return "", None
 
@@ -7183,7 +7183,7 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
         start = eight_starts[i]
         if start is None:
             continue
-        close_time = start + timedelta(hours=8)
+        close_time = start + timedelta(hours=12 if confirmation_interval == "12h" else 8)
         # Pivot's four right-hand Daily candles must have ended before this 8H close.
         known_highs = [(j, v) for j, v in highs
                        if j + 4 < len(daily) and daily_starts[j + 4] is not None
@@ -7228,39 +7228,40 @@ def daily_structure_break_state(daily_candles, eight_hour_candles):
             state = "FULL BULLISH"
             event = {"direction": "BULLISH", "level": high_mid,
                      "swing_index": hi_idx, "break_index": i,
-                     "break_candle": candle, "level_method": "daily_high_upper_wick_50pct_8h_close"}
+                     "break_candle": candle, "level_method": f"daily_high_upper_wick_50pct_{confirmation_interval}_close"}
         elif bearish_cross and state != "FULL BEARISH":
             state = "FULL BEARISH"
             event = {"direction": "BEARISH", "level": low_mid,
                      "swing_index": lo_idx, "break_index": i,
-                     "break_candle": candle, "level_method": "daily_low_lower_wick_50pct_8h_close"}
+                     "break_candle": candle, "level_method": f"daily_low_lower_wick_50pct_{confirmation_interval}_close"}
     if audit:
         print("EDO FULL TREND REPLAY AUDIT: crossings (UTC candle start, side, event, 8H close, Daily wick midpoint, swing date):", audit_rows, flush=True)
         print("EDO FULL TREND REPLAY AUDIT: final state:", state,
               "start:", event["break_candle"].get("datetime") if event else None,
-              "daily bars:", len(daily), "8H bars:", len(eight), flush=True)
+              "daily bars:", len(daily), "confirmation bars:", len(eight), flush=True)
     return state, event
 
 
 def build_full_alignment(symbol, grp=None):
     """FULL TREND ONLY: Daily swing levels confirmed by fully closed 8H candles."""
-    clear_ohlc_cache_for_symbol(symbol, grp, intervals={"1day", "8h"})
+    confirm_tf = "12h" if grp == "CRYPTO" else "8h"
+    clear_ohlc_cache_for_symbol(symbol, grp, intervals={"1day", confirm_tf})
     daily, err = get_candles(symbol, "1day", outputsize=220, grp=grp)
     if err:
         return "", err
-    eight, err = get_candles(symbol, "8h", outputsize=660, grp=grp)
+    eight, err = get_candles(symbol, confirm_tf, outputsize=440 if confirm_tf == "12h" else 660, grp=grp)
     if err:
         return "", err
     daily_closed = fully_closed_candles(daily, "1day")
-    eight_closed = fully_closed_candles(eight, "8h")
+    eight_closed = fully_closed_candles(eight, confirm_tf)
     if len(daily_closed) < 12 or len(eight_closed) < 2:
-        return "", "Not enough completed Daily/8H candle data."
+        return "", f"Not enough completed Daily/{confirm_tf.upper()} candle data."
     from datetime import timezone
-    if not closed_candle_is_fresh(eight_closed[-1], "8h", now_utc=datetime.now(timezone.utc)):
+    if not closed_candle_is_fresh(eight_closed[-1], confirm_tf, now_utc=datetime.now(timezone.utc)):
         stamp = eight_closed[-1].get("datetime", "unknown")
-        return "", f"Waiting for fresh completed 8H candle data (latest {stamp})."
+        return "", f"Waiting for fresh completed {confirm_tf.upper()} candle data (latest {stamp})."
 
-    status, event = daily_structure_break_state(daily, eight)
+    status, event = daily_structure_break_state(daily, eight, confirm_tf)
     _FULL_TREND_CONFIRMED_EVENTS[symbol] = (status, event)
     weekly_state = ""
     weekly_candles, weekly_err = get_candles(symbol, "1week", outputsize=3, grp=grp)
@@ -8030,7 +8031,9 @@ def weekly_display_structure_trend(closed_weekly):
 
 
 def build_trend_scan(symbol, grp=None):
-    """Display Daily swing mid-wick levels with 8H close confirmation."""
+    f"""Display Daily swing mid-wick levels with {confirm_label} close confirmation."""
+    confirm_tf = "12h" if grp == "CRYPTO" else "8h"
+    confirm_label = f"12H" if confirm_tf == "12h" else "{confirm_label}"
     results = []
     state_info = {
         "Bullish": ("🟢", "bull"),
@@ -8063,23 +8066,23 @@ def build_trend_scan(symbol, grp=None):
     if len(daily_closed) < 12:
         return None, "Not enough completed Daily candle data."
 
-    eight_candles, error = get_candles(symbol, "8h", outputsize=660, grp=grp)
+    eight_candles, error = get_candles(symbol, confirm_tf, outputsize=440 if confirm_tf == "12h" else 660, grp=grp)
     if error:
         return None, error
-    eight_closed = fully_closed_candles(eight_candles, "8h")
+    eight_closed = fully_closed_candles(eight_candles, confirm_tf)
     if len(eight_closed) < 2:
-        return None, "Not enough completed 8H candle data."
-    status, event = daily_structure_break_state(daily_candles, eight_candles)
+        return None, f"Not enough completed {confirm_label} candle data."
+    status, event = daily_structure_break_state(daily_candles, eight_candles, confirm_tf)
     _FULL_TREND_CONFIRMED_EVENTS[symbol] = (status, event)
     daily_state = "Bullish" if status == "FULL BULLISH" else "Bearish" if status == "FULL BEARISH" else "Mixed"
     daily_icon, daily_css = state_info[daily_state]
     results.append({
-        "label": "Daily Swing / 8H Close", "interval": "8h", "state": daily_state,
+        "label": f"Daily Swing / {confirm_label} Close", "interval": confirm_tf, "state": daily_state,
         "icon": daily_icon, "css": daily_css, "reference_only": False,
-        # Show the historical FULL TREND confirmation, not the latest 8H scan.
+        # Show the historical FULL TREND confirmation, not the latest {confirm_label} scan.
         "closed_time": (event["break_candle"].get("datetime", "")
                         if event and event.get("break_candle") else ""),
-        "closed_time_perth": (format_closed_candle_perth(event["break_candle"], "8h")
+        "closed_time_perth": (format_closed_candle_perth(event["break_candle"], confirm_tf)
                               if event and event.get("break_candle") else "Awaiting verified breakout"),
     })
 
@@ -8090,25 +8093,25 @@ def build_trend_scan(symbol, grp=None):
         from datetime import timedelta
         event_start = parse_candle_utc(event["break_candle"].get("datetime"))
         if event_start:
-            event_time = (event_start + timedelta(hours=8)).astimezone(ZoneInfo("Australia/Perth")).strftime("%d %b %Y %H:%M Perth")
+            event_time = (event_start + timedelta(hours=12 if confirm_tf == "12h" else 8)).astimezone(ZoneInfo("Australia/Perth")).strftime("%d %b %Y %H:%M Perth")
 
     if status == "FULL BULLISH":
         summary, icon, css = "FULL BULLISH", "🟢", "bull"
         if event:
-            detail = f"Main trend is bullish: a fully closed 8H candle broke above the Daily swing-high mid-wick level at {event['level']:.5f} on {event_time}. It stays bullish until an opposite 8H close below the Daily swing-low mid-wick level is confirmed."
+            detail = f"Main trend is bullish: a fully closed {confirm_label} candle broke above the Daily swing-high mid-wick level at {event['level']:.5f} on {event_time}. It stays bullish until an opposite {confirm_label} close below the Daily swing-low mid-wick level is confirmed."
         else:
-            detail = "Main trend remains bullish from the latest 8H close above a Daily swing-high mid-wick level. It stays bullish until an opposite 8H close below the Daily swing-low mid-wick level is confirmed."
+            detail = f"Main trend remains bullish from the latest {confirm_label} close above a Daily swing-high mid-wick level. It stays bullish until an opposite {confirm_label} close below the Daily swing-low mid-wick level is confirmed."
         score = 1
     elif status == "FULL BEARISH":
         summary, icon, css = "FULL BEARISH", "🔴", "bear"
         if event:
-            detail = f"Main trend is bearish: a fully closed 8H candle broke below the Daily swing-low mid-wick level at {event['level']:.5f} on {event_time}. It stays bearish until an opposite 8H close above the Daily swing-high mid-wick level is confirmed."
+            detail = f"Main trend is bearish: a fully closed {confirm_label} candle broke below the Daily swing-low mid-wick level at {event['level']:.5f} on {event_time}. It stays bearish until an opposite {confirm_label} close above the Daily swing-high mid-wick level is confirmed."
         else:
-            detail = "Main trend remains bearish from the latest 8H close below a Daily swing-low mid-wick level. It stays bearish until an opposite 8H close above the Daily swing-high mid-wick level is confirmed."
+            detail = f"Main trend remains bearish from the latest {confirm_label} close below a Daily swing-low mid-wick level. It stays bearish until an opposite {confirm_label} close above the Daily swing-high mid-wick level is confirmed."
         score = -1
     else:
         summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
-        detail = "No fully closed 8H candle has confirmed a break of a meaningful Daily swing mid-wick level yet."
+        detail = f"No fully closed {confirm_label} candle has confirmed a break of a meaningful Daily swing mid-wick level yet."
         score = 0
 
     return {
