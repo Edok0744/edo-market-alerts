@@ -7108,7 +7108,7 @@ def full_trend_at_structural_sr(symbol, grp, direction):
 _FULL_TREND_CONFIRMED_EVENTS = {}
 
 
-def full_trend_clear_daily_swings(daily, kind, left=4, right=4):
+def full_trend_clear_daily_swings(daily, kind, left=3, right=2):
     """FULL TREND ONLY: reject minor pivots buried in overlapping Daily candles.
 
     A level needs a locally prominent extreme, a meaningful approach and
@@ -7143,13 +7143,13 @@ def full_trend_clear_daily_swings(daily, kind, left=4, right=4):
         if not normal_range:
             continue
         baseline = normal_range[len(normal_range)//2]
-        if baseline <= 0 or min(approach, departure) < 1.5 * baseline:
+        if baseline <= 0 or min(approach, departure) < 1.25 * baseline:
             continue
 
         # Keep every independently qualified historical pivot. Replacing an
         # earlier pivot with a later, stronger one uses future information and
         # can erase the very level that an earlier 8H candle broke. During
-        # replay the latest pivot *known at that time* is selected instead.
+        # replay the latest meaningful pivot *known at that time* is selected instead.
         points.append((i, pivot))
     return points
 
@@ -7157,7 +7157,7 @@ def full_trend_clear_daily_swings(daily, kind, left=4, right=4):
 def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_interval="8h"):
     """FULL TREND ONLY: Daily confirmed swing mid-wicks, 8H closed-candle breaks.
 
-    A Daily pivot is usable only after all four right-hand Daily candles have closed.
+    A Daily pivot is usable only after both right-hand Daily candles have closed.
     Replaying the 8H history never uses a Daily pivot that was not yet known.
     The main trend persists until an opposite confirmed 8H break.
     """
@@ -7184,13 +7184,13 @@ def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_
         if start is None:
             continue
         close_time = start + timedelta(hours=12 if confirmation_interval == "12h" else 8)
-        # Pivot's four right-hand Daily candles must have ended before this 8H close.
+        # Pivot's two right-hand Daily candles must have ended before this 8H close.
         known_highs = [(j, v) for j, v in highs
-                       if j + 4 < len(daily) and daily_starts[j + 4] is not None
-                       and daily_starts[j + 4] + timedelta(days=1) <= close_time]
+                       if j + 2 < len(daily) and daily_starts[j + 2] is not None
+                       and daily_starts[j + 2] + timedelta(days=1) <= close_time]
         known_lows = [(j, v) for j, v in lows
-                      if j + 4 < len(daily) and daily_starts[j + 4] is not None
-                      and daily_starts[j + 4] + timedelta(days=1) <= close_time]
+                      if j + 2 < len(daily) and daily_starts[j + 2] is not None
+                      and daily_starts[j + 2] + timedelta(days=1) <= close_time]
         # A bullish break needs a confirmed high, not an unrelated confirmed
         # low (and vice versa). Requiring both silently skips valid breakouts.
         hi_idx = known_highs[-1][0] if known_highs else None
