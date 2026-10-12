@@ -2997,6 +2997,12 @@ PATTERN_TIMEFRAMES = [
 
 # Edo's exact signal timeframes.
 NORMAL_PULLBACK_INTERVALS = {"4h", "8h", "1day", "1week"}
+
+def pullback_interval_enabled(grp, interval):
+    """Crypto substitutes 12H for 8H; Forex/CFD retain 8H."""
+    if str(grp or "").upper() == "CRYPTO":
+        return interval in {"4h", "12h", "1day", "1week"}
+    return interval in NORMAL_PULLBACK_INTERVALS
 SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
 
 def sr_gap_retest_interval_enabled(grp, interval):
@@ -6010,7 +6016,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    but it MUST align with the larger 8H trend (Daily fallback only when
     #    8H is structurally unclear).
     #    8H / Daily / Weekly Trend Pullbacks still require meaningful S/R.
-    if interval in NORMAL_PULLBACK_INTERVALS:
+    if pullback_interval_enabled(grp, interval):
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
                 closed_candles,
@@ -6063,7 +6069,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             if p.get("name") in (("TREND PULLBACK SETUP",) if str(grp).upper() == "CRYPTO" else ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP"))
         ]
     elif interval == "12h":
-        found = [p for p in found if str(grp).upper() == "CRYPTO" and p.get("name") == "S/R GAP RETEST SETUP"]
+        found = [p for p in found if str(grp).upper() == "CRYPTO" and p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")]
     elif interval == "1day":
         found = [
             p for p in found
@@ -6708,7 +6714,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     #    4H is the entry/re-entry signal: higher-timeframe trend alignment is
     #    required, but S/R proximity is NOT a mandatory blocker.
     #    8H / Daily / Weekly must still be at/near meaningful S/R.
-    if interval in NORMAL_PULLBACK_INTERVALS:
+    if pullback_interval_enabled(grp, interval):
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
                 closed_candles,
@@ -6757,7 +6763,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             if p.get("name") in (("TREND PULLBACK SETUP",) if str(grp).upper() == "CRYPTO" else ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP"))
         ]
     elif interval == "12h":
-        setups = [p for p in setups if str(grp).upper() == "CRYPTO" and p.get("name") == "S/R GAP RETEST SETUP"]
+        setups = [p for p in setups if str(grp).upper() == "CRYPTO" and p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")]
     elif interval == "1day":
         setups = [
             p for p in setups
@@ -6947,6 +6953,7 @@ def pattern_signal_monitor():
     due_seconds = {
         "4h": 15 * 60,
         "8h": 20 * 60,
+        "12h": 20 * 60,
         "1day": 60 * 60,
         "1week": 6 * 60 * 60,
     }
@@ -6978,6 +6985,8 @@ def pattern_signal_monitor():
                     interval = tf["value"]
                     # 12H automatic pattern scan is only for Bybit Crypto Gap-Retest.
                     if interval == "12h" and grp != "CRYPTO":
+                        continue
+                    if interval == "8h" and grp == "CRYPTO":
                         continue
                     key = (grp, symbol, interval)
                     previous = last_checked.get(key, 0.0)
