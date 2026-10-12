@@ -6125,6 +6125,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     # setups visible for reference until the market reopens.
     forex_weekend_blocked = (
         str(grp).upper() == "FOREX" and forex_weekend_closed()
+        and not forex_friday_daily_weekend_exception(
+            grp, interval, latest_closed_date
+        )
     )
     if forex_weekend_blocked:
         current_patterns = []
@@ -6339,6 +6342,34 @@ def forex_weekend_closed(now_utc=None):
     return False
 
 
+def forex_friday_daily_weekend_exception(grp, interval, candle_date, now_utc=None):
+    """Allow a genuine Friday FXCM D1 close to be processed on Saturday.
+
+    FXCM-native candle labels can be broker-session timestamps rather than
+    generic UTC start times. This exception only removes the blanket weekend
+    veto; all existing candle, pattern, freshness and restart checks still run.
+    """
+    if str(grp).upper() != "FOREX" or interval != "1day" or not candle_date:
+        return False
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    ny_now = now_utc.astimezone(ZoneInfo("America/New_York"))
+    # Limit the exception to the actual Friday close and the following Saturday.
+    if ny_now.weekday() not in (4, 5):
+        return False
+    if ny_now.weekday() == 4 and ny_now.hour < 17:
+        return False
+    candle_utc = parse_candle_utc(candle_date)
+    if candle_utc is None:
+        return False
+    ny_candle = candle_utc.astimezone(ZoneInfo("America/New_York"))
+    # FXCM broker labels may use Friday's date in UTC or New York.
+    friday_date = (ny_now.date() if ny_now.weekday() == 4
+                   else (ny_now - timedelta(days=1)).date())
+    return ny_candle.date() == friday_date or candle_utc.date() == friday_date
+
+
 def pattern_candle_close_utc(candle_start, interval):
     """Return the UTC close time for a candle-start timestamp when possible."""
     try:
@@ -6383,9 +6414,9 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
     Safety rules:
       * A Railway restart/redeploy must never replay a candle that had already
         closed before this Python process started.
-      * FOREX pattern pushes are not sent during the weekend market closure.
-        The newest closed candle is baselined instead, so it cannot replay on
-        Saturday/Sunday or when the market reopens.
+      * FOREX weekend pushes are suppressed, except a genuine Friday Daily
+        close detected after Friday's New York market close. The existing
+        freshness, restart and duplicate checks still apply.
       * CRYPTO remains 24/7.
     """
     if not latest_closed_date:
@@ -6424,7 +6455,10 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
     # Edo rule: no delayed Forex pattern alerts over the closed weekend.
     # Advance the state silently so Friday candles cannot replay on Saturday,
     # Sunday, or after the Sunday reopen.
-    if str(grp).upper() == "FOREX" and forex_weekend_closed():
+    if (str(grp).upper() == "FOREX" and forex_weekend_closed()
+            and not forex_friday_daily_weekend_exception(
+                grp, interval, latest_closed_date
+            )):
         _save_pattern_monitor_baseline(
             grp, symbol, interval, latest_closed_date
         )
