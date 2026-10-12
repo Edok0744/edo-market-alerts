@@ -1641,6 +1641,15 @@ def init_db():
         )
         """)
 
+        # Blink acknowledgement is independent from timeframe NEW/read state.
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS price_action_blink_ack(
+            grp TEXT NOT NULL, symbol TEXT NOT NULL, interval TEXT NOT NULL,
+            confirmation_date TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(grp,symbol,interval)
+        )
+        """)
+
         # Migration for existing EdoSignal databases: remember which READY setup Edo has opened.
         try:
             c.execute("ALTER TABLE price_action_status ADD COLUMN acknowledged_date TEXT NOT NULL DEFAULT ''")
@@ -6871,6 +6880,20 @@ def acknowledge_timeframe_ready(grp, symbol, interval):
         c.commit()
 
 
+def acknowledge_home_blink(grp, symbol):
+    """Stop blinking for currently visible signals without clearing any NEW labels."""
+    with db_conn() as c:
+        c.execute("""
+            INSERT INTO price_action_blink_ack(grp,symbol,interval,confirmation_date)
+            SELECT grp,symbol,interval,confirmation_date
+            FROM price_action_timeframe_status
+            WHERE grp=? AND symbol=? AND status='READY'
+            ON CONFLICT(grp,symbol,interval) DO UPDATE SET
+                confirmation_date=excluded.confirmation_date
+        """, (grp,symbol))
+        c.commit()
+
+
 def unread_timeframes(grp, symbol):
     with db_conn() as c:
         rows=c.execute("""
@@ -8403,19 +8426,33 @@ def home():
 
             # Any unread READY timeframe lights the HOME Price Action icon.
             unread_rows = c.execute("""
-                SELECT grp,symbol,interval,direction FROM price_action_timeframe_status
+                SELECT grp,symbol,interval,direction,confirmation_date FROM price_action_timeframe_status
                 WHERE status='READY' AND confirmation_date != acknowledged_date
             """).fetchall()
+            blink_ack_rows = c.execute("""
+                SELECT grp,symbol,interval,confirmation_date FROM price_action_blink_ack
+            """).fetchall()
+            blink_ack = {(r['grp'],r['symbol'],r['interval']): r['confirmation_date']
+                         for r in blink_ack_rows}
             for ur in unread_rows:
                 existing=price_action_statuses.get(ur['symbol'], {})
                 css='ready-buy' if ur['direction']=='BUY' else 'ready-sell'
-                if 'acknowledged' not in existing.get('css','') and existing.get('css','').startswith('ready-'):
+                if blink_ack.get((ur['grp'],ur['symbol'],ur['interval'])) == ur['confirmation_date']:
+                    css += ' acknowledged'
+                elif 'acknowledged' not in existing.get('css','') and existing.get('css','').startswith('ready-'):
                     css=existing['css']
                 price_action_statuses[ur['symbol']]={
                     'css':css,
                     'label':'Price Action — NEW ' + ur['interval'].upper() + ' ' + ur['direction'],
                     'unread_tf':ur['interval']
                 }
+
+            # If any timeframe has a genuinely unacknowledged NEW event, blink.
+            for ur in unread_rows:
+                if blink_ack.get((ur['grp'],ur['symbol'],ur['interval'])) != ur['confirmation_date']:
+                    pa = price_action_statuses.get(ur['symbol'])
+                    if pa:
+                        pa['css'] = 'ready-buy' if ur['direction']=='BUY' else 'ready-sell'
 
             trailing_stops = c.execute('SELECT * FROM trailing_stops ORDER BY triggered,id DESC').fetchall()
 
@@ -8680,17 +8717,13 @@ def signal(i):
         else:
             save_timeframe_ready_status(f['grp'], f['symbol'], selected_tf, setups, latest_closed_date)
             if request.args.get("view") == "1":
-                # Restore original HOME-icon behaviour: opening the blinking icon
-                # acknowledges the current READY alerts for this pair at once.
-                # This does not change pattern detection or confirmation logic.
-                with db_conn() as ack_db:
-                    ack_db.execute("""
-                        UPDATE price_action_timeframe_status
-                        SET acknowledged_date=confirmation_date, updated=?
-                        WHERE grp=? AND symbol=? AND status='READY'
-                    """, (datetime.utcnow().isoformat(), f['grp'], f['symbol']))
-                    ack_db.commit()
-                acknowledge_price_action(f['grp'], f['symbol'])
+                if "tf" in request.args:
+                    # Only an explicit timeframe button click clears its NEW label.
+                    acknowledge_timeframe_ready(f['grp'], f['symbol'], selected_tf)
+                else:
+                    # Opening the HOME icon stops blinking, but leaves NEW labels.
+                    acknowledge_home_blink(f['grp'], f['symbol'])
+                    acknowledge_price_action(f['grp'], f['symbol'])
             if selected_tf == "4h":
                 save_price_action_status(f['grp'], f['symbol'], setups, latest_closed_date)
                 if request.args.get("view") == "1":
