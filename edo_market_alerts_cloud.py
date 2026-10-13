@@ -4036,6 +4036,51 @@ def sr_gap_structure_is_messy(candles, old_i, retest_index, zone_centre, ar, dir
         if best_sep < 3:
             return True
 
+    # Edo clean-gap filter: evaluate the whole intervening structure, not
+    # just the two touches.  Multiple long two-sided tails and overlapping
+    # bodies in a short cluster indicate indecision/range rather than a clean
+    # move-away and retest.  One isolated rejection wick is acceptable.
+    # Normalise by each candle's range and the timeframe's average range so
+    # this behaves consistently on 8H/12H/Daily/Weekly and across assets.
+    noisy_flags = []
+    overlap_flags = []
+    for k, c in enumerate(middle):
+        op = float(c["open"])
+        cl = float(c["close"])
+        hi = float(c["high"])
+        lo = float(c["low"])
+        span = max(hi - lo, 1e-12)
+        body = abs(cl - op)
+        upper = max(0.0, hi - max(op, cl))
+        lower = max(0.0, min(op, cl) - lo)
+        # Reject clusters of large tails on BOTH ends; isolated long
+        # rejection tails are deliberately not penalised on their own.
+        two_sided_wicks = (upper >= span * 0.22 and lower >= span * 0.22)
+        wick_dominated = (upper + lower >= span * 0.65 and span >= ar * 0.55)
+        noisy_flags.append(two_sided_wicks or wick_dominated)
+        if k:
+            prev = middle[k - 1]
+            prev_lo = min(float(prev["open"]), float(prev["close"]))
+            prev_hi = max(float(prev["open"]), float(prev["close"]))
+            body_lo = min(op, cl)
+            body_hi = max(op, cl)
+            overlap = max(0.0, min(body_hi, prev_hi) - max(body_lo, prev_lo))
+            smaller_body = min(body, prev_hi - prev_lo)
+            overlap_flags.append(smaller_body > ar * 0.10 and overlap >= smaller_body * 0.55)
+
+    if len(noisy_flags) >= 5:
+        for k in range(len(noisy_flags) - 4):
+            if sum(noisy_flags[k:k + 5]) >= 3:
+                return True
+    if len(noisy_flags) >= 7 and sum(noisy_flags) / len(noisy_flags) >= 0.42:
+        return True
+    # A cluster of overlapping bodies is only disqualifying when it also
+    # contains several wick-heavy candles: normal orderly pullbacks remain OK.
+    if len(overlap_flags) >= 5:
+        for k in range(len(overlap_flags) - 4):
+            if sum(overlap_flags[k:k + 5]) >= 4 and sum(noisy_flags[k:k + 6]) >= 2:
+                return True
+
     # Genuine back-and-forth closes through the level are also congestion.
     # A rejected 8H setup remains eligible to be found independently on
     # Daily, and a rejected Daily setup remains eligible on Weekly.
