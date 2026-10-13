@@ -788,7 +788,7 @@ Target {{m['direction']}} {{m['target']}}
 <div class="alerttrend">
     <div class="alerttrend-title">TREND • Weekly reference only</div>
     <div class="alerttrend-grid">
-        {% set alert_tfs = ['Weekly','Daily','4H'] if m['grp'] == 'CFD' else ['Weekly','12H','4H'] %}
+        {% set alert_tfs = ['Weekly','Daily'] if m['grp'] == 'CFD' else ['Weekly','12H'] %}
         {% for tf in alert_tfs %}
         {% set st = snap.get(tf, '') %}
         <div>
