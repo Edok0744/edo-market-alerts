@@ -1264,7 +1264,7 @@ a{text-decoration:none}
         {% endif %}
 
         <div class="small" style="margin-top:12px">
-            Daily swing highs/lows define the 50% midpoint of the relevant swing wick. FULL BULLISH is confirmed by a fully closed confirmation candle above the previous Daily swing-high mid-wick line; FULL BEARISH by a fully closed confirmation candle below the previous Daily swing-low mid-wick line. Crypto uses 12H confirmation; FXCM Forex and CFDs use 8H. A wick crossing alone does not count. The main trend persists until an opposite confirmed close beyond the Daily structure level. Weekly is shown for reference only and does not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
+            Daily swing highs/lows define the 50% midpoint of the relevant swing wick. FULL BULLISH is confirmed by a fully closed confirmation candle above the previous Daily swing-high mid-wick line; FULL BEARISH by a fully closed confirmation candle below the previous Daily swing-low mid-wick line. Crypto uses 12H confirmation; FXCM Forex and CFDs use 8H. At least 25% of the fully closed confirmation candle body must finish beyond that level; wicks do not count. If the first breakout close is too shallow, the next closed candle can confirm. The main trend persists until an opposite confirmed close beyond the Daily structure level. Weekly is shown for reference only and does not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
         </div>
     {% endif %}
     </div>
@@ -7231,6 +7231,27 @@ def full_trend_clear_daily_swings(daily, kind, left=3, right=2):
     return points
 
 
+def full_trend_body_break_percent(candle, level, direction):
+    """Percentage of the CLOSED candle's real body beyond a Daily mid-wick level.
+
+    Wicks do not count.  A bullish confirmation must close ABOVE the level;
+    a bearish confirmation must close BELOW it.  A doji has no valid body.
+    """
+    opening = float(candle["open"])
+    closing = float(candle["close"])
+    body = abs(closing - opening)
+    if body <= 0:
+        return 0.0
+    if direction == "BULLISH" and closing > level:
+        return 100.0 * max(0.0, closing - max(min(opening, closing), level)) / body
+    if direction == "BEARISH" and closing < level:
+        return 100.0 * max(0.0, min(max(opening, closing), level) - closing) / body
+    return 0.0
+
+
+FULL_TREND_MIN_BODY_BREAK_PCT = 25.0
+
+
 def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_interval="8h"):
     """FULL TREND ONLY: Daily confirmed swing mid-wicks, 8H closed-candle breaks.
 
@@ -7290,27 +7311,55 @@ def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_
         # The pivot is already confirmed at this candle's close. The prior
         # 8H close only establishes which side of the level price came from;
         # it need not precede the instant the Daily pivot became confirmed.
+        bullish_pct = (full_trend_body_break_percent(candle, high_mid, "BULLISH")
+                       if high_mid is not None else 0.0)
+        bearish_pct = (full_trend_body_break_percent(candle, low_mid, "BEARISH")
+                       if low_mid is not None else 0.0)
+
+        # The first close over/under the Daily level can be too shallow (<25%).
+        # Give the immediately FOLLOWING closed confirmation candle a chance
+        # to qualify; do not demand that it crosses the line for a second time.
+        # Only the real candle body counts, never the wick.
+        prior_bull_weak = (
+            i >= 2 and high_mid is not None
+            and float(eight[i-2]["close"]) <= high_mid
+            and float(eight[i-1]["close"]) > high_mid
+            and full_trend_body_break_percent(eight[i-1], high_mid, "BULLISH")
+            < FULL_TREND_MIN_BODY_BREAK_PCT
+        )
+        prior_bear_weak = (
+            i >= 2 and low_mid is not None
+            and float(eight[i-2]["close"]) >= low_mid
+            and float(eight[i-1]["close"]) < low_mid
+            and full_trend_body_break_percent(eight[i-1], low_mid, "BEARISH")
+            < FULL_TREND_MIN_BODY_BREAK_PCT
+        )
         bullish_cross = (high_mid is not None and previous_close is not None
-                         and previous_close <= high_mid and close > high_mid)
+                         and (previous_close <= high_mid or prior_bull_weak)
+                         and bullish_pct >= FULL_TREND_MIN_BODY_BREAK_PCT)
         bearish_cross = (low_mid is not None and previous_close is not None
-                         and previous_close >= low_mid and close < low_mid)
+                         and (previous_close >= low_mid or prior_bear_weak)
+                         and bearish_pct >= FULL_TREND_MIN_BODY_BREAK_PCT)
         if audit and (bullish_cross or bearish_cross):
             audit_rows.append((str(start), "BULLISH" if bullish_cross else "BEARISH",
                                "NEW" if (bullish_cross and state != "FULL BULLISH") or
                                (bearish_cross and state != "FULL BEARISH") else "CONTINUATION",
                                round(close, 6),
                                round(high_mid if bullish_cross else low_mid, 6),
-                               str(daily_starts[hi_idx if bullish_cross else lo_idx])))
+                               str(daily_starts[hi_idx if bullish_cross else lo_idx]),
+                               round(bullish_pct if bullish_cross else bearish_pct, 2)))
         if bullish_cross and state != "FULL BULLISH":
             state = "FULL BULLISH"
             event = {"direction": "BULLISH", "level": high_mid,
                      "swing_index": hi_idx, "break_index": i,
-                     "break_candle": candle, "level_method": f"daily_high_upper_wick_50pct_{confirmation_interval}_close"}
+                     "break_body_percent": bullish_pct,
+                     "break_candle": candle, "level_method": f"daily_high_upper_wick_50pct_{confirmation_interval}_body25_close"}
         elif bearish_cross and state != "FULL BEARISH":
             state = "FULL BEARISH"
             event = {"direction": "BEARISH", "level": low_mid,
                      "swing_index": lo_idx, "break_index": i,
-                     "break_candle": candle, "level_method": f"daily_low_lower_wick_50pct_{confirmation_interval}_close"}
+                     "break_body_percent": bearish_pct,
+                     "break_candle": candle, "level_method": f"daily_low_lower_wick_50pct_{confirmation_interval}_body25_close"}
     if audit:
         print("EDO FULL TREND REPLAY AUDIT: crossings (UTC candle start, side, event, 8H close, Daily wick midpoint, swing date):", audit_rows, flush=True)
         print("EDO FULL TREND REPLAY AUDIT: final state:", state,
@@ -7374,7 +7423,7 @@ def save_trend_status(symbol, status):
         from datetime import timedelta
         candle_start = parse_candle_utc(event["break_candle"].get("datetime"))
         if candle_start is not None:
-            now_iso = (candle_start + timedelta(hours=8)).replace(tzinfo=None).isoformat()
+            now_iso = (candle_start + timedelta(hours=12 if "12h" in event.get("level_method", "") else 8)).replace(tzinfo=None).isoformat()
     with db_conn() as c:
         c.execute("BEGIN IMMEDIATE")
         row = c.execute(
@@ -8175,14 +8224,14 @@ def build_trend_scan(symbol, grp=None):
     if status == "FULL BULLISH":
         summary, icon, css = "FULL BULLISH", "🟢", "bull"
         if event:
-            detail = f"Main trend is bullish: a fully closed {confirm_label} candle broke above the Daily swing-high mid-wick level at {event['level']:.5f} on {event_time}. It stays bullish until an opposite {confirm_label} close below the Daily swing-low mid-wick level is confirmed."
+            detail = f"Main trend is bullish: at least 25% of a fully closed {confirm_label} candle body broke above the Daily swing-high mid-wick level at {event['level']:.5f} on {event_time}. It stays bullish until an opposite {confirm_label} close below the Daily swing-low mid-wick level is confirmed."
         else:
             detail = f"Main trend remains bullish from the latest {confirm_label} close above a Daily swing-high mid-wick level. It stays bullish until an opposite {confirm_label} close below the Daily swing-low mid-wick level is confirmed."
         score = 1
     elif status == "FULL BEARISH":
         summary, icon, css = "FULL BEARISH", "🔴", "bear"
         if event:
-            detail = f"Main trend is bearish: a fully closed {confirm_label} candle broke below the Daily swing-low mid-wick level at {event['level']:.5f} on {event_time}. It stays bearish until an opposite {confirm_label} close above the Daily swing-high mid-wick level is confirmed."
+            detail = f"Main trend is bearish: at least 25% of a fully closed {confirm_label} candle body broke below the Daily swing-low mid-wick level at {event['level']:.5f} on {event_time}. It stays bearish until an opposite {confirm_label} close above the Daily swing-high mid-wick level is confirmed."
         else:
             detail = f"Main trend remains bearish from the latest {confirm_label} close below a Daily swing-low mid-wick level. It stays bearish until an opposite {confirm_label} close above the Daily swing-high mid-wick level is confirmed."
         score = -1
