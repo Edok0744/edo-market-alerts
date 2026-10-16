@@ -392,6 +392,7 @@ h2{font-size:18px}
 .saved-fulltrend:focus-visible{outline:2px solid #ffffff;outline-offset:3px}
 .saved-fulltrend.bull{background:#153d32;color:#45e0a8}
 .saved-fulltrend.bear{background:#4a2028;color:#ff7488}
+.saved-mixed-warning{display:inline-block;margin-left:6px;font-size:20px;vertical-align:middle;cursor:help}
 
 .alerttrend{
     margin-top:10px;
@@ -694,10 +695,17 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 
 <b>{{f['symbol']}}</b>
 {% set saved_ts = trend_statuses.get(f['symbol'], '') %}
+{% set saved_snap = trend_snapshots.get(f['symbol'], {}) %}
+{% set saved_weekly = saved_snap.get('Weekly', '') %}
+{% set saved_daily = saved_snap.get('Daily', '') %}
+{% set saved_mixed = saved_weekly in ('Bullish', 'Bearish') and saved_daily in ('Bullish', 'Bearish') and saved_weekly != saved_daily %}
 {% if saved_ts == 'FULL BULLISH' %}
 <a class="saved-fulltrend bull" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bullish trend" title="Open Trend page">🟢 ▲{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
 {% elif saved_ts == 'FULL BEARISH' %}
 <a class="saved-fulltrend bear" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bearish trend" title="Open Trend page">🔴 ▼{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
+{% endif %}
+{% if saved_mixed %}
+<span class="saved-mixed-warning" role="img" aria-label="Mixed trend: Daily {{ saved_daily }}, Weekly {{ saved_weekly }}" title="⚠️ Mixed trend — Daily: {{ saved_daily }}; Weekly: {{ saved_weekly }}">⚠️</span>
 {% endif %}
 </div>
 
