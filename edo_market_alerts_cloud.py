@@ -5667,46 +5667,27 @@ def weekly_spike_monitor():
 
 
 def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
-    """
-    Edo 4H higher-timeframe trend rule, using fully CLOSED candles only.
+    """Trend Pullback context for 4H and 8H: Daily first, Weekly fallback.
 
-    Priority:
-      1) Read the 8H price-structure trend first.
-      2) If 8H is mixed/unclear, use Daily as the backup trend.
-
-    Only ONE clear higher timeframe is required. 12H is deliberately not part
-    of this 4H pullback filter. No indicators are used.
+    Only fully closed candles are used. If neither trend is clear, no
+    continuation pullback is eligible. Other signal families are unaffected.
     """
-    if interval != "4h":
+    if interval not in ("4h", "8h"):
         return None, {}, None
 
     states = {}
-
-    # 8H is the primary context for a 4H pullback.
-    candles_8h, err = get_candles(symbol, "8h", outputsize=80, grp=grp)
-    if err:
-        return None, states, err
-    closed_8h = fully_closed_candles(candles_8h, "8h")
-    if len(closed_8h) < 12:
-        return None, states, "Not enough completed 8H candle data."
-    trend_8h = local_structure_trend(closed_8h, len(closed_8h))
-    states["8H"] = trend_8h.capitalize()
-    if trend_8h in ("bullish", "bearish"):
-        states["Used"] = "8H"
-        return trend_8h, states, None
-
-    # If 8H is not structurally clear, step up to Daily.
-    candles_1d, err = get_ohlc(symbol, "1day", outputsize=80, grp=grp)
-    if err:
-        return None, states, err
-    closed_1d = fully_closed_candles(candles_1d, "1day")
-    if len(closed_1d) < 12:
-        return None, states, "Not enough completed Daily candle data."
-    trend_1d = local_structure_trend(closed_1d, len(closed_1d))
-    states["1D"] = trend_1d.capitalize()
-    if trend_1d in ("bullish", "bearish"):
-        states["Used"] = "1D"
-        return trend_1d, states, None
+    for tf, label in (("1day", "1D"), ("1week", "1W")):
+        candles, err = get_ohlc(symbol, tf, outputsize=80, grp=grp)
+        if err:
+            return None, states, err
+        closed = fully_closed_candles(candles, tf)
+        if len(closed) < 12:
+            return None, states, f"Not enough completed {label} candle data."
+        direction = local_structure_trend(closed, len(closed))
+        states[label] = direction.capitalize()
+        if direction in ("bullish", "bearish"):
+            states["Used"] = label
+            return direction, states, None
 
     states["Used"] = "None"
     return None, states, None
@@ -5806,62 +5787,30 @@ def apply_8h_gap_trend_filter(symbol, grp, interval, setups):
 
 
 def apply_strong_trend_filter(symbol, grp, interval, setups):
-    """
-    4H Trend Pullback signals are continuation-only signals.
+    """For 4H/8H Trend Pullbacks, require Daily direction, else Weekly.
 
-    A 4H setup needs one clear higher-timeframe direction. 8H is checked
-    first; Daily is used only when 8H price structure is mixed/unclear.
-
-    8H Trend Pullback is intentionally NOT filtered by higher-timeframe trend.
-    Daily Trend Pullback is intentionally NOT filtered by higher-timeframe trend.
-    Weekly normal Trend Pullback remains disabled elsewhere.
+    This does not filter Gap Retests or any other signal family.
     """
-    if interval != "4h":
+    if interval not in ("4h", "8h"):
+        return setups, None, None
+    pullbacks = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
+    if not pullbacks:
         return setups, None, None
 
-    higher_direction, states, error = strong_higher_timeframe_trend(
-        symbol, grp, interval
-    )
+    higher_direction, states, error = strong_higher_timeframe_trend(symbol, grp, interval)
     if error:
         return [], states, error
-
-    if higher_direction is None:
-        if interval == "8h":
-            exception_setups = []
-            for p in setups:
-                if p.get("name") != "TREND PULLBACK SETUP":
-                    exception_setups.append(p)
-                elif p.get("sr_second_reaction_exception"):
-                    q = dict(p)
-                    q["higher_tf_filter"] = False
-                    q["higher_tf_states"] = dict(states)
-                    q["signal_context"] = "8H second S/R reaction with gap — developing trend"
-                    exception_setups.append(q)
-            return exception_setups, states, None
-        return [], states, None
 
     filtered = []
     for p in setups:
         if p.get("name") != "TREND PULLBACK SETUP":
-            # Keep non-trading WATCH alerts separate.
             filtered.append(p)
-            continue
-
-        if p.get("direction") == higher_direction:
-            p = dict(p)
-            p["higher_tf_filter"] = True
-            p["higher_tf_direction"] = higher_direction
-            p["higher_tf_states"] = dict(states)
-            filtered.append(p)
-        elif interval == "8h" and p.get("sr_second_reaction_exception"):
-            # Early/developing-trend exception: a genuine second separated
-            # S/R reaction may qualify even before higher TFs fully align.
-            p = dict(p)
-            p["higher_tf_filter"] = False
-            p["higher_tf_states"] = dict(states)
-            p["signal_context"] = "8H second S/R reaction with gap — developing trend"
-            filtered.append(p)
-
+        elif higher_direction is not None and p.get("direction") == higher_direction:
+            q = dict(p)
+            q["higher_tf_filter"] = True
+            q["higher_tf_direction"] = higher_direction
+            q["higher_tf_states"] = dict(states)
+            filtered.append(q)
     return filtered, states, None
 
 
@@ -5883,8 +5832,8 @@ def confirmation_room_filter(candles, setup, interval):
     It also flags an unusually oversized confirmation body as an extra reason
     when that candle is already pressing into the historical level.
     """
-    if interval not in ("4h", "8h"):
-        return True, None
+    if interval in ("4h", "8h") and setup.get("name") == "TREND PULLBACK SETUP":
+        return True, None  # No support/resistance requirement for 4H/8H pullbacks.
 
     if setup.get("name") != "TREND PULLBACK SETUP":
         return True, None
@@ -6060,7 +6009,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    4H is Edo's entry/re-entry tool: it does NOT require S/R proximity,
     #    but it MUST align with the larger 8H trend (Daily fallback only when
     #    8H is structurally unclear).
-    #    8H / Daily / Weekly Trend Pullbacks still require meaningful S/R.
+    #    Daily / Weekly Trend Pullbacks still require meaningful S/R.
     if pullback_interval_enabled(grp, interval):
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
@@ -6074,8 +6023,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
             # Edo rule:
             # 4H is the entry/re-entry pullback and S/R is context only, not a blocker.
-            # 8H / Daily / Weekly still require meaningful pre-existing S/R.
-            if interval != "4h":
+            # Daily / Weekly still require meaningful pre-existing S/R.
+            if interval not in ("4h", "8h"):
                 near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
                     closed_candles, pullback, interval
                 )
@@ -6131,11 +6080,11 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     # Edo rule:
     #   All Trend Pullbacks -> established local trend + clean 2+ candle retracement.
-    #   4H -> higher-timeframe direction (8H first, Daily fallback); S/R is context
+    #   4H / 8H -> higher-timeframe direction (Daily first, Weekly fallback); S/R is context
     #   only and does not block the entry/re-entry signal.
-    #   8H / Daily / Weekly -> meaningful pre-existing S/R remains mandatory.
+    #   Daily / Weekly -> meaningful pre-existing S/R remains mandatory.
     higher_tf_states = None
-    if interval == "4h":
+    if interval in ("4h", "8h"):
         normal_found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
         other_found = [p for p in found if p.get("name") != "TREND PULLBACK SETUP"]
 
@@ -6255,7 +6204,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                 state_text = " | ".join(f"{k} {v}" for k, v in higher_tf_states.items())
                 summary = (
                     f"No {interval.upper()} setup passed the higher-timeframe direction filter. "
-                    f"8H is used first; Daily is checked only when 8H is mixed/unclear. "
+                    f"Daily is used first; Weekly is checked only when Daily is mixed/unclear. "
                     f"Current higher-timeframe state: {state_text}."
                 )
             else:
@@ -6758,7 +6707,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     # A) NORMAL Trend Pullback — 4H, 8H, Daily and Weekly, NO 50% rule.
     #    4H is the entry/re-entry signal: higher-timeframe trend alignment is
     #    required, but S/R proximity is NOT a mandatory blocker.
-    #    8H / Daily / Weekly must still be at/near meaningful S/R.
+    #    Daily / Weekly must still be at/near meaningful S/R.
     if pullback_interval_enabled(grp, interval):
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
@@ -6772,8 +6721,8 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
             # Edo rule:
             # 4H is the entry/re-entry pullback and S/R is context only, not a blocker.
-            # 8H / Daily / Weekly still require meaningful pre-existing S/R.
-            if interval != "4h":
+            # Daily / Weekly still require meaningful pre-existing S/R.
+            if interval not in ("4h", "8h"):
                 near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
                     closed_candles, pullback, interval
                 )
@@ -6824,13 +6773,13 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         setups = []
 
     # Edo rule:
-    #   4H Trend Pullback -> higher-timeframe direction (8H first, Daily fallback).
+    #   4H / 8H Trend Pullback -> higher-timeframe direction (Daily first, Weekly fallback).
     #   S/R is useful context on 4H but is NOT a mandatory blocker.
-    #   8H / Daily / Weekly Trend Pullback -> must be near meaningful S/R and do
+    #   Daily / Weekly Trend Pullback -> must be near meaningful S/R and do
     #   not use the 4H higher-timeframe alignment requirement.
     # The separate S/R Gap-Retest setup remains independent.
 
-    if interval == "4h":
+    if interval in ("4h", "8h"):
         normal_setups = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
         other_setups = [p for p in setups if p.get("name") != "TREND PULLBACK SETUP"]
 
