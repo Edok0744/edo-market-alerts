@@ -6121,9 +6121,11 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         closed_candles, interval, found
     )
 
+    # Most recent closed candle first; on the same candle, Gap Retest wins.
     found.sort(
         key=lambda p: (
             p.get("confirmation_date", ""),
+            1 if p.get("name") == "S/R GAP RETEST SETUP" else 0,
             p.get("score", 0)
         ),
         reverse=True
@@ -6276,10 +6278,10 @@ def pattern_push_priority(p):
     """
     name = str(p.get("name", "")).upper()
 
+    if "S/R GAP RETEST" in name:
+        return 40
     if "RR" in name and "RAILWAY" in name:
         return 30
-    if "S/R GAP RETEST" in name:
-        return 25
     if "TREND PULLBACK" in name:
         return 20
     if "RANGE" in name and "REVERSAL" in name:
@@ -6547,7 +6549,14 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         if current is None or pattern_push_priority(p) > pattern_push_priority(current):
             best_by_family[family_key] = p
 
-    for p in best_by_family.values():
+    # Daily per-pair push limit remains unchanged; reserve it for Gap Retest
+    # when multiple families confirm on this newest closed candle.
+    prioritized_patterns = sorted(
+        best_by_family.values(),
+        key=lambda p: (pattern_push_priority(p), p.get("score", 0)),
+        reverse=True,
+    )
+    for p in prioritized_patterns:
         confirmation_date = p.get("confirmation_date", "")
         if not confirmation_date:
             continue
