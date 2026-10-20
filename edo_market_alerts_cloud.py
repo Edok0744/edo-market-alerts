@@ -679,12 +679,8 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 
 
 <div class="card">
-<details id="edo-health-panel">
-<summary style="cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center;gap:10px;font-weight:900;font-size:18px" aria-label="Show or hide Signal Monitor Health">
-  <span>🩺 Signal Monitor Health</span>
-  <span style="font-size:13px;color:#1fd1a5">Tap to show / hide ▾</span>
-</summary>
-<div class="small" style="margin-top:12px">Read-only scanner diagnostics • Times shown in Perth • A successful scan does not mean a trade setup was found.</div>
+<h2>🩺 Signal Monitor Health</h2>
+<div class="small">Read-only scanner diagnostics • Times shown in Perth • A successful scan does not mean a trade setup was found.</div>
 {% for h in scanner_health %}
 <div style="border-top:1px solid #294761;padding:10px 0;margin-top:8px">
   <b>{{ h.name }}</b>
@@ -696,7 +692,6 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 </div>
 {% endfor %}
 <div class="small">Startup and many saved pairs may delay scans. This section reports detection activity, not proof that a phone notification was delivered.</div>
-</details>
 </div>
 
 <div class="card">
@@ -4449,6 +4444,117 @@ def detect_bounce_retest(candles, conf):
         "take_profit_source": take_profit_source,
     }
 
+def detect_diagonal_gap_retest(candles, conf):
+    """Conservative diagonal S/R retest; separate from horizontal Edo rules.
+
+    Three confirmed, distinct historical pivot touches define a clear sloping
+    line. No pivots from the confirmation area are used to fit it. A fresh
+    closed-candle touch, separation and 50% opposite-body rejection are required.
+    """
+    i = conf["index"]
+    direction = conf["direction"]
+    if i < 35:
+        return None
+    ar = avg_range(candles, i + 1, 20)
+    if ar <= 0:
+        return None
+    kind = "low" if direction == "bullish" else "high"
+    key = kind
+    # Require a previous swing with its right-hand confirmation already formed.
+    pivots = swing_points(candles[:max(0, i - 5)], kind, left=3, right=3)
+    pivots = [(j, float(v)) for j, v in pivots if i - 105 <= j <= i - 8]
+    if len(pivots) < 3:
+        return None
+
+    # Recent three touches must be spread out and genuinely form a trendline.
+    candidates = []
+    for lastpos in range(len(pivots) - 1, 1, -1):
+        trio = pivots[lastpos-2:lastpos+1]
+        (a, va), (b, vb), (c, vc) = trio
+        if b - a < 5 or c - b < 5 or c - a < 15:
+            continue
+        slope = (vc - va) / (c - a)
+        # Reject effectively horizontal lines; existing horizontal logic owns those.
+        if abs(slope) * (c - a) < ar * 0.8:
+            continue
+        # A visually clear channel boundary needs three close, aligned touches.
+        tolerance = ar * 0.48
+        if abs(vb - (va + slope * (b - a))) > tolerance:
+            continue
+        projected = vc + slope * (i - 1 - c)
+        # Never extrapolate a line so far that its price level becomes implausible.
+        if i - c > 32 or projected <= 0:
+            continue
+        # A trendline must remain defensible: no material body CLOSE through it
+        # between the historical touch and the latest retest.
+        broken = False
+        for j in range(a + 1, i - 3):
+            line = va + slope * (j - a)
+            close = float(candles[j]["close"])
+            if direction == "bullish" and close < line - ar * 0.55:
+                broken = True
+                break
+            if direction == "bearish" and close > line + ar * 0.55:
+                broken = True
+                break
+        if broken:
+            continue
+        # Price must depart from the line clearly after the third old touch.
+        gap = []
+        for j in range(c + 2, i - 3):
+            line = va + slope * (j - a)
+            delta = (float(candles[j]["close"]) - line) * (1 if direction == "bullish" else -1)
+            gap.append(delta)
+        if not gap or max(gap) < ar * 1.4:
+            continue
+        if not any(all(x >= ar * 0.6 for x in gap[k:k+3]) for k in range(max(0, len(gap)-2))):
+            continue
+        # Retest on the previous red/green candle, before the opposite-colour confirmation.
+        test = candles[i - 1]
+        test_line = va + slope * (i - 1 - a)
+        wick = float(test[key])
+        if abs(wick - test_line) > ar * 0.55:
+            continue
+        current_line = va + slope * (i - a)
+        confirmed_close = float(candles[i]["close"])
+        if direction == "bullish":
+            if confirmed_close <= current_line + ar * 0.10:
+                continue
+        else:
+            if confirmed_close >= current_line - ar * 0.10:
+                continue
+        # Independent S/R rule already requires 50% of previous candle's body.
+        target1, take_profit = sr_structure_targets(candles, direction, i-1, confirmed_close, search_back=120)
+        # Reject a setup already effectively at its first meaningful target.
+        extreme = float(candles[i]["high" if direction == "bullish" else "low"])
+        if target1 is not None:
+            if direction == "bullish" and extreme >= target1 - ar * 0.35:
+                continue
+            if direction == "bearish" and extreme <= target1 + ar * 0.35:
+                continue
+        score = 7.5 + min(1.5, (c-a) / 35.0) + min(1.0, (max(gap) / ar - 1.4) / 3)
+        candidates.append((score, a, va, c, vc, projected, wick, current_line, target1, take_profit))
+
+    if not candidates:
+        return None
+    score, a, va, c, vc, projected, wick, current_line, target1, take_profit = max(candidates)
+    return {
+        "name": "S/R GAP RETEST SETUP", "direction": direction,
+        "confirmed": True, "score": score, "confirmation_date": conf["date"],
+        "confirmation_close": conf["close"], "penetration": conf["penetration"],
+        "retest_depth_pct": 100.0, "departure_extreme": None,
+        "level": current_line, "old_level": va, "retest_price": wick,
+        "retest_date": candles[i-1].get("datetime", ""),
+        "level_source": "diagonal trendline " + ("support" if direction == "bullish" else "resistance"),
+        "old_date": candles[a].get("datetime", ""), "separation": i - c,
+        "weak_retest": False, "diagonal": True, "trendline_touches": 3,
+        "target": target1, "target1": target1,
+        "target1_source": "structural" if target1 is not None else None,
+        "take_profit": take_profit,
+        "take_profit_source": "structural" if take_profit is not None else None,
+    }
+
+
 def count_same_colour_before(candles, i, colour):
     """Count ONLY the uninterrupted same-colour run immediately before i.
 
@@ -5376,21 +5482,36 @@ def describe_setup(p, interval=None):
 
     elif p["name"] == "S/R GAP RETEST SETUP":
         weak_text = " Weakness was also detected in the retest candles." if p["weak_retest"] else ""
-        detail = (
-            f"{direction_word} S/R Gap-Retest confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
-            f"Price first established a wick-defined support/resistance zone, moved clearly away, "
-            f"then returned to RETEST the same zone after {p['separation']} candles. "
-            f"The second touch retraced {p.get('retest_depth_pct', 0):.0f}% back toward the original S/R level "
-            f"(minimum 50% required). The opposite-colour confirmation candle fully closed away from the zone and "
-            f"{p['penetration']:.0f}% through the previous candle BODY (minimum 50% required)."
-        )
-
-        level_text = (
-            f"Established retest zone: {p['level']:.5f} • "
-            f"Earlier wick level: {p['old_level']:.5f} on {format_signal_time_perth(p['old_date'])} • "
-            f"Second {p['level_source']} test: {p['retest_price']:.5f} on {format_signal_time_perth(p['retest_date'])} • "
-            f"Confirmation close: {p['confirmation_close']:.5f}"
-        )
+        if p.get("diagonal"):
+            detail = (
+                f"{direction_word} DIAGONAL trendline Gap-Retest confirmed on {format_signal_time_perth(p['confirmation_date'])}. "
+                f"Three separated historical swing touches formed a clear sloping "
+                f"{p['level_source']}. Price departed, returned to the projected line "
+                f"and gave a fully closed opposite-colour rejection at "
+                f"{p['penetration']:.0f}% through the previous candle body "
+                f"(minimum 50% required)."
+            )
+            level_text = (
+                f"Projected diagonal line: {p['level']:.5f} • "
+                f"Earlier wick: {p['old_level']:.5f} on {format_signal_time_perth(p['old_date'])} • "
+                f"Latest test: {p['retest_price']:.5f} on {format_signal_time_perth(p['retest_date'])} • "
+                f"Confirmation close: {p['confirmation_close']:.5f}"
+            )
+        else:
+            detail = (
+                f"{direction_word} S/R Gap-Retest confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
+                f"Price first established a wick-defined support/resistance zone, moved clearly away, "
+                f"then returned to RETEST the same zone after {p['separation']} candles. "
+                f"The second touch retraced {p.get('retest_depth_pct', 0):.0f}% back toward the original S/R level "
+                f"(minimum 50% required). The opposite-colour confirmation candle fully closed away from the zone and "
+                f"{p['penetration']:.0f}% through the previous candle BODY (minimum 50% required)."
+            )
+            level_text = (
+                f"Established retest zone: {p['level']:.5f} • "
+                f"Earlier wick level: {p['old_level']:.5f} on {format_signal_time_perth(p['old_date'])} • "
+                f"Second {p['level_source']} test: {p['retest_price']:.5f} on {format_signal_time_perth(p['retest_date'])} • "
+                f"Confirmation close: {p['confirmation_close']:.5f}"
+            )
         if p.get("target1") is not None:
             src = p.get("target1_source", "structural")
             level_text += f" • Target 1: {p['target1']:.5f} ({src})"
@@ -6180,6 +6301,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
                 found.append(sr_setup)
+            diagonal_setup = detect_diagonal_gap_retest(closed_candles, sr_conf)
+            if diagonal_setup:
+                found.append(diagonal_setup)
 
     # Avoid duplicate descriptions of the same setup/direction/confirmation.
     unique = {}
@@ -6750,7 +6874,18 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
             if p.get("take_profit") is not None:
                 src = p.get("take_profit_source", "structural")
                 target_lines += f" Take Profit: {p['take_profit']:.5f} ({src})."
-            push_body = (
+            if p.get("diagonal"):
+                push_body = (
+                    f"DIAGONAL {zone_word} Gap-Retest on the NEWEST CLOSED {tf_label} candle "
+                    f"({format_signal_time_perth(confirmation_date)}). "
+                    f"Three well-separated swing touches form a clear sloping trendline; "
+                    f"price moved away and then retested it. "
+                    f"Opposite-colour confirmation closed {p.get('penetration', 0):.0f}% "
+                    f"through the previous body. {direction_word} possibility."
+                    f"{target_lines} Review chart before trading."
+                )
+            else:
+                push_body = (
                 f"{p['name']} confirmed on the NEWEST CLOSED {tf_label} candle "
                 f"({format_signal_time_perth(confirmation_date)}). "
                 f"Established {zone_word} on the left, price moved clearly away, "
@@ -6884,6 +7019,9 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
                 found.append(sr_setup)
+            diagonal_setup = detect_diagonal_gap_retest(closed_candles, sr_conf)
+            if diagonal_setup:
+                found.append(diagonal_setup)
 
     unique = {}
     for p in found:
