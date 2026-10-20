@@ -679,6 +679,22 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 
 
 <div class="card">
+<h2>🩺 Signal Monitor Health</h2>
+<div class="small">Read-only scanner diagnostics • Times shown in Perth • A successful scan does not mean a trade setup was found.</div>
+{% for h in scanner_health %}
+<div style="border-top:1px solid #294761;padding:10px 0;margin-top:8px">
+  <b>{{ h.name }}</b>
+  <div class="small" style="color:{{ '#35e28a' if h.state == 'SCANNING' else '#f2c94c' }}">{{ h.state }}</div>
+  <div class="small">Last attempt: {{ h.last_attempt }} • Last success: {{ h.last_success }}</div>
+  <div class="small">Last market: {{ h.last_market or '—' }} • Successful scans: {{ h.successes }} • Errors: {{ h.failures }}</div>
+  <div class="small">Last detected setup: {{ h.last_signal }} ({{ h.last_signal_at }})</div>
+  {% if h.error %}<div class="small" style="color:#ff8a96">Latest error: {{ h.error }}</div>{% endif %}
+</div>
+{% endfor %}
+<div class="small">Startup and many saved pairs may delay scans. This section reports detection activity, not proof that a phone notification was delivered.</div>
+</div>
+
+<div class="card">
 <h2>⭐ Saved Pairs</h2>
 
 {% if favorites %}
@@ -1527,6 +1543,24 @@ def init_db():
             print("SQLite WAL setup warning:", e)
 
 
+        # Diagnostic-only scanner history (persistent through Railway redeploys).
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS scanner_health (
+            scanner TEXT PRIMARY KEY,
+            last_attempt TEXT NOT NULL DEFAULT '',
+            last_success TEXT NOT NULL DEFAULT '',
+            last_error_at TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            last_symbol TEXT NOT NULL DEFAULT '',
+            last_interval TEXT NOT NULL DEFAULT '',
+            last_signal_at TEXT NOT NULL DEFAULT '',
+            last_signal TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            successes INTEGER NOT NULL DEFAULT 0,
+            failures INTEGER NOT NULL DEFAULT 0
+        )
+        """)
+
         c.execute('''
         CREATE TABLE IF NOT EXISTS alerts(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1804,6 +1838,91 @@ def init_db():
         except sqlite3.OperationalError:
             pass
         c.commit()
+
+
+# -------------------------------------------------
+# SIGNAL MONITOR HEALTH — OBSERVATION ONLY
+# -------------------------------------------------
+SCAN_HEALTH_NAMES = ("Gap Retest", "Trend Pullback", "Weekly Spike")
+
+
+def record_scan_health(scanner, symbol="", interval="", error=None, signal=""):
+    """Record a scan outcome; never let diagnostics interrupt signal delivery."""
+    if scanner not in SCAN_HEALTH_NAMES:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with db_conn() as c:
+            c.execute("INSERT OR IGNORE INTO scanner_health(scanner) VALUES(?)", (scanner,))
+            if error:
+                c.execute("""
+                    UPDATE scanner_health SET last_attempt=?, last_error_at=?,
+                    last_error=?, last_symbol=?, last_interval=?,
+                    attempts=attempts+1, failures=failures+1 WHERE scanner=?
+                """, (now, now, str(error)[:240], str(symbol), str(interval), scanner))
+            else:
+                c.execute("""
+                    UPDATE scanner_health SET last_attempt=?, last_success=?,
+                    last_error='', last_symbol=?, last_interval=?,
+                    attempts=attempts+1, successes=successes+1 WHERE scanner=?
+                """, (now, now, str(symbol), str(interval), scanner))
+                if signal:
+                    c.execute("""
+                        UPDATE scanner_health SET last_signal_at=?, last_signal=?
+                        WHERE scanner=?
+                    """, (now, str(signal)[:180], scanner))
+            c.commit()
+    except Exception as exc:
+        print("scanner health diagnostic error", scanner, exc)
+
+
+def scanner_health_snapshot():
+    """Database-only Home Screen diagnostics; no market API credits consumed."""
+    try:
+        with db_conn() as c:
+            records = c.execute("SELECT * FROM scanner_health").fetchall()
+        by_name = {r['scanner']: dict(r) for r in records}
+    except Exception as exc:
+        print('scanner health read error', exc)
+        by_name = {}
+    now = datetime.now(timezone.utc)
+    results = []
+    for name in SCAN_HEALTH_NAMES:
+        item = by_name.get(name, {})
+        raw = item.get('last_success') or ''
+        try:
+            elapsed = (now - datetime.fromisoformat(raw).astimezone(timezone.utc)).total_seconds()
+        except (ValueError, TypeError, AttributeError):
+            elapsed = None
+        # Pattern scheduler checks one saved symbol/timeframe per cycle; with
+        # many saved pairs, an infrequent scan is not necessarily a failure.
+        if elapsed is None:
+            state = 'WAITING FOR FIRST SUCCESS'
+        elif item.get('last_error'):
+            state = 'LAST SCAN ERROR'
+        elif elapsed > (8 * 3600 if name == 'Weekly Spike' else 3 * 3600):
+            state = 'NOT SCANNED RECENTLY'
+        else:
+            state = 'SCANNING'
+        def perth_time(iso):
+            if not iso:
+                return '—'
+            try:
+                return datetime.fromisoformat(iso).astimezone(ZoneInfo('Australia/Perth')).strftime('%d %b %H:%M')
+            except (ValueError, TypeError):
+                return '—'
+        results.append({
+            'name': name, 'state': state,
+            'last_attempt': perth_time(item.get('last_attempt')),
+            'last_success': perth_time(raw),
+            'last_signal': item.get('last_signal') or 'None recorded yet',
+            'last_signal_at': perth_time(item.get('last_signal_at')),
+            'error': item.get('last_error') or '',
+            'last_market': ' '.join(filter(None, [item.get('last_symbol'), item.get('last_interval')])),
+            'successes': item.get('successes', 0),
+            'failures': item.get('failures', 0),
+        })
+    return results
 
 
 def reset_old_signal_history():
@@ -5580,7 +5699,11 @@ def weekly_spike_monitor():
 
                 if error:
                     print("weekly spike monitor error", symbol, error)
-                elif latest_closed_date:
+                    record_scan_health("Weekly Spike", symbol, "1week", error=error)
+                else:
+                    record_scan_health("Weekly Spike", symbol, "1week",
+                        signal=f"{symbol}: {spike.get('label') or spike.get('side') or 'Spike'}" if spike else '')
+                if not error and latest_closed_date:
                     with db_conn() as c:
                         state = c.execute(
                             """
@@ -7033,7 +7156,22 @@ def pattern_signal_monitor():
 
             if error:
                 print("pattern monitor error", symbol, interval, error)
+                if pullback_interval_enabled(grp, interval):
+                    record_scan_health("Trend Pullback", symbol, interval, error=error)
+                if sr_gap_retest_interval_enabled(grp, interval):
+                    record_scan_health("Gap Retest", symbol, interval, error=error)
             else:
+                # The same candle batch is scanned by both detectors; a valid
+                # empty result is still a successful scan, not a failure.
+                names = [str(p.get('name', '')) for p in (setups or [])]
+                for family, enabled, token in (
+                    ("Trend Pullback", pullback_interval_enabled(grp, interval), "PULLBACK"),
+                    ("Gap Retest", sr_gap_retest_interval_enabled(grp, interval), "RETEST"),
+                ):
+                    if enabled:
+                        found = next((n for n in names if token in n.upper()), '')
+                        record_scan_health(family, symbol, interval,
+                                           signal=f"{symbol} {interval}: {found}" if found else '')
                 save_timeframe_ready_status(grp, symbol, interval, setups, latest_closed_date)
                 if interval == "4h":
                     save_price_action_status(grp, symbol, setups, latest_closed_date)
@@ -8591,7 +8729,8 @@ def home():
         news_items=news_items,
         news_configured=news_configured,
         news_feed_status=news_feed_status,
-        news_feed_unavailable=news_feed_unavailable
+        news_feed_unavailable=news_feed_unavailable,
+        scanner_health=scanner_health_snapshot()
     )
 
 
@@ -9011,6 +9150,11 @@ def internal_error(error):
       <a href="/">← Back to Market Alerts</a>
     </div></div></body></html>
     """, 500
+
+
+@APP.route('/signal-monitor-health')
+def signal_monitor_health():
+    return jsonify(ok=True, scanners=scanner_health_snapshot())
 
 
 @APP.route('/health')
