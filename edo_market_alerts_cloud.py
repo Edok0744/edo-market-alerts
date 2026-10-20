@@ -679,8 +679,12 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 
 
 <div class="card">
-<h2>🩺 Signal Monitor Health</h2>
-<div class="small">Read-only scanner diagnostics • Times shown in Perth • A successful scan does not mean a trade setup was found.</div>
+<details id="edo-health-panel">
+<summary style="cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center;gap:10px;font-weight:900;font-size:18px" aria-label="Show or hide Signal Monitor Health">
+  <span>🩺 Signal Monitor Health</span>
+  <span style="font-size:13px;color:#1fd1a5">Tap to show / hide ▾</span>
+</summary>
+<div class="small" style="margin-top:12px">Read-only scanner diagnostics • Times shown in Perth • A successful scan does not mean a trade setup was found.</div>
 {% for h in scanner_health %}
 <div style="border-top:1px solid #294761;padding:10px 0;margin-top:8px">
   <b>{{ h.name }}</b>
@@ -692,6 +696,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 </div>
 {% endfor %}
 <div class="small">Startup and many saved pairs may delay scans. This section reports detection activity, not proof that a phone notification was delivered.</div>
+</details>
 </div>
 
 <div class="card">
