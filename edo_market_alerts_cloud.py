@@ -3688,13 +3688,56 @@ def sr_confirmation_at(candles, i):
     return None
 
 
-def recent_sr_confirmations(candles, lookback=7):
+def crypto_second_candle_sr_confirmation(candles, i):
+    """Crypto-only: allow the second consecutive rejection candle to confirm.
+
+    The first opposite-colour candle must FAIL the original 50% body
+    midpoint. The second candle must close beyond that SAME original midpoint.
+    This never accumulates percentage across candles and never treats a wick
+    as a close. Callers provide fully closed candles only.
+    """
+    if i < 2 or i >= len(candles):
+        return None
+    reference, first, second = candles[i - 2:i + 1]
+    reference_colour = candle_colour(reference)
+    first_colour = candle_colour(first)
+    second_colour = candle_colour(second)
+    body = abs(float(reference['close']) - float(reference['open']))
+    if body <= 0 or first_colour != second_colour:
+        return None
+    midpoint = (float(reference['open']) + float(reference['close'])) / 2.0
+    if reference_colour == 'green' and first_colour == 'red':
+        # First red close was insufficient; second red close must qualify.
+        if float(first['close']) < midpoint or float(second['close']) >= midpoint:
+            return None
+        direction = 'bearish'
+        penetration = (float(reference['close']) - float(second['close'])) / body * 100.0
+    elif reference_colour == 'red' and first_colour == 'green':
+        if float(first['close']) > midpoint or float(second['close']) <= midpoint:
+            return None
+        direction = 'bullish'
+        penetration = (float(second['close']) - float(reference['close'])) / body * 100.0
+    else:
+        return None
+    if penetration < 50.0:
+        return None
+    return {
+        'direction': direction, 'index': i, 'penetration': penetration,
+        'date': second.get('datetime', ''), 'close': float(second['close']),
+        'previous_midpoint': midpoint, 'retest_candle_index': i - 2,
+        'crypto_second_candle': True,
+    }
+
+
+def recent_sr_confirmations(candles, lookback=7, grp="FOREX"):
     """Newest-first 50% confirmations used ONLY for S/R gap-and-retest."""
     found = []
     first = max(1, len(candles) - lookback)
 
     for i in range(first, len(candles)):
         c = sr_confirmation_at(candles, i)
+        if c is None and str(grp).upper() == "CRYPTO":
+            c = crypto_second_candle_sr_confirmation(candles, i)
         if c:
             found.append(c)
 
@@ -4256,7 +4299,7 @@ def detect_bounce_retest(candles, conf):
         return None
 
     # The second touch must be immediately before/around the confirmation.
-    touch_start = max(3, i - 4)
+    touch_start = max(3, i - (5 if conf.get("crypto_second_candle") else 4))
     touch_end = i + 1
     touch_slice = candles[touch_start:touch_end]
     if not touch_slice:
@@ -4516,8 +4559,9 @@ def detect_diagonal_gap_retest(candles, conf):
         if not any(all(x >= ar * 0.6 for x in gap[k:k+3]) for k in range(max(0, len(gap)-2))):
             continue
         # Retest on the previous red/green candle, before the opposite-colour confirmation.
-        test = candles[i - 1]
-        test_line = va + slope * (i - 1 - a)
+        test_idx = int(conf.get("retest_candle_index", i - 1))
+        test = candles[test_idx]
+        test_line = va + slope * (test_idx - a)
         wick = float(test[key])
         if abs(wick - test_line) > ar * 0.55:
             continue
@@ -4530,7 +4574,7 @@ def detect_diagonal_gap_retest(candles, conf):
             if confirmed_close >= current_line - ar * 0.10:
                 continue
         # Independent S/R rule already requires 50% of previous candle's body.
-        target1, take_profit = sr_structure_targets(candles, direction, i-1, confirmed_close, search_back=120)
+        target1, take_profit = sr_structure_targets(candles, direction, test_idx, confirmed_close, search_back=120)
         # Reject a setup already effectively at its first meaningful target.
         extreme = float(candles[i]["high" if direction == "bullish" else "low"])
         if target1 is not None:
@@ -4539,21 +4583,25 @@ def detect_diagonal_gap_retest(candles, conf):
             if direction == "bearish" and extreme <= target1 + ar * 0.35:
                 continue
         score = 7.5 + min(1.5, (c-a) / 35.0) + min(1.0, (max(gap) / ar - 1.4) / 3)
-        candidates.append((score, a, va, c, vc, projected, wick, current_line, target1, take_profit))
+        candidates.append((score, a, va, b, vb, c, vc, projected, wick, current_line, target1, take_profit))
 
     if not candidates:
         return None
-    score, a, va, c, vc, projected, wick, current_line, target1, take_profit = max(candidates)
+    score, a, va, b, vb, c, vc, projected, wick, current_line, target1, take_profit = max(candidates)
     return {
         "name": "S/R GAP RETEST SETUP", "direction": direction,
         "confirmed": True, "score": score, "confirmation_date": conf["date"],
         "confirmation_close": conf["close"], "penetration": conf["penetration"],
         "retest_depth_pct": 100.0, "departure_extreme": None,
         "level": current_line, "old_level": va, "retest_price": wick,
-        "retest_date": candles[i-1].get("datetime", ""),
+        "retest_date": candles[int(conf.get("retest_candle_index", i - 1))].get("datetime", ""),
         "level_source": "diagonal trendline " + ("support" if direction == "bullish" else "resistance"),
         "old_date": candles[a].get("datetime", ""), "separation": i - c,
         "weak_retest": False, "diagonal": True, "trendline_touches": 3,
+        "trendline_touch_points": [
+            {"date": candles[j].get("datetime", ""), "price": float(v)}
+            for j, v in ((a, va), (b, vb), (c, vc))
+        ],
         "target": target1, "target1": target1,
         "target1_source": "structural" if target1 is not None else None,
         "take_profit": take_profit,
@@ -5497,7 +5545,15 @@ def describe_setup(p, interval=None):
                 f"{p['penetration']:.0f}% through the previous candle body "
                 f"(minimum 50% required)."
             )
+            touches = p.get("trendline_touch_points") or []
+            touch_text = (
+                " • ".join(
+                    f"Touch {n}: {point['price']:.5f} on {format_signal_time_perth(point['date'])}"
+                    for n, point in enumerate(touches, 1)
+                ) + " • "
+            ) if touches else ""
             level_text = (
+                touch_text +
                 f"Projected diagonal line: {p['level']:.5f} • "
                 f"Earlier wick: {p['old_level']:.5f} on {format_signal_time_perth(p['old_date'])} • "
                 f"Latest test: {p['retest_price']:.5f} on {format_signal_time_perth(p['retest_date'])} • "
@@ -6303,7 +6359,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    later retest of the same zone -> opposite-colour CLOSED confirmation.
     #    The 50% previous-candle BODY rule applies ONLY to this signal.
     if sr_gap_retest_interval_enabled(grp, interval):
-        for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
+        for sr_conf in recent_sr_confirmations(closed_candles, lookback=9, grp=grp):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
                 found.append(sr_setup)
@@ -7021,7 +7077,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     #    Messy lower-timeframe structures are suppressed so Daily/Weekly can
     #    supply the cleaner version of the same price structure.
     if sr_gap_retest_interval_enabled(grp, interval):
-        for sr_conf in recent_sr_confirmations(closed_candles, lookback=9):
+        for sr_conf in recent_sr_confirmations(closed_candles, lookback=9, grp=grp):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
                 found.append(sr_setup)
@@ -7676,12 +7732,23 @@ def build_full_alignment(symbol, grp=None):
 
     status, event = daily_structure_break_state(daily, eight, confirm_tf)
     _FULL_TREND_CONFIRMED_EVENTS[symbol] = (status, event)
-    weekly_state = ""
-    weekly_candles, weekly_err = get_candles(symbol, "1week", outputsize=3, grp=grp)
+    # Home-screen Weekly warning MUST use the same completed-week structure
+    # calculation as the manual Trend page. Previously this background path
+    # used just the colour of one weekly candle, producing a false yellow
+    # mixed-trend warning until Edo opened the manual page.
+    weekly_state = None
+    weekly_candles, weekly_err = get_candles(symbol, "1week", outputsize=52, grp=grp)
     if not weekly_err:
-        weekly_closed = last_closed_candle(weekly_candles, "1week")
-        if weekly_closed is not None:
-            weekly_state = analyse_candle(weekly_closed)
+        weekly_history = weekly_card_completed_candles(weekly_candles)
+        if len(weekly_history) >= 12:
+            weekly_state = weekly_display_structure_trend(weekly_history)
+    if weekly_state is None:
+        # A transient weekly-feed failure must not erase a valid weekly state.
+        with db_conn() as c:
+            prior = c.execute(
+                "SELECT weekly FROM trend_snapshot WHERE symbol=?", (symbol,)
+            ).fetchone()
+        weekly_state = (prior["weekly"] or "") if prior else ""
     daily_state = "Bullish" if status == "FULL BULLISH" else "Bearish" if status == "FULL BEARISH" else "Mixed"
     save_trend_snapshot(symbol, {"Weekly": weekly_state, "Daily": daily_state})
     return status, None
