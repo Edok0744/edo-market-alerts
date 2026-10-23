@@ -1483,6 +1483,10 @@ a{text-decoration:none}
                 {% if newest['level_text'] %}
                 <div class="level">{{ newest['level_text'] }}</div>
                 {% endif %}
+                <div class="pattern-detail" style="color:#f2c94c;margin-top:9px">
+                    Confirmed candle: {{ newest.get('confirmation_time_perth', '') }}.<br>
+                    {{ newest.get('notification_note', 'Phone alert history unavailable') }}
+                </div>
             </div>
 
             {% if patterns|length > 1 %}
@@ -1495,6 +1499,10 @@ a{text-decoration:none}
                     {% if p['level_text'] %}
                     <div class="level">{{ p['level_text'] }}</div>
                     {% endif %}
+                    <div class="pattern-detail" style="color:#f2c94c;margin-top:9px">
+                        Confirmed candle: {{ p.get('confirmation_time_perth', '') }}.<br>
+                        {{ p.get('notification_note', 'Phone alert history unavailable') }}
+                    </div>
                 </div>
                 {% endfor %}
             {% endif %}
@@ -1630,6 +1638,18 @@ def init_db():
             UNIQUE(symbol, interval, pattern_name, direction, confirmation_date)
         )
         ''')
+        # Notification transparency: previous sent_at was written BEFORE Pushover
+        # was called. Preserve it as a historical log timestamp, not proof of delivery.
+        for col, dtype in (
+            ("push_attempted_at", "TEXT"),
+            ("push_accepted_at", "TEXT"),
+            ("push_status", "TEXT"),
+        ):
+            try:
+                c.execute(f"ALTER TABLE pattern_notifications ADD COLUMN {col} {dtype}")
+            except sqlite3.OperationalError:
+                pass
+
         c.execute("""
         CREATE TABLE IF NOT EXISTS pair_daily_pushes(
             grp TEXT NOT NULL,
@@ -5648,6 +5668,7 @@ def describe_setup(p, interval=None):
         "css": css,
         "direction": p["direction"],
         "confirmation_date": p.get("confirmation_date", ""),
+        "confirmation_time_perth": format_signal_time_perth(p.get("confirmation_date", "")),
         "confirmed": True,
         "score": p.get("score", 0),
     }
@@ -6286,6 +6307,50 @@ def apply_confirmation_room_filter(candles, interval, setups):
     return accepted, rejected
 
 
+def attach_pattern_push_history(symbol, interval, patterns):
+    """Annotate the displayed patterns with Pushover request history (DB only).
+
+    A successful Pushover HTTP response is NOT confirmation of phone delivery.
+    Historical rows created by older app versions have no reliable outcome.
+    """
+    if not patterns:
+        return patterns
+    try:
+        with db_conn() as c:
+            rows = c.execute(
+                """SELECT pattern_name, direction, confirmation_date, sent_at,
+                          push_attempted_at, push_accepted_at, push_status
+                   FROM pattern_notifications WHERE symbol=? AND interval=?""",
+                (symbol, interval)
+            ).fetchall()
+    except Exception as exc:
+        print("notification history lookup error", symbol, interval, exc)
+        return patterns
+
+    by_key = {(r["pattern_name"], r["direction"], r["confirmation_date"]): r for r in rows}
+    for p in patterns:
+        original_name = ("TREND PULLBACK SETUP" if p.get("name") == "4H PULLBACK ENTRY"
+                         else p.get("name", ""))
+        key = (original_name, p.get("direction", ""), p.get("confirmation_date", ""))
+        row = by_key.get(key)
+        if row is None:
+            p["notification_note"] = "Phone alert: No automatic Pushover request recorded for this setup."
+        elif row["push_status"] == "ACCEPTED":
+            when = format_signal_time_perth(row["push_accepted_at"])
+            p["notification_note"] = (f"Pushover accepted request: {when}. "
+                                      "This does not prove the iPhone displayed it.")
+        elif row["push_status"] == "FAILED":
+            when = format_signal_time_perth(row["push_attempted_at"])
+            p["notification_note"] = f"Pushover request failed: {when}. No phone delivery confirmed."
+        elif row["push_status"] == "ATTEMPTING":
+            when = format_signal_time_perth(row["push_attempted_at"])
+            p["notification_note"] = f"Pushover request started: {when}. Final outcome not recorded."
+        else:
+            p["notification_note"] = ("Older alert record: actual send time and delivery "
+                                      "cannot be verified (previous script saved timestamps before sending).")
+    return patterns
+
+
 def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     cache_key = f"{grp}|{symbol}|{interval}"
     now = time.time()
@@ -6546,7 +6611,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         "signal_icon": icon,
         "signal_css": css,
         "summary": summary,
-        "patterns": [describe_setup(p, interval) for p in found[:4]],
+        "patterns": attach_pattern_push_history(
+            symbol, interval, [describe_setup(p, interval) for p in found[:4]]
+        ),
         "rejected_setups": [
             p.get("rejection_reason", "")
             for p in rejected_room_setups[:3]
@@ -6902,6 +6969,20 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         except sqlite3.IntegrityError:
             continue
 
+        try:
+            with db_conn() as c:
+                c.execute(
+                    """UPDATE pattern_notifications
+                       SET push_status='ATTEMPTING', push_attempted_at=?
+                       WHERE symbol=? AND interval=? AND pattern_name=?
+                         AND direction=? AND confirmation_date=?""",
+                    (datetime.now(timezone.utc).isoformat(), symbol, interval,
+                     p["name"], p["direction"], confirmation_date)
+                )
+                c.commit()
+        except Exception as exc:
+            print("push attempt audit error", exc)
+
         bullish = p["direction"] == "bullish"
         icon = "🔵" if p.get("name") == "RR — RAILWAY TRACKS" else ("🟢" if bullish else "🔴")
         direction_word = "BULLISH" if bullish else "BEARISH"
@@ -6995,12 +7076,26 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         ready_sound = READY_PUSH_SOUND
         ready_priority = 1
 
-        send_push(
+        accepted = send_push(
             f"{icon} {symbol} [{grp}] — {p['name']}",
             push_body,
             sound=ready_sound,
             priority=ready_priority
         )
+        try:
+            with db_conn() as c:
+                c.execute(
+                    """UPDATE pattern_notifications
+                       SET push_status=?, push_accepted_at=?
+                       WHERE symbol=? AND interval=? AND pattern_name=?
+                         AND direction=? AND confirmation_date=?""",
+                    ('ACCEPTED' if accepted else 'FAILED',
+                     datetime.now(timezone.utc).isoformat() if accepted else None,
+                     symbol, interval, p['name'], p['direction'], confirmation_date)
+                )
+                c.commit()
+        except Exception as exc:
+            print("push result audit error", exc)
 
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
@@ -9244,7 +9339,7 @@ def signal(i):
         signal_icon=data['signal_icon'],
         signal_css=data['signal_css'],
         summary=data['summary'],
-        patterns=data['patterns'],
+        patterns=attach_pattern_push_history(f['symbol'], selected_tf, data['patterns']),
         updated=data['updated'],
         error=''
     )
