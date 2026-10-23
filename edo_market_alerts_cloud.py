@@ -7677,11 +7677,31 @@ def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_
             and full_trend_body_break_percent(eight[i-1], low_mid, "BEARISH")
             < FULL_TREND_MIN_BODY_BREAK_PCT
         )
+        # A pivot cannot be used until its two right-hand Daily candles close.
+        # If its 50%-wick level was already crossed before that moment, the
+        # previous logic demanded a SECOND crossing and left FULL TREND stuck
+        # in the old direction. The first eligible 8H/12H candle can instead
+        # confirm with >=25% of ITS OWN body beyond the newly available level.
+        # This never backdates a signal to before the pivot was known.
+        previous_candle_end = (
+            eight_starts[i - 1] + timedelta(hours=12 if confirmation_interval == "12h" else 8)
+            if i and eight_starts[i - 1] is not None else None
+        )
+        high_first_eligible = (
+            hi_idx is not None and previous_candle_end is not None
+            and daily_starts[hi_idx + 2] is not None
+            and previous_candle_end < daily_starts[hi_idx + 2] + timedelta(days=1) <= close_time
+        )
+        low_first_eligible = (
+            lo_idx is not None and previous_candle_end is not None
+            and daily_starts[lo_idx + 2] is not None
+            and previous_candle_end < daily_starts[lo_idx + 2] + timedelta(days=1) <= close_time
+        )
         bullish_cross = (high_mid is not None and previous_close is not None
-                         and (previous_close <= high_mid or prior_bull_weak)
+                         and (previous_close <= high_mid or prior_bull_weak or high_first_eligible)
                          and bullish_pct >= FULL_TREND_MIN_BODY_BREAK_PCT)
         bearish_cross = (low_mid is not None and previous_close is not None
-                         and (previous_close >= low_mid or prior_bear_weak)
+                         and (previous_close >= low_mid or prior_bear_weak or low_first_eligible)
                          and bearish_pct >= FULL_TREND_MIN_BODY_BREAK_PCT)
         if audit and (bullish_cross or bearish_cross):
             audit_rows.append((str(start), "BULLISH" if bullish_cross else "BEARISH",
@@ -8568,6 +8588,22 @@ def build_trend_scan(symbol, grp=None):
 
     save_trend_snapshot(symbol, {"Weekly": weekly_state, "Daily": daily_state})
 
+    # Show Edo the exact latest Daily swing-mid-wick trigger levels in use.
+    # Display-only: never changes the signal, badge or notification rules.
+    high_pivots = full_trend_clear_daily_swings(daily_closed, "high")
+    low_pivots = full_trend_clear_daily_swings(daily_closed, "low")
+    trigger_level_note = []
+    if high_pivots:
+        idx, _ = high_pivots[-1]
+        pivot = daily_closed[idx]
+        level = (float(pivot["high"]) + max(float(pivot["open"]), float(pivot["close"]))) / 2.0
+        trigger_level_note.append(f"Bullish Daily swing-high 50% wick: {level:.5f} ({pivot.get('datetime', '')})")
+    if low_pivots:
+        idx, _ = low_pivots[-1]
+        pivot = daily_closed[idx]
+        level = (float(pivot["low"]) + min(float(pivot["open"]), float(pivot["close"]))) / 2.0
+        trigger_level_note.append(f"Bearish Daily swing-low 50% wick: {level:.5f} ({pivot.get('datetime', '')})")
+
     event_time = ""
     if event and event.get("break_candle"):
         from datetime import timedelta
@@ -8593,6 +8629,9 @@ def build_trend_scan(symbol, grp=None):
         summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
         detail = f"No fully closed {confirm_label} candle has confirmed a break of a meaningful Daily swing mid-wick level yet."
         score = 0
+
+    if trigger_level_note:
+        detail += " Current selected trigger lines: " + " • ".join(trigger_level_note) + "."
 
     return {
         "results": results, "summary": summary, "summary_icon": icon,
