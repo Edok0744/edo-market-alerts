@@ -1819,6 +1819,23 @@ def init_db():
         VALUES(1,'','','','')
         """)
 
+        # Forex-only Monthly Abnormal Spike detector; independent of Weekly.
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_spike_state(
+            grp TEXT NOT NULL, symbol TEXT NOT NULL,
+            last_closed_date TEXT NOT NULL DEFAULT '', updated TEXT,
+            PRIMARY KEY(grp, symbol)
+        )
+        """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_spike_notifications(
+            grp TEXT NOT NULL, symbol TEXT NOT NULL,
+            candle_date TEXT NOT NULL, side TEXT NOT NULL,
+            wick_ratio REAL, sent_at TEXT NOT NULL,
+            PRIMARY KEY(grp, symbol, candle_date, side)
+        )
+        """)
+
         c.execute("""
         CREATE TABLE IF NOT EXISTS weekly_spike_state(
             grp TEXT NOT NULL,
@@ -1869,7 +1886,7 @@ def init_db():
 # -------------------------------------------------
 # SIGNAL MONITOR HEALTH — OBSERVATION ONLY
 # -------------------------------------------------
-SCAN_HEALTH_NAMES = ("Gap Retest", "Trend Pullback", "Weekly Spike")
+SCAN_HEALTH_NAMES = ("Gap Retest", "Trend Pullback", "Weekly Spike", "Monthly Spike")
 
 
 def record_scan_health(scanner, symbol="", interval="", error=None, signal=""):
@@ -1926,7 +1943,7 @@ def scanner_health_snapshot():
             state = 'WAITING FOR FIRST SUCCESS'
         elif item.get('last_error'):
             state = 'LAST SCAN ERROR'
-        elif elapsed > (8 * 3600 if name == 'Weekly Spike' else 3 * 3600):
+        elif elapsed > (72 * 3600 if name == 'Monthly Spike' else 8 * 3600 if name == 'Weekly Spike' else 3 * 3600):
             state = 'NOT SCANNED RECENTLY'
         else:
             state = 'SCANNING'
@@ -6005,6 +6022,132 @@ def weekly_spike_monitor():
 
 
 
+# -------------------------------------------------
+# FOREX MONTHLY ABNORMAL SPIKE — SAME WEEKLY RULES
+# -------------------------------------------------
+def monthly_candle_close_utc(candle):
+    """Use the next UTC calendar-month boundary, never a fixed 30-day period."""
+    start = parse_candle_utc((candle or {}).get("datetime", ""))
+    if start is None or start.day != 1:
+        return None
+    if start.month == 12:
+        return start.replace(year=start.year + 1, month=1, day=1,
+                             hour=0, minute=0, second=0, microsecond=0)
+    return start.replace(month=start.month + 1, day=1,
+                         hour=0, minute=0, second=0, microsecond=0)
+
+
+def fully_closed_monthly_candles(candles, now_utc=None):
+    """Twelve Data monthly bars include a still-forming current month: exclude it."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    return [c for c in (candles or [])
+            if monthly_candle_close_utc(c) is not None
+            and monthly_candle_close_utc(c) <= now_utc]
+
+
+def detect_monthly_spike(closed_monthly):
+    """Identical trend-before-spike and wick thresholds to existing Weekly rule."""
+    result = detect_weekly_spike(closed_monthly)
+    if not result:
+        return None
+    result = dict(result)
+    result["message"] = (result["message"]
+                         .replace("Weekly", "Monthly")
+                         .replace("weekly", "monthly"))
+    return result
+
+
+def collect_monthly_spike(symbol, grp="FOREX"):
+    """Forex only. Source is Twelve Data monthly data (FXCM service lacks M1)."""
+    if grp != "FOREX":
+        return None, None, "Monthly spikes are Forex-only."
+    candles, error = get_ohlc(symbol, "1month", outputsize=80, grp="FOREX")
+    if error:
+        return None, None, error
+    closed = fully_closed_monthly_candles(candles)
+    if len(closed) < 14:
+        return None, None, "Not enough fully closed Monthly candle history."
+    return detect_monthly_spike(closed), closed[-1].get("datetime", ""), None
+
+
+def notify_monthly_spike(symbol, spike):
+    """A unique persistent record prevents repeated alerts for the same month."""
+    if not spike or not spike.get("date") or not spike.get("side"):
+        return False
+    key = ("FOREX", symbol, spike["date"], spike["side"])
+    try:
+        with db_conn() as c:
+            c.execute("""
+                INSERT INTO monthly_spike_notifications
+                (grp,symbol,candle_date,side,wick_ratio,sent_at)
+                VALUES(?,?,?,?,?,?)
+            """, (*key, float(spike.get("ratio",0)), datetime.now(timezone.utc).isoformat()))
+            c.commit()
+    except sqlite3.IntegrityError:
+        return False
+    sent = send_push(f"🟣 {symbol} [FOREX] — MONTHLY SPIKE", spike["message"])
+    if not sent:
+        # Allow a later check to retry an unsuccessful Pushover request.
+        with db_conn() as c:
+            c.execute("""DELETE FROM monthly_spike_notifications
+                         WHERE grp=? AND symbol=? AND candle_date=? AND side=?""", key)
+            c.commit()
+    return bool(sent)
+
+
+def monthly_spike_monitor():
+    """Low-priority Forex-only scan, one saved pair every two minutes."""
+    time.sleep(240)
+    index = 0
+    while True:
+        try:
+            if manual_api_priority_active():
+                time.sleep(15)
+                continue
+            with db_conn() as c:
+                rows = c.execute("SELECT symbol FROM favorites WHERE grp='FOREX' ORDER BY symbol").fetchall()
+            if rows:
+                index %= len(rows)
+                symbol = rows[index]["symbol"]
+                index += 1
+                spike, latest_date, error = collect_monthly_spike(symbol)
+                record_scan_health("Monthly Spike", symbol, "1month", error=error,
+                    signal=f"{symbol}: {spike['label']} Monthly wick" if spike else "")
+                if not error and latest_date:
+                    with db_conn() as c:
+                        state = c.execute("""SELECT last_closed_date FROM monthly_spike_state
+                                             WHERE grp='FOREX' AND symbol=?""", (symbol,)).fetchone()
+                        previous = state["last_closed_date"] if state else None
+                        latest_close_utc = monthly_candle_close_utc({"datetime": latest_date})
+                        # A restart must not replay an old monthly candle as a new alert.
+                        if (previous is not None and latest_date != previous
+                                and latest_close_utc is not None
+                                and latest_close_utc <= PROCESS_STARTED_UTC):
+                            c.execute("""UPDATE monthly_spike_state
+                                         SET last_closed_date=?,updated=?
+                                         WHERE grp='FOREX' AND symbol=?""",
+                                      (latest_date, datetime.now(timezone.utc).isoformat(), symbol))
+                            c.commit()
+                            continue
+                        if previous is None:
+                            # First-ever observation is a baseline, not a historical alert.
+                            c.execute("""INSERT INTO monthly_spike_state
+                                         (grp,symbol,last_closed_date,updated) VALUES(?,?,?,?)""",
+                                      ("FOREX", symbol, latest_date, datetime.now(timezone.utc).isoformat()))
+                            c.commit()
+                        elif latest_date != previous:
+                            # Persist the new completed month before sending; reruns never replay it.
+                            c.execute("""UPDATE monthly_spike_state SET last_closed_date=?,updated=?
+                                         WHERE grp='FOREX' AND symbol=?""",
+                                      (latest_date, datetime.now(timezone.utc).isoformat(), symbol))
+                            c.commit()
+                            if spike:
+                                notify_monthly_spike(symbol, spike)
+        except Exception as exc:
+            print("monthly spike monitor error", exc)
+        time.sleep(120)
+
+
 
 def strong_higher_timeframe_trend(symbol, grp="FOREX", interval="4h"):
     """Trend Pullback context for 4H and 8H: Daily first, Weekly fallback.
@@ -9533,6 +9676,9 @@ threading.Thread(
     target=pattern_signal_monitor,
     daemon=True
 ).start()
+
+# Forex-only Monthly Spike warning has its own scanner and stored state.
+threading.Thread(target=monthly_spike_monitor, daemon=True).start()
 
 # Weekly Spike warning is one of Edo's intended signals.
 # It is a warning only and uses fully closed Weekly candles.
