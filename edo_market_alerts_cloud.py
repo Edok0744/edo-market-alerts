@@ -7766,49 +7766,32 @@ def full_trend_at_structural_sr(symbol, grp, direction):
 _FULL_TREND_CONFIRMED_EVENTS = {}
 
 
-def full_trend_clear_daily_swings(daily, kind, left=3, right=2):
-    """FULL TREND ONLY: reject minor pivots buried in overlapping Daily candles.
+# Full Trend pivot confirmation requires one CLOSED Daily candle on each side.
+# This is intentionally more sensitive than Gap Retest swing selection:
+# a modest local turn can define Edo's Daily 50%-wick trend trigger.
+FULL_TREND_SWING_LEFT = 1
+FULL_TREND_SWING_RIGHT = 1
 
-    A level needs a locally prominent extreme, a meaningful approach and
-    departure, and sufficient separation from nearby same-side pivots.
-    Uses only candles through pivot + right, avoiding future information.
+
+def full_trend_clear_daily_swings(daily, kind, left=FULL_TREND_SWING_LEFT,
+                                  right=FULL_TREND_SWING_RIGHT):
+    """FULL TREND ONLY: keep even small, genuine confirmed Daily local swings.
+
+    A Daily high must exceed neighbouring Daily highs; a Daily low must be
+    below neighbouring Daily lows. No ATR/range/prominence test applies here.
+    The right-side candle must be closed before the pivot can be used.
+    Separate, stricter pivots for Gap Retests and other patterns are unchanged.
     """
-    points = []
     key = "high" if kind == "high" else "low"
-    opposite = "low" if kind == "high" else "high"
+    points = []
     for i in range(left, len(daily) - right):
-        window = daily[i-left:i+right+1]
-        pivot = float(daily[i][key])
-        before = daily[i-left:i]
-        after = daily[i+1:i+right+1]
-        if kind == "high":
-            if not (pivot > max(float(c[key]) for c in before) and
-                    pivot > max(float(c[key]) for c in after)):
-                continue
-            approach = pivot - min(float(c[opposite]) for c in before)
-            departure = pivot - min(float(c[opposite]) for c in after)
-        else:
-            if not (pivot < min(float(c[key]) for c in before) and
-                    pivot < min(float(c[key]) for c in after)):
-                continue
-            approach = max(float(c[opposite]) for c in before) - pivot
-            departure = max(float(c[opposite]) for c in after) - pivot
-
-        # A visible structural turn must be larger than the ordinary Daily
-        # candle fluctuations on both sides, not just a two-bar wiggle.
-        historical = daily[max(0, i-20):i]
-        normal_range = sorted(float(c["high"])-float(c["low"]) for c in historical)
-        if not normal_range:
-            continue
-        baseline = normal_range[len(normal_range)//2]
-        if baseline <= 0 or min(approach, departure) < 1.25 * baseline:
-            continue
-
-        # Keep every independently qualified historical pivot. Replacing an
-        # earlier pivot with a later, stronger one uses future information and
-        # can erase the very level that an earlier 8H candle broke. During
-        # replay the latest meaningful pivot *known at that time* is selected instead.
-        points.append((i, pivot))
+        price = float(daily[i][key])
+        neighbours = [float(daily[j][key])
+                      for j in range(i - left, i + right + 1) if j != i]
+        if kind == "high" and price > max(neighbours):
+            points.append((i, price))
+        elif kind == "low" and price < min(neighbours):
+            points.append((i, price))
     return points
 
 
@@ -7836,7 +7819,7 @@ FULL_TREND_MIN_BODY_BREAK_PCT = 25.0
 def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_interval="8h"):
     """FULL TREND ONLY: Daily confirmed swing mid-wicks, 8H closed-candle breaks.
 
-    A Daily pivot is usable only after both right-hand Daily candles have closed.
+    A Daily pivot is usable only after its right-hand Daily confirmation candle has closed.
     Replaying the 8H history never uses a Daily pivot that was not yet known.
     The main trend persists until an opposite confirmed 8H break.
     """
@@ -7863,13 +7846,13 @@ def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_
         if start is None:
             continue
         close_time = start + timedelta(hours=12 if confirmation_interval == "12h" else 8)
-        # Pivot's two right-hand Daily candles must have ended before this 8H close.
+        # The required right-hand Daily confirmation candle must have closed first.
         known_highs = [(j, v) for j, v in highs
-                       if j + 2 < len(daily) and daily_starts[j + 2] is not None
-                       and daily_starts[j + 2] + timedelta(days=1) <= close_time]
+                       if j + FULL_TREND_SWING_RIGHT < len(daily) and daily_starts[j + FULL_TREND_SWING_RIGHT] is not None
+                       and daily_starts[j + FULL_TREND_SWING_RIGHT] + timedelta(days=1) <= close_time]
         known_lows = [(j, v) for j, v in lows
-                      if j + 2 < len(daily) and daily_starts[j + 2] is not None
-                      and daily_starts[j + 2] + timedelta(days=1) <= close_time]
+                      if j + FULL_TREND_SWING_RIGHT < len(daily) and daily_starts[j + FULL_TREND_SWING_RIGHT] is not None
+                      and daily_starts[j + FULL_TREND_SWING_RIGHT] + timedelta(days=1) <= close_time]
         # A bullish break needs a confirmed high, not an unrelated confirmed
         # low (and vice versa). Requiring both silently skips valid breakouts.
         hi_idx = known_highs[-1][0] if known_highs else None
@@ -7915,7 +7898,7 @@ def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_
             and full_trend_body_break_percent(eight[i-1], low_mid, "BEARISH")
             < FULL_TREND_MIN_BODY_BREAK_PCT
         )
-        # A pivot cannot be used until its two right-hand Daily candles close.
+        # A pivot cannot be used until its right-hand Daily confirmation candle closes.
         # If its 50%-wick level was already crossed before that moment, the
         # previous logic demanded a SECOND crossing and left FULL TREND stuck
         # in the old direction. The first eligible 8H/12H candle can instead
@@ -7927,19 +7910,22 @@ def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_
         )
         high_first_eligible = (
             hi_idx is not None and previous_candle_end is not None
-            and daily_starts[hi_idx + 2] is not None
-            and previous_candle_end < daily_starts[hi_idx + 2] + timedelta(days=1) <= close_time
+            and daily_starts[hi_idx + FULL_TREND_SWING_RIGHT] is not None
+            and previous_candle_end < daily_starts[hi_idx + FULL_TREND_SWING_RIGHT] + timedelta(days=1) <= close_time
         )
         low_first_eligible = (
             lo_idx is not None and previous_candle_end is not None
-            and daily_starts[lo_idx + 2] is not None
-            and previous_candle_end < daily_starts[lo_idx + 2] + timedelta(days=1) <= close_time
+            and daily_starts[lo_idx + FULL_TREND_SWING_RIGHT] is not None
+            and previous_candle_end < daily_starts[lo_idx + FULL_TREND_SWING_RIGHT] + timedelta(days=1) <= close_time
         )
+        # If a small Daily pivot is confirmed after an earlier shallow crossing,
+        # allow the NEXT qualifying closed candle to establish the missing state.
+        # Do not demand a second crossing of the same level.
         bullish_cross = (high_mid is not None and previous_close is not None
-                         and (previous_close <= high_mid or prior_bull_weak or high_first_eligible)
+                         and (previous_close <= high_mid or prior_bull_weak or high_first_eligible or state != "FULL BULLISH")
                          and bullish_pct >= FULL_TREND_MIN_BODY_BREAK_PCT)
         bearish_cross = (low_mid is not None and previous_close is not None
-                         and (previous_close >= low_mid or prior_bear_weak or low_first_eligible)
+                         and (previous_close >= low_mid or prior_bear_weak or low_first_eligible or state != "FULL BEARISH")
                          and bearish_pct >= FULL_TREND_MIN_BODY_BREAK_PCT)
         if audit and (bullish_cross or bearish_cross):
             audit_rows.append((str(start), "BULLISH" if bullish_cross else "BEARISH",
