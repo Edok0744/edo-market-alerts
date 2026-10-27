@@ -1269,6 +1269,9 @@ a{text-decoration:none}
                     {% if not item.get('reference_only') %}{{ item['icon'] }} {% endif %}{{ item['state'] }}
                 </div>
                 <div class="trend-time">{{ item.get('closed_time_perth', '') }}</div>
+                {% if item.get('turning_detail') %}
+                <div class="trend-time" style="font-size:11px; margin-top:6px">{{ item['turning_detail'] }}</div>
+                {% endif %}
             </div>
         {% endfor %}
         </div>
@@ -4530,6 +4533,58 @@ def detect_bounce_retest(candles, conf):
         "take_profit_source": take_profit_source,
     }
 
+def add_turning_point_gap_strength(candles, setup, interval):
+    """Non-blocking confluence information for existing valid D1/W1 retests.
+
+    Uses only historical, right-confirmed swing points preceding the retest.
+    Never changes whether a setup meets Edo's existing confirmation rules.
+    """
+    if not setup or interval not in ("1day", "1week") or setup.get("name") != "S/R GAP RETEST SETUP":
+        return setup
+    setup = dict(setup)
+    if setup.get("diagonal"):
+        # The existing diagonal detector independently verifies 3 pivots and a
+        # closed-candle rejection. Show those existing points as confluence.
+        pts = setup.get("trendline_touch_points") or []
+        if len(pts) >= 3:
+            setup["turning_point_strength"] = "STRONG: 3 confirmed turning points align on a clean diagonal trendline"
+        return setup
+    retest_time = parse_candle_utc(setup.get("retest_date"))
+    limit = len(candles) - 4
+    if retest_time is not None:
+        for idx, c in enumerate(candles):
+            dt = parse_candle_utc(c.get("datetime"))
+            if dt is not None and dt >= retest_time:
+                limit = min(limit, idx - 3)
+                break
+    history = candles[:max(0, limit)]
+    if len(history) < 15:
+        return setup
+    kind = "low" if setup.get("direction") == "bullish" else "high"
+    pivots = swing_points(history, kind, left=2, right=2)
+    average = avg_range(history, end=len(history), length=min(20, len(history)))
+    if average <= 0:
+        return setup
+    level = float(setup["level"])
+    tolerance = average * 0.5
+    matches = [(i, float(v)) for i,v in pivots if abs(float(v)-level) <= tolerance]
+    # Count independent turning points, not neighbouring candle noise.
+    separated=[]
+    for point in matches:
+        if not separated or point[0]-separated[-1][0]>=4:
+            separated.append(point)
+    if len(separated) >= 2:
+        setup["turning_point_strength"] = (
+            f"STRONG: {len(separated)} separated historical turning points support this "
+            f"{kind} / horizontal level (tolerance {tolerance:.5f})"
+        )
+        setup["strength_turning_points"] = [
+            {"date":history[i].get("datetime",""), "price":val}
+            for i,val in separated[-3:]
+        ]
+    return setup
+
+
 def detect_diagonal_gap_retest(candles, conf):
     """Conservative diagonal S/R retest; separate from horizontal Edo rules.
 
@@ -5611,6 +5666,13 @@ def describe_setup(p, interval=None):
                 f"Second {p['level_source']} test: {p['retest_price']:.5f} on {format_signal_time_perth(p['retest_date'])} • "
                 f"Confirmation close: {p['confirmation_close']:.5f}"
             )
+        if p.get("turning_point_strength"):
+            detail += " Additional turning-point confirmation: " + p["turning_point_strength"] + "."
+            if p.get("strength_turning_points"):
+                level_text += " • Supporting turning points: " + "; ".join(
+                    f"{pt['price']:.5f} on {format_signal_time_perth(pt['date'])}"
+                    for pt in p["strength_turning_points"]
+                )
         if p.get("target1") is not None:
             src = p.get("target1_source", "structural")
             level_text += f" • Target 1: {p['target1']:.5f} ({src})"
@@ -6570,10 +6632,10 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9, grp=grp):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
-                found.append(sr_setup)
+                found.append(add_turning_point_gap_strength(closed_candles, sr_setup, interval))
             diagonal_setup = detect_diagonal_gap_retest(closed_candles, sr_conf)
             if diagonal_setup:
-                found.append(diagonal_setup)
+                found.append(add_turning_point_gap_strength(closed_candles, diagonal_setup, interval))
 
     # Avoid duplicate descriptions of the same setup/direction/confirmation.
     unique = {}
@@ -7160,6 +7222,8 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
             if p.get("take_profit") is not None:
                 src = p.get("take_profit_source", "structural")
                 target_lines += f" Take Profit: {p['take_profit']:.5f} ({src})."
+            if p.get("turning_point_strength"):
+                target_lines += " Extra turning-point confirmation: " + p["turning_point_strength"] + "."
             if p.get("diagonal"):
                 push_body = (
                     f"DIAGONAL {zone_word} Gap-Retest on the NEWEST CLOSED {tf_label} candle "
@@ -7318,10 +7382,10 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9, grp=grp):
             sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
-                found.append(sr_setup)
+                found.append(add_turning_point_gap_strength(closed_candles, sr_setup, interval))
             diagonal_setup = detect_diagonal_gap_retest(closed_candles, sr_conf)
             if diagonal_setup:
-                found.append(diagonal_setup)
+                found.append(add_turning_point_gap_strength(closed_candles, diagonal_setup, interval))
 
     unique = {}
     for p in found:
@@ -7985,7 +8049,7 @@ def build_full_alignment(symbol, grp=None):
     if not weekly_err:
         weekly_history = weekly_card_completed_candles(weekly_candles)
         if len(weekly_history) >= 12:
-            weekly_state = weekly_display_structure_trend(weekly_history)
+            weekly_state, _ = weekly_state_with_turning_points(weekly_history, daily_closed)
     if weekly_state is None:
         # A transient weekly-feed failure must not erase a valid weekly state.
         with db_conn() as c:
@@ -8741,6 +8805,120 @@ def weekly_early_two_candle_direction(closed_weekly):
     return None
 
 
+def weekly_turning_point_break(closed_weekly, closed_daily):
+    """Supplemental WEEKLY trend cue from confirmed peaks/troughs, no drawn lines.
+
+    Only a 25%-body breakout by a genuinely CLOSED daily bar qualifies; the
+    Weekly pivots must already be confirmed at the time of that daily bar.
+    Does not modify Gap Retest or the Daily/8H FULL TREND algorithms.
+    """
+    if len(closed_weekly) < 15 or len(closed_daily) < 3:
+        return None
+    from datetime import timedelta
+    weeks = closed_weekly[-52:]
+    daily = closed_daily[-7:]
+    # A recent historical breakout can remain valid while the newest daily
+    # candle stays on the breakout side. Never use an unfinished Daily bar.
+    normal_range = avg_range(weeks, end=len(weeks), length=min(12, len(weeks)))
+    if normal_range <= 0:
+        return None
+    candidates = []
+    for kind, direction in (("high", "Bullish"), ("low", "Bearish")):
+        points = swing_points(weeks, kind, left=2, right=2)
+        # Find the latest pair of genuine turning points with a meaningful
+        # interval and relevant resistance/support slope.
+        for k in range(len(points)-1, 0, -1):
+            j, pj = points[k]
+            i, pi = points[k-1]
+            if j-i < 3 or j-i > 26 or len(weeks)-1-j > 18:
+                continue
+            slope = (float(pj)-float(pi))/(j-i)
+            if direction == 'Bullish' and slope >= -0.015*normal_range:
+                continue  # Bullish breakout needs descending resistance.
+            if direction == 'Bearish' and slope <= 0.015*normal_range:
+                continue  # Bearish breakout needs ascending support.
+            first_t = parse_candle_utc(weeks[i].get('datetime'))
+            second_t = parse_candle_utc(weeks[j].get('datetime'))
+            if first_t is None or second_t is None:
+                continue
+            # Avoid fitting obviously messy lines that cut through many
+            # closed candle bodies between the selected turning points.
+            line_ok = True
+            for n in range(i, min(len(weeks), j+4)):
+                line_at_n = float(pi) + slope*(n-i)
+                close = float(weeks[n]['close'])
+                if direction == 'Bullish' and close > line_at_n + 0.45*normal_range:
+                    line_ok = False
+                    break
+                if direction == 'Bearish' and close < line_at_n - 0.45*normal_range:
+                    line_ok = False
+                    break
+            if not line_ok:
+                continue
+            # Project the weekly trendline to each Daily candle using time,
+            # not the current index (which would leak future information).
+            for prev, curr in zip(daily[:-1], daily[1:]):
+                prev_t = parse_candle_utc(prev.get('datetime'))
+                curr_t = parse_candle_utc(curr.get('datetime'))
+                if not prev_t or not curr_t or curr_t <= second_t + timedelta(days=14):
+                    continue  # Weekly swing requires two completed right weeks.
+                elapsed = (second_t-first_t).total_seconds()
+                if elapsed <= 0:
+                    continue
+                level = float(pi) + (float(pj)-float(pi))*((curr_t-first_t).total_seconds()/elapsed)
+                prior_level = float(pi) + (float(pj)-float(pi))*((prev_t-first_t).total_seconds()/elapsed)
+                op, cl = float(curr['open']), float(curr['close'])
+                body = abs(cl-op)
+                if body <= 0:
+                    continue
+                if direction == 'Bullish':
+                    valid = (cl > op and cl > level and
+                             (cl-max(op, level))/body >= 0.25 and
+                             float(prev['close']) <= prior_level)
+                else:
+                    valid = (cl < op and cl < level and
+                             (min(op, level)-cl)/body >= 0.25 and
+                             float(prev['close']) >= prior_level)
+                if valid:
+                    candidates.append({'direction':direction, 'when':curr_t,
+                        'level':level, 'close':cl,
+                        'touches':((first_t, float(pi)),(second_t, float(pj)))})
+        # Only the most recent validated break is relevant; newer daily
+        # closes can disprove it if the price has moved back through the line.
+    if not candidates:
+        return None
+    winner = max(candidates, key=lambda x:x['when'])
+    last_daily = daily[-1]
+    last_t = parse_candle_utc(last_daily.get('datetime'))
+    (first_t,pi),(second_t,pj)=winner['touches']
+    if last_t is None:
+        return None
+    level_now = pi+(pj-pi)*((last_t-first_t).total_seconds()/(second_t-first_t).total_seconds())
+    last_close=float(last_daily['close'])
+    if winner['direction']=='Bullish' and last_close <= level_now:
+        return None
+    if winner['direction']=='Bearish' and last_close >= level_now:
+        return None
+    return winner
+
+
+def weekly_state_with_turning_points(weekly_history, daily_closed):
+    """Original 2-week signal is primary; confirmed line breakout adds a cue.
+
+    A validated diagonal break can provide an earlier Weekly reference when
+    the two-closed-week reversal has not yet confirmed. Otherwise the original
+    Weekly calculation is kept exactly as it was.
+    """
+    primary = weekly_display_structure_trend(weekly_history)
+    evidence = weekly_turning_point_break(weekly_history, daily_closed)
+    if evidence is None:
+        return primary, None
+    two_week = weekly_early_two_candle_direction(weekly_history)
+    if two_week is not None:
+        return primary, evidence
+    return evidence['direction'], evidence
+
+
 def weekly_display_structure_trend(closed_weekly):
     """Weekly card ONLY: early two-candle reversal, then structural fallback.
 
@@ -8830,6 +9008,22 @@ def build_trend_scan(symbol, grp=None):
     daily_closed = fully_closed_candles(daily_candles, "1day")
     if len(daily_closed) < 12:
         return None, "Not enough completed Daily candle data."
+
+    # Recompute the reference-only Weekly state with the identical two-candle
+    # + turning-point logic used by the Home Screen background scanner.
+    weekly_state, weekly_turn = weekly_state_with_turning_points(weekly_history, daily_closed)
+    _, weekly_css = state_info[weekly_state]
+    results[0]['state'] = weekly_state
+    results[0]['css'] = weekly_css
+    if weekly_turn:
+        results[0]['turning_detail'] = (
+            f"Confirmed {weekly_turn['direction']} diagonal break: "
+            f"Daily close {weekly_turn['close']:.5f} beyond projected "
+            f"Weekly line {weekly_turn['level']:.5f}; "
+            f"turning points "
+            f"{weekly_turn['touches'][0][0].date()} / "
+            f"{weekly_turn['touches'][1][0].date()}"
+        )
 
     eight_candles, error = get_candles(symbol, confirm_tf, outputsize=440 if confirm_tf == "12h" else 660, grp=grp)
     if error:
