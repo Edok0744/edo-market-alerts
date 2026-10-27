@@ -8705,8 +8705,44 @@ def weekly_card_completed_candles(candles, now_utc=None):
     return completed
 
 
+def weekly_early_two_candle_direction(closed_weekly):
+    """Early weekly reversal from TWO genuinely completed directional weeks.
+
+    The caller must first exclude the forming weekly candle. This is deliberately
+    limited to the Weekly reference/status card; it does not alter FULL TREND,
+    Gap Retest, Trend Pullback, or the Weekly/Monthly spike detectors.
+    """
+    if len(closed_weekly) < 6:
+        return None
+    first, second = closed_weekly[-2:]
+    try:
+        a_open, a_close = float(first["open"]), float(first["close"])
+        b_open, b_close = float(second["open"]), float(second["close"])
+        typical = avg_range(closed_weekly, end=len(closed_weekly), length=min(8, len(closed_weekly)))
+    except (TypeError, ValueError, KeyError, ZeroDivisionError):
+        return None
+    if typical <= 0:
+        return None
+    # Ignore two tiny dojis or a choppy pair that makes almost no progress.
+    min_each_body = 0.12 * typical
+    min_total_progress = 0.40 * typical
+    if (a_close > a_open and b_close > b_open
+            and a_close - a_open >= min_each_body
+            and b_close - b_open >= min_each_body
+            and b_close > a_close
+            and b_close - a_open >= min_total_progress):
+        return "Bullish"
+    if (a_close < a_open and b_close < b_open
+            and a_open - a_close >= min_each_body
+            and b_open - b_close >= min_each_body
+            and b_close < a_close
+            and a_open - b_close >= min_total_progress):
+        return "Bearish"
+    return None
+
+
 def weekly_display_structure_trend(closed_weekly):
-    """Weekly card ONLY: closed-week structural breaks override stale swing labels.
+    """Weekly card ONLY: early two-candle reversal, then structural fallback.
 
     No other trend or trading-signal function uses this calculation. A current
     forming weekly candle is filtered out by weekly_card_completed_candles().
@@ -8715,6 +8751,11 @@ def weekly_display_structure_trend(closed_weekly):
         return "Mixed"
 
     history = closed_weekly[-36:]
+    # Two consecutive, meaningful fully closed Weekly candles are an EARLY
+    # direction cue; a minor reversal need not wait for major swing breaks.
+    early_direction = weekly_early_two_candle_direction(history)
+    if early_direction is not None:
+        return early_direction
     last_close = float(history[-1]["close"])
     # Pivot points require two *subsequent fully closed* weeks to confirm.
     # Do not allow the newest week's own high/low to become a prior pivot.
