@@ -392,6 +392,8 @@ h2{font-size:18px}
 .saved-fulltrend:focus-visible{outline:2px solid #ffffff;outline-offset:3px}
 .saved-fulltrend.bull{background:#153d32;color:#45e0a8}
 .saved-fulltrend.bear{background:#4a2028;color:#ff7488}
+.saved-fulltrend.trend-mixed-status{background:#45380f;color:#f2c94c}
+.saved-fulltrend.trend-unconfirmed-status{background:#273341;color:#c5d0da}
 .saved-mixed-warning{display:inline-block;margin-left:6px;font-size:20px;vertical-align:middle;cursor:help}
 
 .alerttrend{
@@ -438,6 +440,8 @@ h2{font-size:18px}
 }
 .fullbull{color:#35e28a}
 .fullbear{color:#ff6b7d}
+.fullmixed{color:#f2c94c}
+.fullunconfirmed{color:#c5d0da}
 .news-card{
     border:1px solid #294761;
 }
@@ -725,8 +729,10 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <a class="saved-fulltrend bull" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bullish trend" title="Open Trend page">🟢 ▲{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
 {% elif saved_ts == 'FULL BEARISH' %}
 <a class="saved-fulltrend bear" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bearish trend" title="Open Trend page">🔴 ▼{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
-{% elif saved_ts.endswith('— MIXED') or saved_ts.endswith('— UNCONFIRMED') %}
-<a class="saved-fulltrend" href="/trend/{{f['id']}}" title="Open Trend page">⚠️ {{saved_ts}}</a>
+{% elif saved_ts.endswith('— MIXED') %}
+<a class="saved-fulltrend trend-mixed-status" href="/trend/{{f['id']}}" title="Weekly and Daily disagree — Open Trend page">⚠️ {{saved_ts}}</a>
+{% elif saved_ts.endswith('— UNCONFIRMED') %}
+<a class="saved-fulltrend trend-unconfirmed-status" href="/trend/{{f['id']}}" title="Weekly direction unconfirmed — Open Trend page">{{saved_ts}}</a>
 {% endif %}
 {% if saved_mixed and not saved_ts.endswith('— MIXED') %}
 <span class="saved-mixed-warning" role="img" aria-label="Mixed trend: Daily {{ saved_daily }}, Weekly {{ saved_weekly }}" title="⚠️ Mixed trend — Daily: {{ saved_daily }}; Weekly: {{ saved_weekly }}">⚠️</span>
@@ -853,8 +859,10 @@ Target {{m['direction']}} {{m['target']}}
 <div class="fulltrend fullbull">🟢 FULL BULLISH</div>
 {% elif m['triggered'] and ts == 'FULL BEARISH' %}
 <div class="fulltrend fullbear">🔴 FULL BEARISH</div>
-{% elif m['triggered'] and ts and (ts.endswith('— MIXED') or ts.endswith('— UNCONFIRMED')) %}
-<div class="fulltrend">⚠️ {{ts}}</div>
+{% elif m['triggered'] and ts and ts.endswith('— MIXED') %}
+<div class="fulltrend fullmixed">⚠️ {{ts}}</div>
+{% elif m['triggered'] and ts and ts.endswith('— UNCONFIRMED') %}
+<div class="fulltrend fullunconfirmed">{{ts}}</div>
 {% endif %}
 
 <div>
@@ -1248,6 +1256,7 @@ a{text-decoration:none}
 .bull{color:#35e28a}
 .bear{color:#ff6b7d}
 .mixed{color:#f2c94c}
+.unconfirmed{color:#c5d0da}
 .summary{font-size:23px;font-weight:900;margin-top:16px}
 .since{margin-top:7px;font-size:13px;color:#a9bfd2;font-weight:700}
 .error{color:#ff8a96;font-weight:700}
@@ -9124,6 +9133,13 @@ def build_trend_scan(symbol, grp=None):
         summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
         detail = f"No fully closed {confirm_label} candle has confirmed a break of a meaningful Daily swing mid-wick level yet."
         score = 0
+
+    # Use the final Weekly/Daily agreement, not the underlying Daily direction,
+    # when colouring the Trend-page headline.
+    if aligned_status.endswith("— MIXED"):
+        icon, css = "⚠️", "mixed"
+    elif aligned_status.endswith("— UNCONFIRMED"):
+        icon, css = "", "unconfirmed"
 
     if status in ("FULL BULLISH", "FULL BEARISH") and aligned_status != status:
         if weekly_state in ("Bullish", "Bearish"):
