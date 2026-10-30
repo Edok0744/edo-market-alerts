@@ -5171,6 +5171,19 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
             candles[j].get("datetime", "")
             for j in range(run_start, i)
         ],
+        # Keep the exact raw feed evidence for chart-to-scanner audits.
+        "run_candle_details": [
+            {
+                "datetime": candles[j].get("datetime", ""),
+                "open": float(candles[j]["open"]),
+                "close": float(candles[j]["close"]),
+                "colour": candle_colour(candles[j]),
+            }
+            for j in range(run_start, i)
+        ],
+        "confirmation_feed_date": candles[i].get("datetime", ""),
+        "confirmation_feed_open": float(candles[i]["open"]),
+        "feed_source": candles[i].get("_source_label", "Market OHLC"),
         "trend": trend,
         "required_trend": required_trend,
         "normal_local_trend_ok": trend == required_trend,
@@ -5665,13 +5678,24 @@ def describe_setup(p, interval=None):
         detail = f"{zone_word} retest • {p.get('touches', 2)} touches • {str(p.get('trend', 'mixed')).upper()} trend"
         level_text = f"{zone_word}: {p['level']:.5f} • Close: {p['confirmation_close']:.5f}"
     elif p["name"] == "TREND PULLBACK SETUP":
-        detail = f"{p['run_count']} {p['run_colour']} pullback candles • Confirmed close"
+        evidence = p.get("run_candle_details") or []
+        # A count is only as reliable as the broker candles behind it: show
+        # the exact source dates so chart/session mismatches can be diagnosed.
+        run_count = len(evidence) if evidence else len(p.get("run_dates") or []) or p['run_count']
+        detail = f"{run_count} {p['run_colour']} pullback candles • Confirmed close"
         if p.get("higher_tf_filter"):
             htf = p.get("higher_tf_states", {})
             detail += f" • D1: {htf.get('1D','?')} • W1: {htf.get('1W','?')}"
             if p.get('higher_tf_warning'):
                 detail += f" • {p['higher_tf_warning']}"
         level_text = f"Close: {p['confirmation_close']:.5f}"
+        if evidence:
+            # Exact broker timestamps, not assumed calendar trading days.
+            audit = " • ".join(
+                f"{c['datetime']} ({c['open']:.5f}→{c['close']:.5f})"
+                for c in evidence
+            )
+            level_text += f" • Pullback candles [{p.get('feed_source','OHLC')}]: {audit}"
     else:
         detail = f"Range reversal • {p['run_count']} candles • {p['penetration']:.0f}% confirmation"
         level_text = f"Close: {p['confirmation_close']:.5f}"
