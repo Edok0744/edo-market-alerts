@@ -725,8 +725,10 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <a class="saved-fulltrend bull" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bullish trend" title="Open Trend page">🟢 ▲{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
 {% elif saved_ts == 'FULL BEARISH' %}
 <a class="saved-fulltrend bear" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bearish trend" title="Open Trend page">🔴 ▼{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
+{% elif saved_ts.endswith('— MIXED') or saved_ts.endswith('— UNCONFIRMED') %}
+<a class="saved-fulltrend" href="/trend/{{f['id']}}" title="Open Trend page">⚠️ {{saved_ts}}</a>
 {% endif %}
-{% if saved_mixed %}
+{% if saved_mixed and not saved_ts.endswith('— MIXED') %}
 <span class="saved-mixed-warning" role="img" aria-label="Mixed trend: Daily {{ saved_daily }}, Weekly {{ saved_weekly }}" title="⚠️ Mixed trend — Daily: {{ saved_daily }}; Weekly: {{ saved_weekly }}">⚠️</span>
 {% endif %}
 </div>
@@ -851,6 +853,8 @@ Target {{m['direction']}} {{m['target']}}
 <div class="fulltrend fullbull">🟢 FULL BULLISH</div>
 {% elif m['triggered'] and ts == 'FULL BEARISH' %}
 <div class="fulltrend fullbear">🔴 FULL BEARISH</div>
+{% elif m['triggered'] and ts and (ts.endswith('— MIXED') or ts.endswith('— UNCONFIRMED')) %}
+<div class="fulltrend">⚠️ {{ts}}</div>
 {% endif %}
 
 <div>
@@ -1289,7 +1293,7 @@ a{text-decoration:none}
         {% endif %}
 
         <div class="small" style="margin-top:12px">
-            Daily swing highs/lows define the 50% midpoint of the relevant swing wick. FULL BULLISH is confirmed by a fully closed confirmation candle above the previous Daily swing-high mid-wick line; FULL BEARISH by a fully closed confirmation candle below the previous Daily swing-low mid-wick line. Crypto uses 12H confirmation; FXCM Forex and CFDs use 8H. At least 25% of the fully closed confirmation candle body must finish beyond that level; wicks do not count. If the first breakout close is too shallow, the next closed candle can confirm. The main trend persists until an opposite confirmed close beyond the Daily structure level. Weekly is shown for reference only and does not affect the Full Trend status. It is an analysis aid, not a guarantee of future price movement.
+            Daily swing highs/lows define the 50% midpoint of the relevant swing wick. FULL BULLISH is confirmed by a fully closed confirmation candle above the previous Daily swing-high mid-wick line; FULL BEARISH by a fully closed confirmation candle below the previous Daily swing-low mid-wick line. Crypto uses 12H confirmation; FXCM Forex and CFDs use 8H. At least 25% of the fully closed confirmation candle body must finish beyond that level; wicks do not count. If the first breakout close is too shallow, the next closed candle can confirm. The main trend persists until an opposite confirmed close beyond the Daily structure level. FULL appears only when Weekly agrees with the confirmed Daily direction. When they disagree, the status is BULLISH/BEARISH — MIXED; an unclear Weekly is UNCONFIRMED. It is an analysis aid, not a guarantee of future price movement.
         </div>
     {% endif %}
     </div>
@@ -3054,6 +3058,7 @@ def bybit_interval(interval):
         "12h": "720",
         "1day": "D",
         "1week": "W",
+        "1month": "M",
     }.get(interval)
 
 
@@ -3166,15 +3171,19 @@ PATTERN_TIMEFRAMES = [
     {"label": "12H", "value": "12h"},
     {"label": "1D", "value": "1day"},
     {"label": "1W", "value": "1week"},
+    {"label": "1M", "value": "1month"},
 ]
 
 # Edo's exact signal timeframes.
 NORMAL_PULLBACK_INTERVALS = {"4h", "8h", "1day", "1week"}
 
 def pullback_interval_enabled(grp, interval):
-    """Crypto substitutes 12H for 8H; Forex/CFD retain 8H."""
-    if str(grp or "").upper() == "CRYPTO":
-        return interval in {"4h", "12h", "1day", "1week"}
+    """Crypto uses 12H instead of 8H; Monthly pullbacks are Forex/Crypto only."""
+    market = str(grp or "").upper()
+    if market == "CRYPTO":
+        return interval in {"4h", "12h", "1day", "1week", "1month"}
+    if market == "FOREX":
+        return interval in NORMAL_PULLBACK_INTERVALS | {"1month"}
     return interval in NORMAL_PULLBACK_INTERVALS
 SR_GAP_RETEST_INTERVALS = {"8h", "1day", "1week"}
 
@@ -3534,6 +3543,8 @@ def fully_closed_candles(candles, interval, now_utc=None):
     """
     from datetime import timezone, timedelta
 
+    if interval == "1month":
+        return fully_closed_monthly_candles(candles, now_utc=now_utc)
     seconds = interval_seconds(interval)
     if not candles or not seconds:
         return []
@@ -6552,6 +6563,8 @@ def attach_pattern_push_history(symbol, interval, patterns):
 
 
 def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
+    if interval == "1month" and str(grp).upper() not in {"FOREX", "CRYPTO"}:
+        return None, "Monthly Trend Pullback is supported for Forex and Crypto only."
     cache_key = f"{grp}|{symbol}|{interval}"
     now = time.time()
     cached = PATTERN_SIGNAL_CACHE.get(cache_key)
@@ -6583,7 +6596,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             if rr:
                 found.append(rr)
 
-    # A) NORMAL Edo Trend Pullback — 4H, 8H, Daily and Weekly.
+    # A) NORMAL Edo Trend Pullback — 4H, 8H/12H, Daily, Weekly, Forex/Crypto Monthly.
     #    Minimum 2 same-colour fully CLOSED pullback candles,
     #    then an opposite-colour fully CLOSED confirmation.
     #    NO 50% rule applies to this signal.
@@ -6662,6 +6675,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             p for p in found
             if p.get("name") in ("TREND PULLBACK SETUP", "S/R GAP RETEST SETUP")
         ]
+    elif interval == "1month":
+        found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
     else:
         found = []
 
@@ -6976,6 +6991,8 @@ def pattern_candle_close_utc(candle_start, interval):
         start = parse_candle_utc(candle_start)
         if start is None:
             return None
+        if interval == "1month":
+            return monthly_candle_close_utc({"datetime": candle_start})
         seconds = interval_seconds(interval)
         if not seconds:
             return None
@@ -7301,6 +7318,8 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
+    if interval == "1month" and str(grp).upper() not in {"FOREX", "CRYPTO"}:
+        return None, None, "Monthly Trend Pullback is supported for Forex and Crypto only."
     """
     Collect Edo's trading setups from fully closed candles only: normal Trend Pullback (4H trend-filtered; 8H/Daily/Weekly near S/R, no 50%) and S/R Gap-Retest (8H/Daily/Weekly, 50% rules).
 
@@ -7343,7 +7362,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             if rr:
                 found.append(rr)
 
-    # A) NORMAL Trend Pullback — 4H, 8H, Daily and Weekly, NO 50% rule.
+    # A) NORMAL Trend Pullback — through Monthly for Forex/Crypto, NO 50% rule.
     #    4H is the entry/re-entry signal: higher-timeframe trend alignment is
     #    required, but S/R proximity is NOT a mandatory blocker.
     #    Daily / Weekly must still be at/near meaningful S/R.
@@ -7592,6 +7611,7 @@ def pattern_signal_monitor():
         "12h": 20 * 60,
         "1day": 60 * 60,
         "1week": 6 * 60 * 60,
+        "1month": 12 * 60 * 60,
     }
 
     last_checked = {}
@@ -7623,6 +7643,8 @@ def pattern_signal_monitor():
                     if interval == "12h" and grp != "CRYPTO":
                         continue
                     if interval == "8h" and grp == "CRYPTO":
+                        continue
+                    if interval == "1month" and grp not in {"FOREX", "CRYPTO"}:
                         continue
                     key = (grp, symbol, interval)
                     previous = last_checked.get(key, 0.0)
@@ -8014,8 +8036,26 @@ def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_
     return state, event
 
 
+def aligned_full_trend_status(daily_break_status, weekly_state):
+    """Use FULL only when Weekly and confirmed Daily/8H (Crypto 12H) agree.
+
+    Preserve the independent daily breakout state; the weekly filter changes
+    the displayed classification, not the breakout detector itself.
+    """
+    daily = ("Bullish" if daily_break_status == "FULL BULLISH" else
+             "Bearish" if daily_break_status == "FULL BEARISH" else "Mixed")
+    weekly = str(weekly_state or "").strip().capitalize()
+    if daily == "Mixed":
+        return "MIXED / WAIT"
+    if weekly not in ("Bullish", "Bearish"):
+        return f"{daily.upper()} — UNCONFIRMED"
+    if weekly == daily:
+        return f"FULL {daily.upper()}"
+    return f"{daily.upper()} — MIXED"
+
+
 def build_full_alignment(symbol, grp=None):
-    """FULL TREND ONLY: Daily swing levels confirmed by fully closed 8H candles."""
+    """Daily swing breakout plus Weekly alignment for displayed trend status."""
     confirm_tf = "12h" if grp == "CRYPTO" else "8h"
     clear_ohlc_cache_for_symbol(symbol, grp, intervals={"1day", confirm_tf})
     daily, err = get_candles(symbol, "1day", outputsize=220, grp=grp)
@@ -8054,7 +8094,7 @@ def build_full_alignment(symbol, grp=None):
         weekly_state = (prior["weekly"] or "") if prior else ""
     daily_state = "Bullish" if status == "FULL BULLISH" else "Bearish" if status == "FULL BEARISH" else "Mixed"
     save_trend_snapshot(symbol, {"Weekly": weekly_state, "Daily": daily_state})
-    return status, None
+    return aligned_full_trend_status(status, weekly_state), None
 
 
 def save_trend_status(symbol, status):
@@ -8979,8 +9019,8 @@ def build_trend_scan(symbol, grp=None):
         "Mixed": ("🟡", "mixed"),
     }
 
-    # Weekly remains reference-only; Daily structure is now the sole authority
-    # for FULL BULLISH / FULL BEARISH across Forex, CFD and Crypto.
+    # Weekly agreement is required for the FULL label, but Daily/8H (Crypto
+    # 12H) keeps its own independent swing-break detection.
     weekly_candles, error = get_candles(symbol, "1week", outputsize=52, grp=grp)
     if error:
         return None, error
@@ -9065,15 +9105,16 @@ def build_trend_scan(symbol, grp=None):
         if event_start:
             event_time = (event_start + timedelta(hours=12 if confirm_tf == "12h" else 8)).astimezone(ZoneInfo("Australia/Perth")).strftime("%d %b %Y %H:%M Perth")
 
+    aligned_status = aligned_full_trend_status(status, weekly_state)
     if status == "FULL BULLISH":
-        summary, icon, css = "FULL BULLISH", "🟢", "bull"
+        summary, icon, css = aligned_status, "🟢", "bull"
         if event:
             detail = f"Main trend is bullish: at least 25% of a fully closed {confirm_label} candle body broke above the Daily swing-high mid-wick level at {event['level']:.5f} on {event_time}. It stays bullish until an opposite {confirm_label} close below the Daily swing-low mid-wick level is confirmed."
         else:
             detail = f"Main trend remains bullish from the latest {confirm_label} close above a Daily swing-high mid-wick level. It stays bullish until an opposite {confirm_label} close below the Daily swing-low mid-wick level is confirmed."
         score = 1
     elif status == "FULL BEARISH":
-        summary, icon, css = "FULL BEARISH", "🔴", "bear"
+        summary, icon, css = aligned_status, "🔴", "bear"
         if event:
             detail = f"Main trend is bearish: at least 25% of a fully closed {confirm_label} candle body broke below the Daily swing-low mid-wick level at {event['level']:.5f} on {event_time}. It stays bearish until an opposite {confirm_label} close above the Daily swing-high mid-wick level is confirmed."
         else:
@@ -9084,6 +9125,13 @@ def build_trend_scan(symbol, grp=None):
         detail = f"No fully closed {confirm_label} candle has confirmed a break of a meaningful Daily swing mid-wick level yet."
         score = 0
 
+    if status in ("FULL BULLISH", "FULL BEARISH") and aligned_status != status:
+        if weekly_state in ("Bullish", "Bearish"):
+            detail += (f" Weekly is {weekly_state}; Daily is {daily_state}. "
+                       "FULL is withheld until both directions agree. ⚠️")
+        else:
+            detail += (" Weekly direction is unconfirmed; FULL is withheld until "
+                       "a confirmed Weekly direction agrees with Daily.")
     if trigger_level_note:
         detail += " Current selected trigger lines: " + " • ".join(trigger_level_note) + "."
 
@@ -9212,8 +9260,10 @@ def monitor():
                                 trend_line = "Trend now: 🔴 FULL BEARISH"
                             elif trend_error:
                                 trend_line = "Trend now: refresh temporarily unavailable"
+                            elif fresh_status:
+                                trend_line = f"Trend now: ⚠️ {fresh_status}"
                             else:
-                                trend_line = "Trend now: 🟡 MIXED"
+                                trend_line = "Trend now: 🟡 MIXED / WAIT"
 
                             send_push(
                                 f"🚨 {a['symbol']} PRICE ALERT",
@@ -9221,7 +9271,7 @@ def monitor():
                                 f"Target: {a['direction']} {a['target']}\n"
                                 f"{trend_line}\n"
                                 f"12H + 8H + 6H use CLOSED candles only.\n"
-                                f"Weekly is reference only.\n"
+                                f"FULL requires matching Weekly and Daily directions.\n"
                                 f"Note: {a['note'] or '-'}"
                             )
 
@@ -9602,11 +9652,12 @@ def signal(i):
 
     # Edo UI rule: Crypto no longer exposes the 8H manual signal timeframe.
     # This is display/navigation only; no other market group's timeframes change.
-    signal_timeframes = (
-        [x for x in PATTERN_TIMEFRAMES if x["value"] != "8h"]
-        if f['grp'] == 'CRYPTO'
-        else PATTERN_TIMEFRAMES
-    )
+    signal_timeframes = [
+        x for x in PATTERN_TIMEFRAMES
+        if not (f['grp'] == 'CRYPTO' and x['value'] == '8h')
+        and not (f['grp'] == 'CFD' and x['value'] == '1month')
+        and not (f['grp'] != 'CRYPTO' and x['value'] == '12h')
+    ]
     allowed = {x["value"]: x["label"] for x in signal_timeframes}
     unread_on_entry = unread_timeframes(f['grp'], f['symbol'])
     default_tf = next((x["value"] for x in signal_timeframes if x["value"] in unread_on_entry), "4h" if f['grp'] == 'CRYPTO' else "8h")
@@ -9725,7 +9776,7 @@ def trend(i):
     # loop gets to this market, record it here as well (without sending a push).
     full_trend_since = ''
     if not error:
-        current_full = scan['summary'] if scan['summary'] in ('FULL BULLISH', 'FULL BEARISH') else ''
+        current_full = scan['summary']  # FULL, MIXED, UNCONFIRMED or WAIT
         with db_conn() as c:
             row = c.execute(
                 'SELECT status, updated FROM trend_status WHERE symbol=?',
