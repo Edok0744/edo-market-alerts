@@ -8061,11 +8061,15 @@ def daily_structure_break_state(daily_candles, eight_hour_candles, confirmation_
         # If a small Daily pivot is confirmed after an earlier shallow crossing,
         # allow the NEXT qualifying closed candle to establish the missing state.
         # Do not demand a second crossing of the same level.
+        # Never flip merely because price remains beyond an OLD pivot level.
+        # Demand an actual crossing, immediate follow-up to a shallow break,
+        # or the first closed confirmation candle after pivot eligibility.
+        # Shared by Forex/CFD 8H and Crypto 12H trend identification.
         bullish_cross = (high_mid is not None and previous_close is not None
-                         and (previous_close <= high_mid or prior_bull_weak or high_first_eligible or state != "FULL BULLISH")
+                         and (previous_close <= high_mid or prior_bull_weak or high_first_eligible)
                          and bullish_pct >= FULL_TREND_MIN_BODY_BREAK_PCT)
         bearish_cross = (low_mid is not None and previous_close is not None
-                         and (previous_close >= low_mid or prior_bear_weak or low_first_eligible or state != "FULL BEARISH")
+                         and (previous_close >= low_mid or prior_bear_weak or low_first_eligible)
                          and bearish_pct >= FULL_TREND_MIN_BODY_BREAK_PCT)
         if audit and (bullish_cross or bearish_cross):
             audit_rows.append((str(start), "BULLISH" if bullish_cross else "BEARISH",
