@@ -3265,6 +3265,25 @@ def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
             })
 
         candles.sort(key=lambda x: x["datetime"])
+        # The FXCM helper has occasionally supplied a synthetic D1 candle
+        # stamped on Saturday evening UTC (e.g. GBP/USD 2026-10-24 21:00Z).
+        # Spot FX is closed then. Treating that row as an independent Daily
+        # candle inflated Edo's consecutive red/green pullback counts.
+        # Preserve the raw provider bars on all intraday timeframes; this
+        # guard applies ONLY to Forex D1, not to crypto or index CFDs.
+        if tf == "D1" and str(symbol).strip().upper() not in {
+            "SPX500", "US30", "NAS100", "GER30", "UK100", "FRA40",
+            "JPN225", "AUS200", "HK33", "US2000"
+        }:
+            kept = []
+            for candle in candles:
+                session_time = parse_candle_utc(candle.get("datetime"))
+                if session_time is not None and session_time.weekday() == 5:
+                    print("FXCM D1 closed-market Saturday bar excluded:",
+                          symbol, candle.get("datetime"))
+                    continue
+                kept.append(candle)
+            candles = kept
         if not candles:
             return None, "FXCM service returned no candles."
 
@@ -5171,19 +5190,6 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
             candles[j].get("datetime", "")
             for j in range(run_start, i)
         ],
-        # Keep the exact raw feed evidence for chart-to-scanner audits.
-        "run_candle_details": [
-            {
-                "datetime": candles[j].get("datetime", ""),
-                "open": float(candles[j]["open"]),
-                "close": float(candles[j]["close"]),
-                "colour": candle_colour(candles[j]),
-            }
-            for j in range(run_start, i)
-        ],
-        "confirmation_feed_date": candles[i].get("datetime", ""),
-        "confirmation_feed_open": float(candles[i]["open"]),
-        "feed_source": candles[i].get("_source_label", "Market OHLC"),
         "trend": trend,
         "required_trend": required_trend,
         "normal_local_trend_ok": trend == required_trend,
@@ -5678,24 +5684,13 @@ def describe_setup(p, interval=None):
         detail = f"{zone_word} retest • {p.get('touches', 2)} touches • {str(p.get('trend', 'mixed')).upper()} trend"
         level_text = f"{zone_word}: {p['level']:.5f} • Close: {p['confirmation_close']:.5f}"
     elif p["name"] == "TREND PULLBACK SETUP":
-        evidence = p.get("run_candle_details") or []
-        # A count is only as reliable as the broker candles behind it: show
-        # the exact source dates so chart/session mismatches can be diagnosed.
-        run_count = len(evidence) if evidence else len(p.get("run_dates") or []) or p['run_count']
-        detail = f"{run_count} {p['run_colour']} pullback candles • Confirmed close"
+        detail = f"{p['run_count']} {p['run_colour']} pullback candles • Confirmed close"
         if p.get("higher_tf_filter"):
             htf = p.get("higher_tf_states", {})
             detail += f" • D1: {htf.get('1D','?')} • W1: {htf.get('1W','?')}"
             if p.get('higher_tf_warning'):
                 detail += f" • {p['higher_tf_warning']}"
         level_text = f"Close: {p['confirmation_close']:.5f}"
-        if evidence:
-            # Exact broker timestamps, not assumed calendar trading days.
-            audit = " • ".join(
-                f"{c['datetime']} ({c['open']:.5f}→{c['close']:.5f})"
-                for c in evidence
-            )
-            level_text += f" • Pullback candles [{p.get('feed_source','OHLC')}]: {audit}"
     else:
         detail = f"Range reversal • {p['run_count']} candles • {p['penetration']:.0f}% confirmation"
         level_text = f"Close: {p['confirmation_close']:.5f}"
@@ -9101,13 +9096,22 @@ def build_trend_scan(symbol, grp=None):
         detail = f"Awaiting confirmed {confirm_label} breakout"
         score = 0
 
+    # Use the final Weekly/Daily agreement, not the underlying Daily direction,
+    # when colouring the Trend-page headline.
     if aligned_status.endswith("— MIXED"):
         icon, css = "⚠️", "mixed"
     elif aligned_status.endswith("— UNCONFIRMED"):
         icon, css = "", "unconfirmed"
+
+    if status in ("FULL BULLISH", "FULL BEARISH") and aligned_status != status:
+        if weekly_state in ("Bullish", "Bearish"):
+            detail += (f" Weekly is {weekly_state}; Daily is {daily_state}. "
+                       "FULL is withheld until both directions agree. ⚠️")
+        else:
+            detail += (" Weekly direction is unconfirmed; FULL is withheld until "
+                       "a confirmed Weekly direction agrees with Daily.")
     if trigger_level_note:
-        # Important levels remain visible even when the tutorial text is removed.
-        detail += " • " + " • ".join(trigger_level_note)
+        detail += " Current selected trigger lines: " + " • ".join(trigger_level_note) + "."
 
     return {
         "results": results, "summary": summary, "summary_icon": icon,
