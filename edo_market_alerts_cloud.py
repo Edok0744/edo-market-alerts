@@ -240,6 +240,53 @@ _HOME_PAGE_CACHE = {
 }
 _HOME_PAGE_CACHE_LOCK = threading.Lock()
 
+# Refresh the saved-pair trend badges when HOME opens, not only when a Trend
+# detail page is viewed. Work runs off-request to keep the iPhone UI responsive.
+_EDO_OPEN_TREND_LOCK = threading.Lock()
+_EDO_OPEN_TREND_STATE = {"running": False, "started": 0.0, "completed": 0.0, "revision": 0}
+_EDO_OPEN_TREND_COOLDOWN = 180  # Avoid repeated broker/API downloads on every page refresh.
+
+def edo_home_trend_refresh_worker():
+    try:
+        with db_conn() as c:
+            pairs = c.execute("SELECT DISTINCT symbol, grp FROM favorites ORDER BY symbol").fetchall()
+        for pair in pairs:
+            symbol, grp = pair['symbol'], pair['grp']
+            # A temporary feed error must not overwrite the last known state.
+            if str(grp).upper() == 'FOREX' and forex_weekend_closed():
+                continue
+            try:
+                status, error = build_full_alignment(symbol, grp)
+                if not error and status:
+                    save_trend_status(symbol, status)
+                elif error:
+                    print('home-open trend refresh:', symbol, error, flush=True)
+            except Exception as exc:
+                print('home-open trend refresh failed:', symbol, exc, flush=True)
+    except Exception as exc:
+        print('home-open trend refresh worker:', exc, flush=True)
+    finally:
+        with _EDO_OPEN_TREND_LOCK:
+            _EDO_OPEN_TREND_STATE['running'] = False
+            _EDO_OPEN_TREND_STATE['completed'] = time.time()
+            _EDO_OPEN_TREND_STATE['revision'] += 1
+
+def edo_start_home_trend_refresh():
+    with _EDO_OPEN_TREND_LOCK:
+        now = time.time()
+        if _EDO_OPEN_TREND_STATE['running']:
+            return
+        if now - _EDO_OPEN_TREND_STATE['started'] < _EDO_OPEN_TREND_COOLDOWN:
+            return
+        _EDO_OPEN_TREND_STATE['running'] = True
+        _EDO_OPEN_TREND_STATE['started'] = now
+    threading.Thread(target=edo_home_trend_refresh_worker, daemon=True).start()
+
+@APP.get('/home-trend-refresh-status')
+def edo_home_trend_refresh_status():
+    with _EDO_OPEN_TREND_LOCK:
+        return jsonify(dict(_EDO_OPEN_TREND_STATE))
+
 
 COLORS = {
     'FOREX': '#2980ff',
@@ -1111,6 +1158,39 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
             edoFreshHome(true);
         }
     });
+
+    // The home request starts a background refresh of ALL saved-pair trends.
+    // Once completed, update the home list so no pair needs to be opened
+    // individually. Never interrupt Edo while editing a form.
+    let edoTrendRevisionAtOpen = null;
+    let edoTrendRefreshSeenRunning = false;
+    async function edoCheckTrendRefresh() {
+        if (document.visibilityState !== 'visible') return;
+        try {
+            const r = await fetch('/home-trend-refresh-status?_=' + Date.now(), {cache:'no-store'});
+            if (!r.ok) return;
+            const d = await r.json();
+            if (edoTrendRevisionAtOpen === null) {
+                edoTrendRevisionAtOpen = d.revision;
+                // If scan already completed between page load and first poll,
+                // a fresh HOME request reads the newest database values.
+                if (!d.running && d.completed && (Date.now()/1000 - d.completed < 15) &&
+                    !sessionStorage.getItem('edoTrendRefreshRevision' + d.revision)) {
+                    sessionStorage.setItem('edoTrendRefreshRevision' + d.revision, '1');
+                    edoFreshHome(true);
+                }
+            }
+            if (d.running) edoTrendRefreshSeenRunning = true;
+            if (!d.running && (edoTrendRefreshSeenRunning || d.revision > edoTrendRevisionAtOpen)) {
+                edoTrendRefreshSeenRunning = false;
+                edoTrendRevisionAtOpen = d.revision;
+                sessionStorage.setItem('edoTrendRefreshRevision' + d.revision, '1');
+                edoFreshHome(true);
+            }
+        } catch (_) { /* normal offline/browser resume; retry next poll */ }
+    }
+    edoCheckTrendRefresh();
+    setInterval(edoCheckTrendRefresh, 5000);
 
     // While HOME stays open, refresh the cached dashboard once per minute.
     setInterval(function () { edoFreshHome(false); }, 60000);
@@ -9321,6 +9401,7 @@ def edo_no_cache_dynamic_pages(response):
 
 @APP.route('/')
 def home():
+    edo_start_home_trend_refresh()
     """
     Fast home screen:
     - database/cache only
