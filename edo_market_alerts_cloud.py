@@ -1268,7 +1268,7 @@ a{text-decoration:none}
 <body>
 <div class="wrap">
     <h1>📊 {{ symbol }} TREND</h1>
-    <div class="small">{{ grp }} • Multi-timeframe trend scan</div>
+    <div class="small">{{ grp }} • Weekly + Daily trend</div>
 
     <div class="card">
     {% if error %}
@@ -1294,16 +1294,12 @@ a{text-decoration:none}
         </div>
 
         {% if full_trend_since and summary in ('FULL BULLISH', 'FULL BEARISH') %}
-        <div class="since">{{ summary }} latest structural confirmation: {{ full_trend_since }}</div>
+        <div class="since">Confirmed: {{ full_trend_since }}</div>
         {% endif %}
 
         {% if detail %}
-        <div class="small" style="margin-top:8px">{{ detail }}</div>
+        <div class="small" style="margin-top:9px;line-height:1.5">{{ detail }}</div>
         {% endif %}
-
-        <div class="small" style="margin-top:12px">
-            Daily swing highs/lows define the 50% midpoint of the relevant swing wick. FULL BULLISH is confirmed by a fully closed confirmation candle above the previous Daily swing-high mid-wick line; FULL BEARISH by a fully closed confirmation candle below the previous Daily swing-low mid-wick line. Crypto uses 12H confirmation; FXCM Forex and CFDs use 8H. At least 25% of the fully closed confirmation candle body must finish beyond that level; wicks do not count. If the first breakout close is too shallow, the next closed candle can confirm. The main trend persists until an opposite confirmed close beyond the Daily structure level. FULL appears only when Weekly agrees with the confirmed Daily direction. When they disagree, the status is BULLISH/BEARISH — MIXED; an unclear Weekly is UNCONFIRMED. It is an analysis aid, not a guarantee of future price movement.
-        </div>
     {% endif %}
     </div>
 
@@ -1432,7 +1428,7 @@ a{text-decoration:none}
 <body>
 <div class="wrap">
     <h1>📊 {{ symbol }} PRICE ACTION</h1>
-    <div class="small">{{ group }} • Price Action status • Trend Pullback: 4H / 8H / 1D • consecutive adjacent 2+ candles • clean retracement required • S/R Gap-Retest: {% if group == 'CRYPTO' %}12H / 1D / 1W{% else %}8H / 1D / 1W{% endif %} • Closed candles only • Manual trade decision</div>
+    <div class="small">{{ group }} • Closed-candle signals</div>
 
     <style>
       .tf-new{display:block;color:#5dff9a;font-size:10px;font-weight:900;animation:tf-new-blink 1s step-end infinite}
@@ -1455,7 +1451,7 @@ a{text-decoration:none}
     {% else %}
         <div class="pricebox">
             <div>
-                <div class="small">Latest FULLY CLOSED candle</div>
+                <div class="small">Latest closed candle</div>
                 <div class="pricebig">{{ price }}</div>
                 <div class="small">{{ latest_closed_perth }}</div>
                 {% if market_source %}
@@ -1487,9 +1483,9 @@ a{text-decoration:none}
             <div class="pattern newest-pattern">
                 <div class="newest-badge">
                     {% if newest.get('confirmation_date') == latest_closed_date %}
-                        NEWEST CLOSED-CANDLE TRIGGER
+                        NEW TRIGGER
                     {% else %}
-                        MOST RECENT HISTORICAL TRIGGER
+                        HISTORICAL
                     {% endif %}
                 </div>
                 <div class="pattern-title {{ newest['css'] }}">
@@ -1500,7 +1496,7 @@ a{text-decoration:none}
                 <div class="level">{{ newest['level_text'] }}</div>
                 {% endif %}
                 <div class="pattern-detail" style="color:#f2c94c;margin-top:9px">
-                    Confirmed candle: {{ newest.get('confirmation_time_perth', '') }}.<br>
+                    Confirmed: {{ newest.get('confirmation_time_perth', '') }}<br>
                     {{ newest.get('notification_note', 'Phone alert history unavailable') }}
                 </div>
             </div>
@@ -1516,7 +1512,7 @@ a{text-decoration:none}
                     <div class="level">{{ p['level_text'] }}</div>
                     {% endif %}
                     <div class="pattern-detail" style="color:#f2c94c;margin-top:9px">
-                        Confirmed candle: {{ p.get('confirmation_time_perth', '') }}.<br>
+                        Confirmed: {{ p.get('confirmation_time_perth', '') }}<br>
                         {{ p.get('notification_note', 'Phone alert history unavailable') }}
                     </div>
                 </div>
@@ -1526,16 +1522,12 @@ a{text-decoration:none}
             <div class="pattern">
                 <div class="pattern-title neutral">No matching setup yet</div>
                 <div class="pattern-detail">
-                    No recent candle sequence matches your 2+ candle trend-pullback confirmation rule on this timeframe.
+                    No qualifying setup on this timeframe.
                 </div>
             </div>
         {% endif %}
 
-        <div class="small" style="margin-top:12px">
-            Updated: {{ updated }}. The headline refers ONLY to the newest fully closed candle.
-            If no new setup triggered on that candle, the older valid pattern below is labelled
-            historical. WAIT changes to READY TO REVIEW only after a valid confirmation candle is fully closed. The scanner does not place trades.
-        </div>
+        <div class="small" style="margin-top:12px">Updated: {{ updated }}</div>
     {% endif %}
     </div>
 
@@ -5625,127 +5617,64 @@ def describe_setup(p, interval=None):
     direction_word = "Bullish" if bullish else "Bearish"
 
     if p["name"] == "RR — RAILWAY TRACKS":
-        icon = "🔵"
-        css = "rrblue"
-        side = "BUY" if bullish else "SELL"
-        detail = (
-            f"AUD/USD Daily RR — Railway Tracks {side} reversal on "
-            f"{format_signal_time_perth(p['confirmation_date'])}. "
-            f"Two adjacent fully CLOSED opposite-colour Daily candles formed at the end of a clear "
-            f"{p.get('run_direction','')} run. Their real bodies are roughly similar "
-            f"({p.get('body_similarity_pct',0):.0f}% size match)."
-        )
+        icon, css = "🔵", "rrblue"
+        detail = f"Railway Tracks • {p.get('body_similarity_pct',0):.0f}% body match"
         level_text = (
-            f"First RR candle: {format_signal_time_perth(p.get('first_date',''))} • "
-            f"Second/confirmation candle: {format_signal_time_perth(p.get('confirmation_date',''))} • "
-            f"Confirmation close: {p['confirmation_close']:.5f}"
+            f"First candle: {format_signal_time_perth(p.get('first_date',''))} • "
+            f"Confirmed: {format_signal_time_perth(p.get('confirmation_date',''))} • "
+            f"Close: {p['confirmation_close']:.5f}"
         )
-
     elif p["name"] == "S/R GAP RETEST SETUP":
-        weak_text = " Weakness was also detected in the retest candles." if p["weak_retest"] else ""
         if p.get("diagonal"):
-            detail = (
-                f"{direction_word} DIAGONAL trendline Gap-Retest confirmed on {format_signal_time_perth(p['confirmation_date'])}. "
-                f"Two or more separated historical swing touches established a clear sloping "
-                f"{p['level_source']}. Price departed, returned for touch "
-                f"{p.get('trendline_touches',3)} and produced a fully closed opposite-colour rejection at "
-                f"{p['penetration']:.0f}% through the previous candle body "
-                f"(minimum 50% required)."
-            )
+            count = p.get('trendline_touches', 3)
+            strength = "VERY STRONG" if count >= 4 else "STRONG" if count >= 3 else "VALID"
+            detail = f"Diagonal {p['level_source']} • {count} touches • {strength} • {p['penetration']:.0f}% candle confirmation"
             touches = p.get("trendline_touch_points") or []
             touch_text = (
-                " • ".join(
-                    f"Touch {n}: {point['price']:.5f} on {format_signal_time_perth(point['date'])}"
-                    for n, point in enumerate(touches, 1)
-                ) + " • "
+                " • ".join(f"Touch {n}: {point['price']:.5f} ({format_signal_time_perth(point['date'])})"
+                           for n, point in enumerate(touches, 1)) + " • "
             ) if touches else ""
             level_text = (
                 touch_text +
-                f"Projected diagonal line: {p['level']:.5f} • "
-                f"Earlier wick: {p['old_level']:.5f} on {format_signal_time_perth(p['old_date'])} • "
-                f"Latest test: {p['retest_price']:.5f} on {format_signal_time_perth(p['retest_date'])} • "
-                f"Confirmation close: {p['confirmation_close']:.5f}"
+                f"Trendline: {p['level']:.5f} • "
+                f"Retest: {p['retest_price']:.5f} ({format_signal_time_perth(p['retest_date'])}) • "
+                f"Close: {p['confirmation_close']:.5f}"
             )
         else:
-            detail = (
-                f"{direction_word} S/R Gap-Retest confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
-                f"Price first established a wick-defined support/resistance zone, moved clearly away, "
-                f"then returned to RETEST the same zone after {p['separation']} candles. "
-                f"The second touch retraced {p.get('retest_depth_pct', 0):.0f}% back toward the original S/R level "
-                f"(minimum 50% required). The opposite-colour confirmation candle fully closed away from the zone and "
-                f"{p['penetration']:.0f}% through the previous candle BODY (minimum 50% required)."
-            )
+            detail = f"Horizontal S/R retest • {p.get('retest_depth_pct', 0):.0f}% level retest • {p['penetration']:.0f}% candle confirmation"
             level_text = (
-                f"Established retest zone: {p['level']:.5f} • "
-                f"Earlier wick level: {p['old_level']:.5f} on {format_signal_time_perth(p['old_date'])} • "
-                f"Second {p['level_source']} test: {p['retest_price']:.5f} on {format_signal_time_perth(p['retest_date'])} • "
-                f"Confirmation close: {p['confirmation_close']:.5f}"
+                f"S/R level: {p['level']:.5f} • "
+                f"Earlier wick: {p['old_level']:.5f} ({format_signal_time_perth(p['old_date'])}) • "
+                f"Retest: {p['retest_price']:.5f} ({format_signal_time_perth(p['retest_date'])}) • "
+                f"Close: {p['confirmation_close']:.5f}"
             )
         if p.get("turning_point_strength"):
-            detail += " Additional turning-point confirmation: " + p["turning_point_strength"] + "."
+            detail += " • " + p["turning_point_strength"]
             if p.get("strength_turning_points"):
-                level_text += " • Supporting turning points: " + "; ".join(
-                    f"{pt['price']:.5f} on {format_signal_time_perth(pt['date'])}"
+                level_text += " • Supporting pivots: " + "; ".join(
+                    f"{pt['price']:.5f} ({format_signal_time_perth(pt['date'])})"
                     for pt in p["strength_turning_points"]
                 )
+        # Preserve both numerical profit targets and their structural sources.
         if p.get("target1") is not None:
-            src = p.get("target1_source", "structural")
-            level_text += f" • Target 1: {p['target1']:.5f} ({src})"
+            level_text += f" • Target 1: {p['target1']:.5f} ({p.get('target1_source', 'structural')})"
         if p.get("take_profit") is not None:
-            src = p.get("take_profit_source", "structural")
-            level_text += f" • Take Profit: {p['take_profit']:.5f} ({src})"
-
-    elif p["name"] in (
-        "SUPPORT RETEST / BOUNCE WATCH",
-        "RESISTANCE RETEST / REJECTION WATCH"
-    ):
-        zone_word = "support" if p["direction"] == "bullish" else "resistance"
-        action_word = "Bullish watch" if bullish else "Bearish watch"
-        trend_word = str(p.get("trend", "mixed")).upper()
-
-        detail = (
-            f"{action_word}: the newest fully CLOSED candle has RETESTED an established "
-            f"{zone_word} zone and shown a rejection/bounce away from it. "
-            f"The zone has at least {p.get('touches', 2)} historical swing touches, and price "
-            f"previously moved clearly away before returning. Current local structure is "
-            f"{trend_word}. This alert is allowed in bullish, bearish and range-bound markets."
-        )
-
-        level_text = (
-            f"{zone_word.title()} zone: {p['level']:.5f} • "
-            f"Latest close: {p['confirmation_close']:.5f}"
-        )
-
+            level_text += f" • Take Profit: {p['take_profit']:.5f} ({p.get('take_profit_source', 'structural')})"
+    elif p["name"] in ("SUPPORT RETEST / BOUNCE WATCH", "RESISTANCE RETEST / REJECTION WATCH"):
+        zone_word = "Support" if bullish else "Resistance"
+        detail = f"{zone_word} retest • {p.get('touches', 2)} touches • {str(p.get('trend', 'mixed')).upper()} trend"
+        level_text = f"{zone_word}: {p['level']:.5f} • Close: {p['confirmation_close']:.5f}"
     elif p["name"] == "TREND PULLBACK SETUP":
-        run_dates = ", ".join(format_signal_time_perth(x) for x in p.get("run_dates", []))
-        htf_text = ""
+        detail = f"{p['run_count']} {p['run_colour']} pullback candles • Confirmed close"
         if p.get("higher_tf_filter"):
             htf = p.get("higher_tf_states", {})
-            htf_text = (
-                f" Higher-timeframe context: Daily {htf.get('1D', 'unknown')}, "
-                f"Weekly {htf.get('1W', 'unknown')}; used {htf.get('Used', 'n/a')}."
-                f" {p.get('higher_tf_warning', '')}"
-            )
-
-        detail = (
-            f"{direction_word} trend-pullback confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
-            f"{p['run_count']} {p['run_colour']} CLOSED candles pulled against the larger "
-            f"{p['trend']} price structure, then the opposite-colour confirmation candle "
-            f"fully CLOSED. No minimum body-penetration percentage is required. "
-            f"Pullback candle times: {run_dates or 'n/a'}."
-            f"{htf_text}"
-        )
-        level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
-
+            detail += f" • D1: {htf.get('1D','?')} • W1: {htf.get('1W','?')}"
+            if p.get('higher_tf_warning'):
+                detail += f" • {p['higher_tf_warning']}"
+        level_text = f"Close: {p['confirmation_close']:.5f}"
     else:
-        detail = (
-            f"{direction_word} range-reversal confirmation on {format_signal_time_perth(p['confirmation_date'])}. "
-            f"{p['run_count']} {p['run_colour']} CLOSED candles moved in one direction "
-            f"while local structure was mixed/range-bound, then the confirmation candle "
-            f"closed {p['penetration']:.0f}% back through the previous candle body."
-        )
-
-        level_text = f"Confirmation close: {p['confirmation_close']:.5f}"
+        detail = f"Range reversal • {p['run_count']} candles • {p['penetration']:.0f}% confirmation"
+        level_text = f"Close: {p['confirmation_close']:.5f}"
 
     # Visual-only distinction: Edo uses 4H Trend Pullback mainly as an entry/re-entry
     # inside the larger trend. Detection rules are unchanged.
@@ -6788,25 +6717,25 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         rr_side = "BUY" if rr.get("direction") == "bullish" else "SELL"
         signal = f"RR DAILY — {rr_side}"
         icon, css = "🔵", "rrblue"
-        summary = "AUD/USD Daily Railway Tracks reversal confirmed on the newest fully CLOSED Daily candle."
+        summary = "Railway Tracks confirmed"
     elif bullish and not bearish:
         if interval == "4h":
             signal = "4H PULLBACK ENTRY — BUY"
             icon, css = "⚪", "entry4h"
-            summary = "4H entry/re-entry indication inside the larger trend. The existing Trend Pullback detection rules are unchanged, and only a fully CLOSED candle can trigger it."
+            summary = "4H pullback confirmed"
         else:
             signal = "READY TO REVIEW — BUY"
             icon, css = "🟢", "buy"
-            summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bullish Edo setup. No forming candle can make this READY."
+            summary = "BUY setup confirmed"
     elif bearish and not bullish:
         if interval == "4h":
             signal = "4H PULLBACK ENTRY — SELL"
             icon, css = "⚪", "entry4h"
-            summary = "4H entry/re-entry indication inside the larger trend. The existing Trend Pullback detection rules are unchanged, and only a fully CLOSED candle can trigger it."
+            summary = "4H pullback confirmed"
         else:
             signal = "READY TO REVIEW — SELL"
             icon, css = "🔴", "sell"
-            summary = "Price Action is ready to review because the newest fully CLOSED candle completed a valid bearish Edo setup. No forming candle can make this READY."
+            summary = "SELL setup confirmed"
     elif bullish and bearish:
         signal = "WAIT — MIXED PRICE ACTION"
         icon, css = "🟡", "wait"
@@ -6825,8 +6754,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             )
         elif found:
             summary = (
-                "No pattern triggered on the newest fully closed candle. "
-                "The most recent older valid trigger is shown below for reference."
+                "No new trigger • Previous setup shown below"
             )
         else:
             if rejected_room_setups:
@@ -6842,7 +6770,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                     f"Current higher-timeframe state: {state_text}."
                 )
             else:
-                summary = "No recent setup matches your candle-close pattern rules on this timeframe."
+                summary = "No qualifying closed-candle setup"
 
     # Weekly Spike disabled: Edo wants ONLY his requested trading signals.
     weekly_spike = None
@@ -9084,12 +9012,8 @@ def build_trend_scan(symbol, grp=None):
     results[0]['css'] = weekly_css
     if weekly_turn:
         results[0]['turning_detail'] = (
-            f"Confirmed {weekly_turn['direction']} diagonal break: "
-            f"Daily close {weekly_turn['close']:.5f} beyond projected "
-            f"Weekly line {weekly_turn['level']:.5f}; "
-            f"turning points "
-            f"{weekly_turn['touches'][0][0].date()} / "
-            f"{weekly_turn['touches'][1][0].date()}"
+            f"Line {weekly_turn['level']:.5f} • D1 close {weekly_turn['close']:.5f}"
+            f" • Pivots {weekly_turn['touches'][0][0].date()} / {weekly_turn['touches'][1][0].date()}"
         )
 
     eight_candles, error = get_candles(symbol, confirm_tf, outputsize=440 if confirm_tf == "12h" else 660, grp=grp)
@@ -9140,39 +9064,26 @@ def build_trend_scan(symbol, grp=None):
     aligned_status = aligned_full_trend_status(status, weekly_state)
     if status == "FULL BULLISH":
         summary, icon, css = aligned_status, "🟢", "bull"
-        if event:
-            detail = f"Main trend is bullish: at least 25% of a fully closed {confirm_label} candle body broke above the Daily swing-high mid-wick level at {event['level']:.5f} on {event_time}. It stays bullish until an opposite {confirm_label} close below the Daily swing-low mid-wick level is confirmed."
-        else:
-            detail = f"Main trend remains bullish from the latest {confirm_label} close above a Daily swing-high mid-wick level. It stays bullish until an opposite {confirm_label} close below the Daily swing-low mid-wick level is confirmed."
+        detail = (f"{confirm_label} BUY break: {event['level']:.5f} • {event_time}"
+                  if event else f"Bullish {confirm_label} structure confirmed")
         score = 1
     elif status == "FULL BEARISH":
         summary, icon, css = aligned_status, "🔴", "bear"
-        if event:
-            detail = f"Main trend is bearish: at least 25% of a fully closed {confirm_label} candle body broke below the Daily swing-low mid-wick level at {event['level']:.5f} on {event_time}. It stays bearish until an opposite {confirm_label} close above the Daily swing-high mid-wick level is confirmed."
-        else:
-            detail = f"Main trend remains bearish from the latest {confirm_label} close below a Daily swing-low mid-wick level. It stays bearish until an opposite {confirm_label} close above the Daily swing-high mid-wick level is confirmed."
+        detail = (f"{confirm_label} SELL break: {event['level']:.5f} • {event_time}"
+                  if event else f"Bearish {confirm_label} structure confirmed")
         score = -1
     else:
         summary, icon, css = "MIXED / WAIT", "🟡", "mixed"
-        detail = f"No fully closed {confirm_label} candle has confirmed a break of a meaningful Daily swing mid-wick level yet."
+        detail = f"Awaiting confirmed {confirm_label} breakout"
         score = 0
 
-    # Use the final Weekly/Daily agreement, not the underlying Daily direction,
-    # when colouring the Trend-page headline.
     if aligned_status.endswith("— MIXED"):
         icon, css = "⚠️", "mixed"
     elif aligned_status.endswith("— UNCONFIRMED"):
         icon, css = "", "unconfirmed"
-
-    if status in ("FULL BULLISH", "FULL BEARISH") and aligned_status != status:
-        if weekly_state in ("Bullish", "Bearish"):
-            detail += (f" Weekly is {weekly_state}; Daily is {daily_state}. "
-                       "FULL is withheld until both directions agree. ⚠️")
-        else:
-            detail += (" Weekly direction is unconfirmed; FULL is withheld until "
-                       "a confirmed Weekly direction agrees with Daily.")
     if trigger_level_note:
-        detail += " Current selected trigger lines: " + " • ".join(trigger_level_note) + "."
+        # Important levels remain visible even when the tutorial text is removed.
+        detail += " • " + " • ".join(trigger_level_note)
 
     return {
         "results": results, "summary": summary, "summary_icon": icon,
