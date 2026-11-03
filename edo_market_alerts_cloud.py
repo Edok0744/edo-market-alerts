@@ -4742,6 +4742,15 @@ def detect_diagonal_gap_retest(candles, conf):
             test_idx = int(conf.get("retest_candle_index", i-1))
             if test_idx<=b+3 or test_idx>=i:
                 continue
+            # Third-touch diagonal Gap Retest ONLY: follow the established
+            # structure BEFORE this retest. A bearish market permits resistance
+            # swing-high SELLs; bullish permits support swing-low BUYs.
+            # When structure is genuinely mixed/ranging, allow either side.
+            # The separate horizontal/double-top/double-bottom detector stays
+            # unchanged. This function is called only on Gap Retest timeframes.
+            market_trend = local_structure_trend(candles, test_idx)
+            if market_trend in ("bullish", "bearish") and direction != market_trend:
+                continue
             projected = va+slope*(i-a)
             if projected<=0:
                 continue
