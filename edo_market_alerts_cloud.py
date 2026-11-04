@@ -237,6 +237,7 @@ _HOME_PAGE_CACHE = {
     "trend_statuses": {},
     "trend_since": {},
     "trend_snapshots": {},
+    "cci_alignments": {},
 }
 _HOME_PAGE_CACHE_LOCK = threading.Lock()
 
@@ -259,6 +260,9 @@ def edo_home_trend_refresh_worker():
                 status, error = build_full_alignment(symbol, grp)
                 if not error and status:
                     save_trend_status(symbol, status)
+                    # Independent, information-only CCI25 alignment badge.
+                    # Errors clear the arrow rather than showing stale alignment.
+                    update_cci_alignment(symbol, grp, status)
                 elif error:
                     print('home-open trend refresh:', symbol, error, flush=True)
             except Exception as exc:
@@ -442,6 +446,10 @@ h2{font-size:18px}
 .saved-fulltrend.trend-mixed-status{background:#45380f;color:#f2c94c}
 .saved-fulltrend.trend-unconfirmed-status{background:#273341;color:#c5d0da}
 .saved-mixed-warning{display:inline-block;margin-left:6px;font-size:20px;vertical-align:middle;cursor:help}
+/* A small CCI arrow is shown only beside matching FULL trend badges. */
+.cci-inline-arrow{margin-left:5px;font-size:15px;font-weight:900;vertical-align:middle}
+.cci-inline-arrow.up{color:#53dfce}
+.cci-inline-arrow.down{color:#ffae65}
 
 .alerttrend{
     margin-top:10px;
@@ -773,9 +781,9 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 {% set saved_daily = saved_snap.get('Daily', '') %}
 {% set saved_mixed = saved_weekly in ('Bullish', 'Bearish') and saved_daily in ('Bullish', 'Bearish') and saved_weekly != saved_daily %}
 {% if saved_ts == 'FULL BULLISH' %}
-<a class="saved-fulltrend bull" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bullish trend" title="Open Trend page">🟢 ▲{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
+<a class="saved-fulltrend bull" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bullish trend" title="Open Trend page">🟢 ▲{% if cci_alignments.get((f['symbol'],f['grp'])) == 'BULLISH' %}<span class="cci-inline-arrow up" title="CCI(25): 1W, 1D, 8H, 4H all below −80 • Oversold alignment, not a trade signal">↑</span>{% endif %}{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
 {% elif saved_ts == 'FULL BEARISH' %}
-<a class="saved-fulltrend bear" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bearish trend" title="Open Trend page">🔴 ▼{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
+<a class="saved-fulltrend bear" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bearish trend" title="Open Trend page">🔴 ▼{% if cci_alignments.get((f['symbol'],f['grp'])) == 'BEARISH' %}<span class="cci-inline-arrow down" title="CCI(25): 1W, 1D, 8H, 4H all above +80 • Overbought alignment, not a trade signal">↓</span>{% endif %}{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
 {% elif saved_ts.endswith('— MIXED') %}
 <a class="saved-fulltrend trend-mixed-status" href="/trend/{{f['id']}}" title="Weekly and Daily disagree — Open Trend page">⚠️ {{saved_ts}}</a>
 {% elif saved_ts.endswith('— UNCONFIRMED') %}
@@ -1645,6 +1653,21 @@ def init_db():
         except sqlite3.OperationalError as e:
             print("SQLite WAL setup warning:", e)
 
+
+        # Information-only CCI alignment; no effect on trading signals/alerts.
+        c.execute("""CREATE TABLE IF NOT EXISTS cci_alignment (
+            symbol TEXT NOT NULL, grp TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT '', updated TEXT,
+            PRIMARY KEY(symbol, grp)
+        )""")
+
+        # One CCI sound per pair/direction/day; separate from trade alerts.
+        c.execute("""CREATE TABLE IF NOT EXISTS cci_inline_sound_log (
+            symbol TEXT NOT NULL, grp TEXT NOT NULL,
+            direction TEXT NOT NULL, perth_day TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY(symbol,grp,direction,perth_day)
+        )""")
 
         # Diagnostic-only scanner history (persistent through Railway redeploys).
         c.execute("""
@@ -8325,6 +8348,113 @@ def aligned_full_trend_status(daily_break_status, weekly_state):
     return f"{daily.upper()} — MIXED"
 
 
+# -------------------------------------------------
+# CCI(25) 4-TIMEFRAME ALIGNMENT — INFORMATION ONLY
+# -------------------------------------------------
+# All FOUR fully closed chart candles must simultaneously be beyond -80
+# (BULLISH / oversold) or +80 (BEARISH / overbought). This is NOT a
+# trend prediction or filter on any EdoSignal pattern. A separate notification
+# with Pushover magic sound is sent only when alignment first becomes valid.
+CCI_INLINE_PERIOD = 25
+CCI_INLINE_LEVEL = 80.0
+CCI_INLINE_INTERVALS = ("1week", "1day", "8h", "4h")
+
+
+def cci_latest_value(closed_candles, period=CCI_INLINE_PERIOD):
+    """CCI = (typical price - SMA of typical price) / (0.015 * mean deviation).
+
+    Uses only fully completed candles; a zero mean deviation means no signal.
+    """
+    if len(closed_candles or []) < period:
+        return None
+    typical = [
+        (float(c["high"]) + float(c["low"]) + float(c["close"])) / 3.0
+        for c in closed_candles[-period:]
+    ]
+    average = sum(typical) / period
+    deviation = sum(abs(v - average) for v in typical) / period
+    if deviation <= 1e-15:
+        return None
+    return (typical[-1] - average) / (0.015 * deviation)
+
+
+def cci_four_timeframe_state(symbol, grp):
+    """Return BULLISH/BEARISH only when all four closed-bar CCI25 values align."""
+    values = []
+    for interval in CCI_INLINE_INTERVALS:
+        candles, err = get_candles(symbol, interval, outputsize=82, grp=grp)
+        if err or not candles:
+            return ""
+        if interval == "1week":
+            closed = weekly_card_completed_candles(candles)
+        else:
+            closed = fully_closed_candles(candles, interval)
+        value = cci_latest_value(closed)
+        if value is None:
+            return ""
+        values.append(value)
+    if all(value <= -CCI_INLINE_LEVEL for value in values):
+        return "BULLISH"
+    if all(value >= CCI_INLINE_LEVEL for value in values):
+        return "BEARISH"
+    return ""
+
+
+def update_cci_alignment(symbol, grp, trend_status):
+    """Update the independent CCI arrow and alert only on new valid alignment.
+
+    A missing/unavailable market feed hides the arrow. New-install baselines
+    never send a historical notification; actual changes after that can alert.
+    Pushover offers no custom WIZZ sound: 'magic' is the closest available.
+    """
+    state = ""
+    if trend_status in ("FULL BULLISH", "FULL BEARISH"):
+        try:
+            candidate = cci_four_timeframe_state(symbol, grp)
+            if (trend_status == "FULL BULLISH" and candidate == "BULLISH") or (
+                trend_status == "FULL BEARISH" and candidate == "BEARISH"
+            ):
+                state = candidate
+        except Exception as exc:
+            print("CCI alignment check:", symbol, exc, flush=True)
+
+    should_alert = False
+    try:
+        with db_conn() as c:
+            old = c.execute(
+                "SELECT state FROM cci_alignment WHERE symbol=? AND grp=?",
+                (symbol, grp)
+            ).fetchone()
+            c.execute("""INSERT INTO cci_alignment(symbol,grp,state,updated)
+                VALUES(?,?,?,?) ON CONFLICT(symbol,grp) DO UPDATE SET
+                state=excluded.state, updated=excluded.updated""",
+                (symbol, grp, state, datetime.now(timezone.utc).isoformat()))
+            # Only a NEW valid alignment sounds; never on first installation,
+            # unchanged scans, or disappearing arrows. At most once per day.
+            if old is not None and old['state'] != state and state:
+                perth_day = datetime.now(ZoneInfo("Australia/Perth")).date().isoformat()
+                cur = c.execute("""INSERT OR IGNORE INTO cci_inline_sound_log
+                    (symbol,grp,direction,perth_day,sent_at) VALUES(?,?,?,?,?)""",
+                    (symbol, grp, state, perth_day, datetime.now(timezone.utc).isoformat()))
+                should_alert = cur.rowcount == 1
+            c.commit()
+    except Exception as exc:
+        print("CCI alignment save:", symbol, exc, flush=True)
+        return
+
+    if should_alert:
+        label = "BULLISH — INLINE" if state == "BULLISH" else "BEARISH — INLINE"
+        ok = send_push(
+            f"CCI (25) {label}",
+            f"{symbol} • W, D, 8H, 4H all beyond {'−80' if state == 'BULLISH' else '+80'}"
+            "\nCCI alignment only — not a new trade signal.",
+            sound="magic"
+        )
+        if not ok:
+            print("CCI inline sound not accepted by Pushover:", symbol, state, flush=True)
+
+
+
 def build_full_alignment(symbol, grp=None):
     """Daily swing breakout plus Weekly alignment for displayed trend status."""
     confirm_tf = "12h" if grp == "CRYPTO" else "8h"
@@ -8471,6 +8601,22 @@ def active_trend_monitor():
                     # trend_status is persistent in SQLite, so restart/redeploy
                     # does not erase the previously processed trend state.
                     previous = save_trend_status(symbol, status)
+
+                    # Independent CCI info badge: refresh each pair at most
+                    # every 30 minutes to protect broker/API rate limits.
+                    try:
+                        with db_conn() as c:
+                            last_row = c.execute(
+                                'SELECT updated FROM cci_alignment WHERE symbol=? AND grp=?',
+                                (symbol, grp)
+                            ).fetchone()
+                        last_dt = parse_candle_utc(last_row['updated']) if last_row else None
+                        due = (last_dt is None or
+                               (datetime.now(timezone.utc) - last_dt).total_seconds() >= 1800)
+                        if due:
+                            update_cci_alignment(symbol, grp, status)
+                    except Exception as cci_exc:
+                        print('CCI monitor:', symbol, cci_exc, flush=True)
 
                     # FULL TREND is now a dashboard indicator only.
                     # Keep the persistent state fresh for Saved Pairs / Trend pages,
@@ -9697,6 +9843,11 @@ def home():
                 'SELECT symbol,status,updated FROM trend_status'
             ).fetchall()
 
+            cci_rows = c.execute(
+                'SELECT symbol,grp,state FROM cci_alignment'
+            ).fetchall()
+            cci_alignments = {(r['symbol'], r['grp']): r['state'] for r in cci_rows}
+
             trend_statuses = {
                 r['symbol']: r['status']
                 for r in trend_rows
@@ -9731,6 +9882,7 @@ def home():
             _HOME_PAGE_CACHE["trend_statuses"] = trend_statuses
             _HOME_PAGE_CACHE["trend_since"] = trend_since
             _HOME_PAGE_CACHE["trend_snapshots"] = trend_snapshots
+            _HOME_PAGE_CACHE["cci_alignments"] = cci_alignments
 
     except sqlite3.OperationalError as e:
         print("home SQLite busy; serving cached screen:", e)
@@ -9743,6 +9895,7 @@ def home():
             trend_statuses = dict(_HOME_PAGE_CACHE["trend_statuses"])
             trend_since = dict(_HOME_PAGE_CACHE.get("trend_since", {}))
             trend_snapshots = dict(_HOME_PAGE_CACHE["trend_snapshots"])
+            cci_alignments = dict(_HOME_PAGE_CACHE.get("cci_alignments", {}))
 
     return render_template_string(
         HTML,
@@ -9755,6 +9908,7 @@ def home():
         trend_statuses=trend_statuses,
         trend_since=trend_since,
         trend_snapshots=trend_snapshots,
+        cci_alignments=cci_alignments,
         price_action_statuses=price_action_statuses,
         news_items=news_items,
         news_configured=news_configured,
