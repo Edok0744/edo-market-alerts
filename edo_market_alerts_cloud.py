@@ -1429,6 +1429,7 @@ a{text-decoration:none}
 .neutral{color:#8ca7bf}
 .entry4h{color:#aeb8c2}
 .rrblue{color:#4da3ff}
+.starcyan{color:#22e6db}
 .error{color:#ff8a96;font-weight:800}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .tfrow{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
@@ -3247,6 +3248,7 @@ PATTERN_BASELINE_CLOSED = {}
 # Supported saved-market groups: FOREX, CRYPTO, CFD.
 # The scanner does NOT place trades. It only finds setups for manual review.
 PATTERN_TIMEFRAMES = [
+    {"label": "3H", "value": "3h"},
     {"label": "4H", "value": "4h"},
     {"label": "8H", "value": "8h"},
     {"label": "12H", "value": "12h"},
@@ -4696,6 +4698,152 @@ def add_turning_point_gap_strength(candles, setup, interval):
     return setup
 
 
+# Independent Morning / Evening Star and single-candle rejection signals.
+# These do not alter the separate Gap Retest or Trend Pullback detectors.
+STAR_PATTERN_INTERVALS = frozenset({"3h", "4h", "1day", "1week"})
+STAR_PATTERN_NAMES = frozenset({"MORNING STAR SETUP", "EVENING STAR SETUP",
+                                "HAMMER REVERSAL SETUP", "SHOOTING STAR SETUP"})
+
+
+def detect_trendline_star(candles, i):
+    """Recognise a closed bullish/bearish star/rejection at a confirmed 3rd+ line touch.
+
+    Two established, separated and chronologically confirmed swing anchors make
+    the trendline. The current reversal test is touch three; earlier independent
+    aligned contacts can raise it to VERY STRONG. Follow the pre-event market
+    structure: bearish resistance sells, bullish support buys, range either.
+    """
+    if i < 35 or i >= len(candles):
+        return None
+    ar = avg_range(candles, i, 20)
+    if ar <= 0:
+        return None
+
+    first = second = None
+    pattern = None
+    test_idx = i
+    confirmed = candles[i]
+    current_colour = candle_colour(confirmed)
+    # The traditional three-candle Morning/Evening Star.
+    if i >= 2:
+        first, middle, third = candles[i-2:i+1]
+        first_body = abs(float(first['close'])-float(first['open']))
+        middle_body = abs(float(middle['close'])-float(middle['open']))
+        third_body = abs(float(third['close'])-float(third['open']))
+        midpoint = (float(first['open'])+float(first['close']))/2
+        small_middle = middle_body <= max(first_body*.45, ar*.25)
+        strong_first = first_body >= ar*.50
+        if (candle_colour(first)=='red' and current_colour=='green' and
+            strong_first and small_middle and third_body >= ar*.40 and
+            float(third['close'])>midpoint):
+            pattern = ('MORNING STAR SETUP','bullish')
+            test_idx = i-1
+        elif (candle_colour(first)=='green' and current_colour=='red' and
+              strong_first and small_middle and third_body >= ar*.40 and
+              float(third['close'])<midpoint):
+            pattern = ('EVENING STAR SETUP','bearish')
+            test_idx = i-1
+
+    # Alternative closed-candle confirmation: a hammer/shooting star is followed
+    # by a full closed candle in its rejection direction (as in Edo's screenshot).
+    if pattern is None and i >= 1:
+        rejection = candles[i-1]
+        rbody = abs(float(rejection['close'])-float(rejection['open']))
+        rbody = max(rbody, ar*.035)  # avoid zero-body division/false positives
+        upper = float(rejection['high'])-max(float(rejection['open']),float(rejection['close']))
+        lower = min(float(rejection['open']),float(rejection['close']))-float(rejection['low'])
+        midpoint = (float(rejection['open'])+float(rejection['close']))/2
+        if (upper >= max(rbody*2,ar*.45) and lower <= max(rbody*.7,ar*.18)
+            and current_colour=='red' and float(confirmed['close'])<midpoint):
+            pattern=('SHOOTING STAR SETUP','bearish')
+            test_idx=i-1
+        elif (lower >= max(rbody*2,ar*.45) and upper <= max(rbody*.7,ar*.18)
+              and current_colour=='green' and float(confirmed['close'])>midpoint):
+            pattern=('HAMMER REVERSAL SETUP','bullish')
+            test_idx=i-1
+    if pattern is None:
+        return None
+    name,direction=pattern
+    trend=local_structure_trend(candles,test_idx)
+    if trend in ('bullish','bearish') and direction != trend:
+        return None
+    kind='low' if direction=='bullish' else 'high'
+    # Right-side confirmation of each pivot must precede the reaction candle.
+    pivots=swing_points(candles[:max(0,test_idx-5)],kind,left=3,right=3)
+    pivots=[(j,float(v)) for j,v in pivots if test_idx-110 <= j <= test_idx-8]
+    if len(pivots)<2:
+        return None
+    candidates=[]
+    for bp in range(len(pivots)-1,0,-1):
+        b,vb=pivots[bp]
+        for ap in range(bp-1,-1,-1):
+            a,va=pivots[ap]
+            if b-a<10 or test_idx-b>42:
+                continue
+            slope=(vb-va)/(b-a)
+            tolerance=ar*.55
+            # A resistance line can't be repeatedly violated before a sell,
+            # or support repeatedly violated before a buy.
+            anchors=[(a,va)]
+            invalid=False
+            for j,v in pivots[ap+1:bp+1]:
+                expected=va+slope*(j-a)
+                if abs(v-expected)>tolerance:
+                    invalid=True;break
+                if j-anchors[-1][0]>=5:
+                    anchors.append((j,v))
+            if invalid or len(anchors)<2 or anchors[-1][0]!=b:
+                continue
+            test_line=va+slope*(test_idx-a)
+            wick=float(candles[test_idx][kind])
+            if test_line<=0 or abs(wick-test_line)>tolerance:
+                continue
+            # Reject candles that close decisively through the opposite side.
+            projection=va+slope*(i-a)
+            close=float(confirmed['close'])
+            if direction=='bullish' and close<projection-ar*.12:
+                continue
+            if direction=='bearish' and close>projection+ar*.12:
+                continue
+            broken=False
+            for j in range(b+1,test_idx):
+                projected=va+slope*(j-a)
+                price=float(candles[j]['close'])
+                if direction=='bullish' and price<projected-ar*.7:
+                    broken=True;break
+                if direction=='bearish' and price>projected+ar*.7:
+                    broken=True;break
+            if broken:
+                continue
+            # Distinct departure required before a fresh touch.
+            departure=[(float(candles[j]['close'])-(va+slope*(j-a))) *
+                       (1 if direction=='bullish' else -1)
+                       for j in range(b+1,test_idx)]
+            if not departure or max(departure)<ar*.8:
+                continue
+            touches=len(anchors)+1
+            score=7+min(2,touches*.45)+min(1,(test_idx-b)/35)
+            candidates.append((score,touches,anchors,a,va,test_line,wick))
+    if not candidates:
+        return None
+    score,touches,anchors,a,va,level,wick=max(candidates,key=lambda x:(x[0],x[1]))
+    t1,tp=sr_structure_targets(candles,direction,test_idx,float(confirmed['close']),search_back=110)
+    return {
+        'name':name, 'direction':direction, 'confirmed':True,
+        'score':score,'confirmation_date':confirmed.get('datetime',''),
+        'confirmation_close':float(confirmed['close']),
+        'retest_date':candles[test_idx].get('datetime',''),
+        'retest_price':wick,'level':level,
+        'trendline_touches':touches,
+        'turning_point_strength':'VERY STRONG' if touches>=4 else 'STRONG',
+        'trendline_touch_points':[{'date':candles[j].get('datetime',''),'price':v}
+                                  for j,v in anchors],
+        'trendline_type':'support' if direction=='bullish' else 'resistance',
+        'target1':t1,'take_profit':tp,
+        'trend_at_retest':trend,
+    }
+
+
 def detect_diagonal_gap_retest(candles, conf):
     """Edo diagonal retest: TWO established pivots define a valid line.
 
@@ -5724,7 +5872,20 @@ def describe_setup(p, interval=None):
     css = "buy" if bullish else "sell"
     direction_word = "Bullish" if bullish else "Bearish"
 
-    if p["name"] == "RR — RAILWAY TRACKS":
+    if p["name"] in STAR_PATTERN_NAMES:
+        icon, css = "💠", "starcyan"
+        touches = int(p.get('trendline_touches',3))
+        detail = (f"{p.get('trendline_type','Trendline').title()} retest • "
+                  f"{touches} touches • {p.get('turning_point_strength','STRONG')} "
+                  f"• {p.get('trend_at_retest','mixed').upper()} trend")
+        level_text = (f"Trendline: {p['level']:.5f} • "
+                      f"Rejection: {p['retest_price']:.5f} • "
+                      f"Confirmed close: {p['confirmation_close']:.5f}")
+        if p.get('target1') is not None:
+            level_text += f" • Target 1: {p['target1']:.5f}"
+        if p.get('take_profit') is not None:
+            level_text += f" • Take Profit: {p['take_profit']:.5f}"
+    elif p["name"] == "RR — RAILWAY TRACKS":
         icon, css = "🔵", "rrblue"
         detail = f"Railway Tracks • {p.get('body_similarity_pct',0):.0f}% body match"
         level_text = (
@@ -6655,6 +6816,13 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = []
 
+    # Independent trendline star/rejection signals (3H/4H/Daily/Weekly).
+    if interval in STAR_PATTERN_INTERVALS:
+        for star_i in range(max(35,len(closed_candles)-9), len(closed_candles)):
+            star = detect_trendline_star(closed_candles, star_i)
+            if star:
+                found.append(star)
+
     # AUD/USD only: separate Daily RR (Railway Tracks) reversal signal.
     # This does not alter any existing Trend Pullback or Gap-Retest rules.
     if str(grp).upper() == "FOREX" and str(symbol).upper() == "AUD/USD" and interval == "1day":
@@ -6721,6 +6889,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = list(unique.values())
 
+    star_found = [p for p in found if p.get('name') in STAR_PATTERN_NAMES]
     # Hard whitelist: ONLY Edo's requested signals.
     if interval == "4h":
         found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
@@ -6746,6 +6915,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         found = [p for p in found if p.get("name") == "TREND PULLBACK SETUP"]
     else:
         found = []
+
+    if interval in STAR_PATTERN_INTERVALS:
+        found.extend(star_found)
 
     # Edo rule:
     #   All Trend Pullbacks -> established local trend + clean 2+ candle retracement.
@@ -6827,7 +6999,12 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         icon, css = "🔵", "rrblue"
         summary = "Railway Tracks confirmed"
     elif bullish and not bearish:
-        if interval == "4h":
+        star_only = [p for p in bullish if p.get('name') in STAR_PATTERN_NAMES]
+        if star_only and len(star_only) == len(current_patterns):
+            signal = "MORNING STAR — BUY" if star_only[0]['name'] == 'MORNING STAR SETUP' else "HAMMER — BUY"
+            icon, css = "💠", "starcyan"
+            summary = "Trendline reversal confirmed"
+        elif interval == "4h" and all(p.get("name") == "TREND PULLBACK SETUP" for p in bullish):
             signal = "4H PULLBACK ENTRY — BUY"
             icon, css = "⚪", "entry4h"
             summary = "4H pullback confirmed"
@@ -6836,7 +7013,12 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             icon, css = "🟢", "buy"
             summary = "BUY setup confirmed"
     elif bearish and not bullish:
-        if interval == "4h":
+        star_only = [p for p in bearish if p.get('name') in STAR_PATTERN_NAMES]
+        if star_only and len(star_only) == len(current_patterns):
+            signal = "EVENING STAR — SELL" if star_only[0]['name'] == 'EVENING STAR SETUP' else "SHOOTING STAR — SELL"
+            icon, css = "💠", "starcyan"
+            summary = "Trendline rejection confirmed"
+        elif interval == "4h" and all(p.get("name") == "TREND PULLBACK SETUP" for p in bearish):
             signal = "4H PULLBACK ENTRY — SELL"
             icon, css = "⚪", "entry4h"
             summary = "4H pullback confirmed"
@@ -6921,6 +7103,8 @@ def pattern_signal_family(p):
     """
     name = str(p.get("name", "")).upper()
 
+    if name in STAR_PATTERN_NAMES:
+        return "TRENDLINE_STAR"
     if "RR" in name and "RAILWAY" in name:
         return "RR_RAILWAY_TRACKS"
     if "S/R GAP RETEST" in name:
@@ -6942,6 +7126,8 @@ def pattern_push_priority(p):
 
     if "S/R GAP RETEST" in name:
         return 40
+    if name in STAR_PATTERN_NAMES:
+        return 25
     if "RR" in name and "RAILWAY" in name:
         return 30
     if "TREND PULLBACK" in name:
@@ -7423,6 +7609,13 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     found = []
 
+    # Independent trendline star/rejection signals (3H/4H/Daily/Weekly).
+    if interval in STAR_PATTERN_INTERVALS:
+        for star_i in range(max(35,len(closed_candles)-9), len(closed_candles)):
+            star = detect_trendline_star(closed_candles, star_i)
+            if star:
+                found.append(star)
+
     # AUD/USD only: separate Daily RR (Railway Tracks) reversal signal.
     if str(grp).upper() == "FOREX" and str(symbol).upper() == "AUD/USD" and interval == "1day":
         for rr_conf in recent_confirmations(closed_candles, lookback=9):
@@ -7477,6 +7670,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     setups = list(unique.values())
 
+    star_setups = [p for p in setups if p.get('name') in STAR_PATTERN_NAMES]
     # Hard whitelist for automatic phone notifications.
     if interval == "4h":
         setups = [p for p in setups if p.get("name") == "TREND PULLBACK SETUP"]
@@ -7500,6 +7694,9 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         ]
     else:
         setups = []
+
+    if interval in STAR_PATTERN_INTERVALS:
+        setups.extend(star_setups)
 
     # Edo rule:
     #   4H / 8H (Crypto 12H) Trend Pullback -> Daily first, Weekly fallback; range permits both.
@@ -7674,6 +7871,8 @@ def pattern_signal_monitor():
     time.sleep(180)
 
     due_seconds = {
+        "1h": 15 * 60,
+        "3h": 20 * 60,
         "4h": 15 * 60,
         "8h": 20 * 60,
         "12h": 20 * 60,
