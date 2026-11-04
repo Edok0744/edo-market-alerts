@@ -781,9 +781,9 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 {% set saved_daily = saved_snap.get('Daily', '') %}
 {% set saved_mixed = saved_weekly in ('Bullish', 'Bearish') and saved_daily in ('Bullish', 'Bearish') and saved_weekly != saved_daily %}
 {% if saved_ts == 'FULL BULLISH' %}
-<a class="saved-fulltrend bull" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bullish trend" title="Open Trend page">🟢 ▲{% if cci_alignments.get((f['symbol'],f['grp'])) == 'BULLISH' %}<span class="cci-inline-arrow up" title="CCI(25): 1W, 1D, 8H, 4H all below −80 • Oversold alignment, not a trade signal">↑</span>{% endif %}{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
+<a class="saved-fulltrend bull" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bullish trend" title="Open Trend page">🟢 ▲{% if cci_alignments.get((f['symbol'],f['grp'])) == 'BULLISH' %}<span class="cci-inline-arrow up" title="CCI(25): W/D ≤−80, 8H/4H ≤−120, closed green 8H confirmation • Information only">↑</span>{% endif %}{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
 {% elif saved_ts == 'FULL BEARISH' %}
-<a class="saved-fulltrend bear" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bearish trend" title="Open Trend page">🔴 ▼{% if cci_alignments.get((f['symbol'],f['grp'])) == 'BEARISH' %}<span class="cci-inline-arrow down" title="CCI(25): 1W, 1D, 8H, 4H all above +80 • Overbought alignment, not a trade signal">↓</span>{% endif %}{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
+<a class="saved-fulltrend bear" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bearish trend" title="Open Trend page">🔴 ▼{% if cci_alignments.get((f['symbol'],f['grp'])) == 'BEARISH' %}<span class="cci-inline-arrow down" title="CCI(25): W/D ≥+80, 8H/4H ≥+120, closed red 8H confirmation • Information only">↓</span>{% endif %}{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
 {% elif saved_ts.endswith('— MIXED') %}
 <a class="saved-fulltrend trend-mixed-status" href="/trend/{{f['id']}}" title="Weekly and Daily disagree — Open Trend page">⚠️ {{saved_ts}}</a>
 {% elif saved_ts.endswith('— UNCONFIRMED') %}
@@ -8350,21 +8350,17 @@ def aligned_full_trend_status(daily_break_status, weekly_state):
 
 # -------------------------------------------------
 # CCI(25) 4-TIMEFRAME ALIGNMENT — INFORMATION ONLY
-# -------------------------------------------------
-# All FOUR fully closed chart candles must simultaneously be beyond -80
-# (BULLISH / oversold) or +80 (BEARISH / overbought). This is NOT a
-# trend prediction or filter on any EdoSignal pattern. A separate notification
-# with Pushover magic sound is sent only when alignment first becomes valid.
+# Weekly and Daily: +/-80. 8H and 4H: +/-120.
+# 8H must CROSS into its extreme zone and subsequently print at least one
+# fully closed reversal-colour candle while CCI remains in that zone.
+# This is not a separate trade signal and never blocks existing patterns.
 CCI_INLINE_PERIOD = 25
-CCI_INLINE_LEVEL = 80.0
+CCI_INLINE_LEVELS = {"1week": 80.0, "1day": 80.0, "8h": 120.0, "4h": 120.0}
 CCI_INLINE_INTERVALS = ("1week", "1day", "8h", "4h")
 
 
 def cci_latest_value(closed_candles, period=CCI_INLINE_PERIOD):
-    """CCI = (typical price - SMA of typical price) / (0.015 * mean deviation).
-
-    Uses only fully completed candles; a zero mean deviation means no signal.
-    """
+    """CCI based on typical price, using completed candles only."""
     if len(closed_candles or []) < period:
         return None
     typical = [
@@ -8378,9 +8374,52 @@ def cci_latest_value(closed_candles, period=CCI_INLINE_PERIOD):
     return (typical[-1] - average) / (0.015 * deviation)
 
 
+def cci_8h_reversal_confirmed(closed_candles, direction):
+    """Return True if the current 8H extreme has a CLOSED opposite candle.
+
+    Identify the most recent crossing into the still-active CCI extreme.
+    For BUY alignment, a green candle must close AFTER CCI crossed below -120.
+    For SELL alignment, a red candle must close AFTER CCI crossed above +120.
+    A candle that is still forming, or the crossing candle itself, cannot
+    count as the subsequent confirmation.
+    """
+    n = len(closed_candles or [])
+    if n < CCI_INLINE_PERIOD + 2:
+        return False
+    level = CCI_INLINE_LEVELS["8h"]
+    last = cci_latest_value(closed_candles)
+    if last is None:
+        return False
+    in_zone = (lambda v: v <= -level) if direction == "BULLISH" else (lambda v: v >= level)
+    colour = "green" if direction == "BULLISH" else "red"
+    if not in_zone(last):
+        return False
+    # Walk backwards along the continuous overbought/oversold run.
+    # Once the preceding bar is outside the zone, that is the entry crossing.
+    cross_index = None
+    for idx in range(n-1, CCI_INLINE_PERIOD-1, -1):
+        current = cci_latest_value(closed_candles[:idx+1])
+        previous = cci_latest_value(closed_candles[:idx])
+        if current is None or previous is None:
+            break
+        if not in_zone(current):
+            break
+        if not in_zone(previous):
+            cross_index = idx
+            break
+    if cross_index is None:
+        return False
+    # The reversal candle must be later than the CCI threshold crossing.
+    return any(
+        candle_colour(closed_candles[i]) == colour
+        for i in range(cross_index+1, n)
+    )
+
+
 def cci_four_timeframe_state(symbol, grp):
-    """Return BULLISH/BEARISH only when all four closed-bar CCI25 values align."""
-    values = []
+    """Independent alignment: W/D +/-80, 8H/4H +/-120, 8H candle confirmed."""
+    readings = {}
+    eight_closed = []
     for interval in CCI_INLINE_INTERVALS:
         candles, err = get_candles(symbol, interval, outputsize=82, grp=grp)
         if err or not candles:
@@ -8392,11 +8431,13 @@ def cci_four_timeframe_state(symbol, grp):
         value = cci_latest_value(closed)
         if value is None:
             return ""
-        values.append(value)
-    if all(value <= -CCI_INLINE_LEVEL for value in values):
-        return "BULLISH"
-    if all(value >= CCI_INLINE_LEVEL for value in values):
-        return "BEARISH"
+        readings[interval] = value
+        if interval == "8h":
+            eight_closed = closed
+    if all(readings[tf] <= -CCI_INLINE_LEVELS[tf] for tf in CCI_INLINE_INTERVALS):
+        return "BULLISH" if cci_8h_reversal_confirmed(eight_closed, "BULLISH") else ""
+    if all(readings[tf] >= CCI_INLINE_LEVELS[tf] for tf in CCI_INLINE_INTERVALS):
+        return "BEARISH" if cci_8h_reversal_confirmed(eight_closed, "BEARISH") else ""
     return ""
 
 
@@ -8446,8 +8487,8 @@ def update_cci_alignment(symbol, grp, trend_status):
         label = "BULLISH — INLINE" if state == "BULLISH" else "BEARISH — INLINE"
         ok = send_push(
             f"CCI (25) {label}",
-            f"{symbol} • W, D, 8H, 4H all beyond {'−80' if state == 'BULLISH' else '+80'}"
-            "\nCCI alignment only — not a new trade signal.",
+            f"{symbol} • W/D {'≤−80' if state == 'BULLISH' else '≥+80'}; 8H/4H {'≤−120' if state == 'BULLISH' else '≥+120'}"
+            "\nClosed 8H reversal candle confirmed. CCI info only — not a trade signal.",
             sound="magic"
         )
         if not ok:
