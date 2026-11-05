@@ -4439,6 +4439,12 @@ def sr_gap_structure_is_messy(candles, old_i, retest_index, zone_centre, ar, dir
     return side_flips >= 3
 
 
+# User-defined minimum depth for horizontal BUY and SELL Gap Retests.
+# Retrace at least half the previous swing-low-to-high (or high-to-low) move.
+# Keep separate from the 65% closed-candle body confirmation rule.
+SR_HORIZONTAL_GAP_RETEST_MIN_DEPTH_PCT = 50.0
+
+
 def detect_bounce_retest(candles, conf):
     """
     Edo S/R Gap-and-Retest trading rule.
@@ -4452,8 +4458,9 @@ def detect_bounce_retest(candles, conf):
       * The second touch must retrace at least 50% of the move-away distance
         back toward the original S/R level. It may return all the way to, or
         slightly through, the original level.
-      * The opposite-colour confirmation must also satisfy the separate 50%
-        previous-candle BODY rule from sr_confirmation_at().
+      * Horizontal support BUY and resistance SELL retests require a fully
+        closed opposite-colour candle penetrating at least 65% of the previous
+        candle body. Other signal families retain their existing rules.
       * The same S/R level may be tested repeatedly (2nd / 3rd / 4th+). A
         failed earlier test does not retire the level; a later fully closed
         confirmation may qualify when all Gap-Retest rules are satisfied.
@@ -4472,6 +4479,12 @@ def detect_bounce_retest(candles, conf):
 
     ar = avg_range(candles, i + 1, 20)
     if ar <= 0:
+        return None
+
+    # Edo near-level rule for BOTH horizontal support BUY and resistance SELL:
+    # the fully closed opposite-colour candle must recover/reject at least 65%
+    # of the preceding candle body. Diagonal, pullback and Star rules are unchanged.
+    if float(conf.get("penetration", 0.0)) < 65.0:
         return None
 
     # The second touch must be immediately before/around the confirmation.
@@ -4500,9 +4513,11 @@ def detect_bounce_retest(candles, conf):
         confirm_close = float(candles[i]["close"])
         confirm_extreme = float(candles[i]["low"])
 
-    # Same-zone tolerance allows ordinary wick variation while preserving the
-    # distinction between support and resistance.
-    zone_tolerance = max(ar * 0.45, abs(retest_price) * 0.0015)
+    # Both directions permit a NEAR retest, not necessarily an exact touch:
+    # BUY near historical support, SELL near historical resistance. Bound the
+    # allowance to recent volatility / market price so unrelated levels fail.
+    # Existing clean-gap/spike, move-away, depth and target filters still apply.
+    zone_tolerance = max(ar * 0.90, abs(retest_price) * 0.0030)
 
     candidates = []
 
@@ -4556,7 +4571,7 @@ def detect_bounce_retest(candles, conf):
                 continue
             retest_depth_pct = ((retest_price - departure_extreme) / move_distance) * 100.0
 
-        if retest_depth_pct < 50.0:
+        if retest_depth_pct < SR_HORIZONTAL_GAP_RETEST_MIN_DEPTH_PCT:
             continue
 
         zone_centre = (old_price + retest_price) / 2.0
