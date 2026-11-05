@@ -4455,9 +4455,9 @@ def detect_bounce_retest(candles, conf):
         provide the cleaner structural signal instead.
       * Historical HIGH = RESISTANCE only -> bearish/SELL confirmation only.
       * Historical LOW  = SUPPORT only    -> bullish/BUY confirmation only.
-      * The second touch must retrace at least 50% of the move-away distance
-        back toward the original S/R level. It may return all the way to, or
-        slightly through, the original level.
+      * Retest must enter the 50%-to-100% area of the previous swing move;
+        it does not need to touch the original level. A small move beyond the
+        old level is allowed, but a large break is rejected.
       * Horizontal support BUY and resistance SELL retests require a fully
         closed opposite-colour candle penetrating at least 65% of the previous
         candle body. Other signal families retain their existing rules.
@@ -4513,9 +4513,9 @@ def detect_bounce_retest(candles, conf):
         confirm_close = float(candles[i]["close"])
         confirm_extreme = float(candles[i]["low"])
 
-    # Both directions permit a NEAR retest, not necessarily an exact touch:
-    # BUY near historical support, SELL near historical resistance. Bound the
-    # allowance to recent volatility / market price so unrelated levels fail.
+    # Both directions accept a retest inside the LOWER/UPPER HALF of the
+    # previous swing move (50%-100% depth), with a limited overshoot beyond
+    # the old swing price. No exact level touch is needed.
     # Existing clean-gap/spike, move-away, depth and target filters still apply.
     zone_tolerance = max(ar * 0.90, abs(retest_price) * 0.0030)
 
@@ -4528,9 +4528,16 @@ def detect_bounce_retest(candles, conf):
         if separation < 8 or separation > 120:
             continue
 
-        # The second touch must still be in the same broad S/R area. The new
-        # 50%-depth test below determines how deeply price returned toward it.
-        if abs(old_price - retest_price) > zone_tolerance:
+        # Edo's chart-demonstrated retest AREA is the second half of the
+        # preceding swing move: from its 50% retracement to the original swing
+        # support (BUY) or resistance (SELL). The retest need NOT reach the
+        # original price exactly. A modest overshoot beyond the original
+        # level is acceptable, but a materially deeper break is not.
+        # The minimum 50% depth is verified against the actual departure
+        # extreme below, independently of the 65% candle-body confirmation.
+        if direction == "bullish" and retest_price < old_price - zone_tolerance:
+            continue
+        if direction == "bearish" and retest_price > old_price + zone_tolerance:
             continue
 
         # Original level must be a meaningful swing extreme, not a minor pivot.
@@ -4553,9 +4560,10 @@ def detect_bounce_retest(candles, conf):
         if not between:
             continue
 
-        # Price must first move materially AWAY from the original S/R level.
-        # Then the second touch must retrace at least 50% of that move back
-        # toward the original level. A full return is valid too.
+        # Price must first move materially AWAY from the old swing level.
+        # Then the retest must enter the 50%-to-100% retracement area. A full
+        # return or small overshoot beyond the old swing is allowed; a shallow
+        # retracement or excessive level break is not.
         if direction == "bullish":
             departure_extreme = max(float(c["high"]) for c in between)
             move_distance = departure_extreme - old_price
