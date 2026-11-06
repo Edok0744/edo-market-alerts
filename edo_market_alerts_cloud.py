@@ -460,6 +460,7 @@ h2{font-size:18px}
 .saved-fulltrend.bear{background:#4a2028;color:#ff7488}
 .saved-fulltrend.trend-mixed-status{background:#45380f;color:#f2c94c}
 .saved-fulltrend.trend-unconfirmed-status{background:#273341;color:#c5d0da}
+.saved-fulltrend.trend-ranging-status{background:#263b46;color:#7fe4ec;border:1px solid #3f8291}
 /* Real compact animated trend GIF next to saved pair (no additional files). */
 .edo-trend-icon-link{display:inline-flex;align-items:center;justify-content:center;flex:none;width:43px;height:43px;margin-left:3px;vertical-align:middle;border-radius:12px;text-decoration:none;isolation:isolate}
 .edo-trend-icon{display:block;width:40px;height:40px;object-fit:contain;transform-origin:50% 52%;animation:none}
@@ -812,6 +813,8 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 {% elif saved_ts == 'FULL BEARISH' %}
 <a class="edo-trend-icon-link bear" href="/trend/{{f['id']}}" title="FULL BEARISH — Weekly + Daily confirmed. Open Trend page" aria-label="FULL BEARISH: open trend detail"><img class="edo-trend-icon" src="/edo-trend-icon/bear.gif" width="40" height="40" alt="Bearish falling bear" loading="lazy"></a>
 {% if trend_since.get(f['symbol']) %}<span class="edo-trend-since" title="Trend confirmed at">⏳ {{trend_since.get(f['symbol'])}}</span>{% endif %}
+{% elif saved_ts == 'RANGING' %}
+<a class="saved-fulltrend trend-ranging-status" href="/trend/{{f['id']}}" title="Confirmed nearly horizontal range: 2 upper and 2 lower swing touches">↔ RANGING</a>
 {% elif saved_ts.endswith('— MIXED') %}
 <a class="saved-fulltrend trend-mixed-status" href="/trend/{{f['id']}}" title="Weekly and Daily trend disagree">⚠️ {{saved_ts}}</a>
 {% elif saved_ts.endswith('— UNCONFIRMED') %}
@@ -823,7 +826,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 {% elif wd_state == 'BEARISH' and saved_ts != 'FULL BEARISH' %}
 <span class="weekly-daily-inline-arrow down" title="BEARISH — INLINE: Weekly candle body break + Daily retest and bearish close (independent)">↓ BEARISH — INLINE</span>
 {% endif %}
-{% if saved_mixed and not saved_ts.endswith('— MIXED') %}
+{% if saved_mixed and saved_ts != 'RANGING' and not saved_ts.endswith('— MIXED') %}
 <span class="saved-mixed-warning" role="img" aria-label="Mixed trend: Daily {{ saved_daily }}, Weekly {{ saved_weekly }}" title="⚠️ Mixed trend — Daily: {{ saved_daily }}; Weekly: {{ saved_weekly }}">⚠️</span>
 {% endif %}
 </div>
@@ -948,6 +951,8 @@ Target {{m['direction']}} {{m['target']}}
 <div class="fulltrend fullbull">🟢 FULL BULLISH</div>
 {% elif m['triggered'] and ts == 'FULL BEARISH' %}
 <div class="fulltrend fullbear">🔴 FULL BEARISH</div>
+{% elif m['triggered'] and ts == 'RANGING' %}
+<div class="fulltrend" style="color:#7fe4ec">↔ RANGING</div>
 {% elif m['triggered'] and ts and ts.endswith('— MIXED') %}
 <div class="fulltrend fullmixed">⚠️ {{ts}}</div>
 {% elif m['triggered'] and ts and ts.endswith('— UNCONFIRMED') %}
@@ -5413,7 +5418,7 @@ def trend_pullback_retracement_preserves_structure(candles, run_start, confirm_i
 
     return True
 
-def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local_trend=True):
+def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local_trend=True, ranging_context=None):
     """
     Edo Trend Pullback rule — NO 50% penetration requirement.
 
@@ -5482,8 +5487,12 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     # The counter-trend run must remain a retracement.  If it has already
     # broken the pre-pullback swing structure, the old trend is invalidated and
     # the confirmation candle must NOT create a continuation signal.
-    if not trend_pullback_retracement_preserves_structure(
+    if ranging_context is None and not trend_pullback_retracement_preserves_structure(
         candles, run_start, i, required_trend
+    ):
+        return None
+    if ranging_context is not None and not edo_range_pullback_side_ok(
+        ranging_context, direction, confirm_close
     ):
         return None
 
@@ -5508,6 +5517,7 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
         "trend": trend,
         "required_trend": required_trend,
         "normal_local_trend_ok": trend == required_trend,
+        "range_confirmed": bool(ranging_context),
         "context": "trend",
         "target": target,
     }
@@ -6523,7 +6533,7 @@ def weekly_daily_direction_for_filters(symbol, grp):
     states = {'1W': weekly_event['direction'].capitalize() if weekly_event else 'Mixed',
               '1D': direction.capitalize() if direction else 'Mixed',
               'Used': 'Weekly→Daily 65% confirmation',
-              'Market': 'Trending' if direction else 'Ranging'}
+              'Market': ('Trending' if direction else 'Ranging' if status == 'RANGING' else 'Mixed / Wait')}
     return direction, states, None
 
 
@@ -6606,6 +6616,8 @@ def apply_strong_trend_filter(symbol, grp, interval, setups):
             filtered.append(p)
             continue
         if higher_direction is not None and p.get("direction") != higher_direction:
+            continue
+        if higher_direction is None and states.get('Market') != 'Ranging':
             continue
         q = dict(p)
         q["higher_tf_filter"] = True
@@ -6869,12 +6881,36 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    8H is structurally unclear).
     #    Daily / Weekly Trend Pullbacks still require meaningful S/R.
     if pullback_interval_enabled(grp, interval):
+        ranging_context = None
+        try:
+            if interval == '1day':
+                range_daily = closed_candles
+            else:
+                range_daily_raw, range_error = get_candles(symbol,'1day',outputsize=110,grp=grp)
+                range_daily = (fully_closed_candles(range_daily_raw,'1day')
+                               if not range_error and range_daily_raw else [])
+            # Only the Weekly and Daily candles can establish a range.
+            # Smaller charts use these levels solely for qualifying entries.
+            if interval == '1week':
+                weekly_range, weekly_error = candles, None
+            else:
+                weekly_range, weekly_error = get_candles(symbol,'1week',outputsize=100,grp=grp)
+            if not weekly_error and weekly_range and range_daily:
+                range_weekly_closed = weekly_card_completed_candles(weekly_range)
+                candidate_range = edo_weekly_daily_range(range_weekly_closed, range_daily)
+                if candidate_range:
+                    main_status, _, _ = weekly_daily_main_trend_from_candles(weekly_range, range_daily)
+                    if main_status == 'RANGING':
+                        ranging_context = candidate_range
+        except Exception as range_exc:
+            print('Edo confirmed ranging check:',symbol,range_exc,flush=True)
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
                 closed_candles,
                 conf,
                 allow_sr_exception=False,
-                require_local_trend=True
+                require_local_trend=(ranging_context is None),
+                ranging_context=ranging_context
             )
             if not pullback:
                 continue
@@ -6882,7 +6918,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             # Edo rule:
             # 4H is the entry/re-entry pullback and S/R is context only, not a blocker.
             # Daily / Weekly still require meaningful pre-existing S/R.
-            if interval not in ("4h", "8h"):
+            if interval not in ("4h", "8h", "12h"):
                 near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
                     closed_candles, pullback, interval
                 )
@@ -7674,12 +7710,36 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     #    required, but S/R proximity is NOT a mandatory blocker.
     #    Daily / Weekly must still be at/near meaningful S/R.
     if pullback_interval_enabled(grp, interval):
+        ranging_context = None
+        try:
+            if interval == '1day':
+                range_daily = closed_candles
+            else:
+                range_daily_raw, range_error = get_candles(symbol,'1day',outputsize=110,grp=grp)
+                range_daily = (fully_closed_candles(range_daily_raw,'1day')
+                               if not range_error and range_daily_raw else [])
+            # Only the Weekly and Daily candles can establish a range.
+            # Smaller charts use these levels solely for qualifying entries.
+            if interval == '1week':
+                weekly_range, weekly_error = candles, None
+            else:
+                weekly_range, weekly_error = get_candles(symbol,'1week',outputsize=100,grp=grp)
+            if not weekly_error and weekly_range and range_daily:
+                range_weekly_closed = weekly_card_completed_candles(weekly_range)
+                candidate_range = edo_weekly_daily_range(range_weekly_closed, range_daily)
+                if candidate_range:
+                    main_status, _, _ = weekly_daily_main_trend_from_candles(weekly_range, range_daily)
+                    if main_status == 'RANGING':
+                        ranging_context = candidate_range
+        except Exception as range_exc:
+            print('Edo confirmed ranging check:',symbol,range_exc,flush=True)
         for conf in recent_confirmations(closed_candles, lookback=7):
             pullback = detect_trend_pullback(
                 closed_candles,
                 conf,
                 allow_sr_exception=False,
-                require_local_trend=True
+                require_local_trend=(ranging_context is None),
+                ranging_context=ranging_context
             )
             if not pullback:
                 continue
@@ -7687,7 +7747,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             # Edo rule:
             # 4H is the entry/re-entry pullback and S/R is context only, not a blocker.
             # Daily / Weekly still require meaningful pre-existing S/R.
-            if interval not in ("4h", "8h"):
+            if interval not in ("4h", "8h", "12h"):
                 near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
                     closed_candles, pullback, interval
                 )
@@ -8534,6 +8594,92 @@ def update_weekly_daily_alignment(symbol, grp):
             print('Weekly/Daily inline Pushover not accepted:', symbol, flush=True)
 
 
+def edo_confirmed_horizontal_range(closed_daily):
+    """Recognise an existing nearly-horizontal range from COMPLETED Weekly or Daily bars.
+
+    Points 1,2 = TWO previously confirmed swing highs; A,B = TWO previously
+    confirmed swing lows. The newest two pivot highs and lows must be distinct,
+    near-horizontal and approximately parallel. Merely unclear direction is
+    never enough. Uses no forming candles and no future bars to create pivots.
+    """
+    if not closed_daily or len(closed_daily) < 24:
+        return None
+    history = closed_daily[-80:]
+    highs = swing_points(history, 'high', left=2, right=2)
+    lows = swing_points(history, 'low', left=2, right=2)
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+    (h1, top1), (h2, top2) = highs[-2:]
+    (l1, bot1), (l2, bot2) = lows[-2:]
+    if h2-h1 < 4 or l2-l1 < 4:
+        return None
+    if max(h1,l1) >= min(h2,l2):
+        # Both older anchors should exist before the newest boundary tests;
+        # crossings of the two lines are otherwise poorly established.
+        return None
+    if min(h2,l2) < len(history)-38:
+        return None
+    upper = (float(top1) + float(top2))/2.0
+    lower = (float(bot1) + float(bot2))/2.0
+    width = upper-lower
+    atr = avg_range(history, end=len(history), length=20)
+    if width <= 0 or atr <= 0 or width < 2.0*atr:
+        return None
+    # A range may have a gentle slope, never a clearly sloping channel.
+    upper_delta = float(top2)-float(top1)
+    lower_delta = float(bot2)-float(bot1)
+    if abs(upper_delta) > width*0.20 or abs(lower_delta) > width*0.20:
+        return None
+    if abs(upper_delta-lower_delta) > width*0.15:
+        return None
+    # Two nearly parallel lines must keep a reasonable separation at their
+    # existing endpoints, even when their test candles differ.
+    if min(float(top1),float(top2))-max(float(bot1),float(bot2)) < width*0.58:
+        return None
+    # No established breakout: completed closes must respect the boundaries.
+    breakout_margin = min(width*0.12, atr*0.45)
+    recent = history[max(h2,l2)+1:]
+    if not recent:
+        recent = history[-3:]
+    if any(float(c['close']) > upper+breakout_margin or
+           float(c['close']) < lower-breakout_margin for c in recent):
+        return None
+    if not lower-breakout_margin <= float(history[-1]['close']) <= upper+breakout_margin:
+        return None
+    return {'upper':upper,'lower':lower,'width':width,
+            'high_points':(h1,h2),'low_points':(l1,l2),
+            'atr':atr, 'market':'RANGING'}
+
+
+def edo_weekly_daily_range(weekly_closed, daily_closed):
+    """Only completed WEEKLY or DAILY candles may establish RANGING.
+
+    Prefer the more actionable Daily boundary when both qualify; do not use
+    an 8H, 12H, 4H, 3H or Monthly chart to derive a range classification.
+    """
+    daily_range = edo_confirmed_horizontal_range(daily_closed)
+    if daily_range:
+        return dict(daily_range, source_interval='1day')
+    weekly_range = edo_confirmed_horizontal_range(weekly_closed)
+    if weekly_range:
+        return dict(weekly_range, source_interval='1week')
+    return None
+
+
+def edo_range_pullback_side_ok(range_info, direction, close):
+    """A ranging BUY belongs near support, SELL near resistance, not midrange."""
+    if not range_info:
+        return False
+    upper,lower,width = range_info['upper'],range_info['lower'],range_info['width']
+    tolerance = min(width*0.32, max(range_info['atr']*1.1,width*0.14))
+    close = float(close)
+    if direction == 'bullish':
+        return lower-width*0.12 <= close <= lower+tolerance
+    if direction == 'bearish':
+        return upper-tolerance <= close <= upper+width*0.12
+    return False
+
+
 def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
     """Edo's ONE main trend method: latest Weekly body break + Daily confirmation.
 
@@ -8549,16 +8695,16 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
     daily_closed = fully_closed_candles(daily, '1day', now_utc=now_utc)
     weekly_event = weekly_daily_inline_event(weekly_closed)
     if weekly_event is None or len(daily_closed) < 5:
-        return 'MIXED / WAIT', None, weekly_event
+        return ('RANGING' if edo_weekly_daily_range(weekly_closed, daily_closed) else 'MIXED / WAIT'), None, weekly_event
     direction, level, confirmed_at = weekly_daily_inline_from_candles(
         weekly, daily, now_utc=now_utc)
     if direction != weekly_event['direction'] or confirmed_at is None:
-        return 'MIXED / WAIT', None, weekly_event
+        return ('RANGING' if edo_weekly_daily_range(weekly_closed, daily_closed) else 'MIXED / WAIT'), None, weekly_event
     # Find actual fully closed Daily confirmation to save its REAL timestamp.
     confirmation = next((c for c in reversed(daily_closed)
                          if parse_candle_utc(c.get('datetime')) == parse_candle_utc(confirmed_at)), None)
     if confirmation is None:
-        return 'MIXED / WAIT', None, weekly_event
+        return ('RANGING' if edo_weekly_daily_range(weekly_closed, daily_closed) else 'MIXED / WAIT'), None, weekly_event
     status = 'FULL BULLISH' if direction == 'BULLISH' else 'FULL BEARISH'
     return status, {'break_candle': confirmation, 'level': level,
                     'level_method': '1day', 'weekly_event': weekly_event}, weekly_event
