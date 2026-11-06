@@ -55,6 +55,9 @@ READY_PUSH_SOUND = os.environ.get('READY_PUSH_SOUND', 'siren')
 # "growl", so use its low, growling-style "alien" alert by default.
 # Railway can override this with TRAILING_STOP_PUSH_SOUND if Edo prefers another.
 TRAILING_STOP_PUSH_SOUND = os.environ.get('TRAILING_STOP_PUSH_SOUND', 'alien')
+# Same unique sound for new confirmed FULL BULLISH or FULL BEARISH trends.
+# Set TREND_DIRECTION_PUSH_SOUND in Railway to change it without editing code.
+TREND_DIRECTION_PUSH_SOUND = os.environ.get('TREND_DIRECTION_PUSH_SOUND', 'cosmic')
 
 # Edo Major News filter: Forex Factory can label events High even when they
 # are not normally the kind of release Edo wants to stop new entries for.
@@ -8589,7 +8592,7 @@ def update_weekly_daily_alignment(symbol, grp):
         label = 'BULLISH — INLINE' if state == 'BULLISH' else 'BEARISH — INLINE'
         ok = send_push(f'{label} • Weekly/Daily',
                        f'{symbol} • Main trend: Weekly body breakout + Daily 65% confirmation at {level:.5f}.',
-                       sound='magic')
+                       sound=TREND_DIRECTION_PUSH_SOUND)
         if not ok:
             print('Weekly/Daily inline Pushover not accepted:', symbol, flush=True)
 
