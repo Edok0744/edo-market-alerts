@@ -8416,7 +8416,8 @@ def aligned_full_trend_status(daily_break_status, weekly_state):
 # 2) That prior body boundary becomes the horizontal Weekly trigger line.
 # 3) AFTER that Weekly confirmation, Daily returns into the vicinity of
 #    the line and prints a fully closed opposite-colour confirming candle
-#    that closes past BOTH the previous Daily body and the Weekly line.
+#    that closes at least 65% through the previous Daily body AND beyond
+#    BOTH the previous Daily body boundary and Weekly line.
 # No forming candles, no retrospective confirmation before a Weekly close.
 # -------------------------------------------------
 
@@ -8475,13 +8476,24 @@ def weekly_daily_inline_from_candles(weekly, daily, now_utc=None):
         prev, curr = after[i-1], after[i]
         prev_top = max(float(prev['open']), float(prev['close']))
         prev_bottom = min(float(prev['open']), float(prev['close']))
+        previous_body = prev_top - prev_bottom
+        if previous_body <= 0:
+            continue
+        # Edo's Daily confirmation: the first opposite-colour candle must
+        # recover/reject at least 65% of the previous candle's REAL body.
+        # It must also CLOSE beyond the entire previous body and Weekly level,
+        # as illustrated in the live chart example (not a wick-only break).
         if direction == 'BULLISH':
             retest = float(prev['low']) <= level + tolerance and float(prev['low']) >= level - max(ar * 1.25, tolerance)
+            body_recovered_pct = 100.0 * (float(curr['close']) - prev_bottom) / previous_body
             valid = (candle_colour(prev) == 'red' and candle_colour(curr) == 'green'
+                     and body_recovered_pct >= 65.0
                      and float(curr['close']) > max(level, prev_top) and retest)
         else:
             retest = float(prev['high']) >= level - tolerance and float(prev['high']) <= level + max(ar * 1.25, tolerance)
+            body_rejected_pct = 100.0 * (prev_top - float(curr['close'])) / previous_body
             valid = (candle_colour(prev) == 'green' and candle_colour(curr) == 'red'
+                     and body_rejected_pct >= 65.0
                      and float(curr['close']) < min(level, prev_bottom) and retest)
         if valid:
             confirmation = curr
