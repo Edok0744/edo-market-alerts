@@ -7355,8 +7355,28 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 )
                 return
 
-    # Never turn an old candle into a "new" push just because Railway restarted.
+    # TIMELY ALERT SAFEGUARD (all automatic pattern families): Never describe
+    # a setup discovered hours after its expected candle close as a NEW alert.
+    # FXCM-native timestamps are broker session labels; the existing
+    # pattern_candle_close_utc interpretation is retained rather than
+    # guessing a new broker candle boundary here. Validate exact FXCM session
+    # alignment separately against the Railway candle helper.
     close_utc = pattern_candle_close_utc(latest_closed_date, interval)
+    maximum_alert_lag_seconds = {
+        "3h": 2 * 3600, "4h": 2 * 3600, "8h": 2 * 3600,
+        "12h": 2 * 3600, "1day": 2 * 3600,
+        "1week": 6 * 3600, "1month": 12 * 3600,
+    }.get(interval, 2 * 3600)
+    if close_utc is not None:
+        actual_lag = (datetime.now(timezone.utc) - close_utc).total_seconds()
+        if actual_lag > maximum_alert_lag_seconds:
+            _save_pattern_monitor_baseline(grp, symbol, interval, latest_closed_date)
+            print('late pattern push suppressed', grp, symbol, interval,
+                  latest_closed_date, 'lag_minutes', int(actual_lag / 60),
+                  flush=True)
+            return
+
+    # Never turn an old candle into a "new" push just because Railway restarted.
     if close_utc is not None and close_utc <= PROCESS_STARTED_UTC:
         _save_pattern_monitor_baseline(
             grp, symbol, interval, latest_closed_date
@@ -7902,29 +7922,33 @@ def pattern_signal_monitor():
     Protection:
       - manual_api_priority_active() always wins
       - only ONE background API job is processed at a time
-      - 20-second gap between background jobs
+      - 3-second gap between background jobs
       - each symbol/timeframe is checked only when its due interval expires
 
     Check cadence per saved market:
-      4H     every 15 minutes
-      8H     every 20 minutes
-      Daily  every 60 minutes
-      Weekly every 6 hours
+      3H/4H/8H/12H  every 10 minutes
+      Daily           every 10 minutes
+      Weekly          every 45 minutes
+      Monthly         every 3 hours
 
     These are scan frequencies only. Signals still require a NEW fully CLOSED
     candle, so repeated scans cannot create duplicate signals.
     """
-    time.sleep(180)
+    # Start promptly after deployment; the persistent baseline/restart rules
+    # below still prevent replaying old candle alerts.
+    time.sleep(15)
 
+    # Check more often after candle closes without altering ANY pattern rules.
+    # One API job at a time still protects the FXCM/Bybit services.
     due_seconds = {
-        "1h": 15 * 60,
-        "3h": 20 * 60,
-        "4h": 15 * 60,
-        "8h": 20 * 60,
-        "12h": 20 * 60,
-        "1day": 60 * 60,
-        "1week": 6 * 60 * 60,
-        "1month": 12 * 60 * 60,
+        "1h": 15 * 60,  # raw hourly data is never a trading signal
+        "3h": 10 * 60,
+        "4h": 10 * 60,
+        "8h": 10 * 60,
+        "12h": 10 * 60,
+        "1day": 10 * 60,
+        "1week": 45 * 60,
+        "1month": 3 * 60 * 60,
     }
 
     last_checked = {}
@@ -7958,6 +7982,14 @@ def pattern_signal_monitor():
                     if interval == "8h" and grp == "CRYPTO":
                         continue
                     if interval == "1month" and grp not in {"FOREX", "CRYPTO"}:
+                        continue
+                    # Do not waste the serial scan queue on timeframe/group
+                    # combinations that have NO active signal family.
+                    if not (pullback_interval_enabled(grp, interval)
+                            or sr_gap_retest_interval_enabled(grp, interval)
+                            or interval in STAR_PATTERN_INTERVALS
+                            or (interval == "1day" and grp == "FOREX"
+                                and symbol.upper() == "AUD/USD")):
                         continue
                     key = (grp, symbol, interval)
                     previous = last_checked.get(key, 0.0)
@@ -8023,8 +8055,10 @@ def pattern_signal_monitor():
         except Exception as e:
             print("pattern signal monitor error", e)
 
-        # Important Grow-55 safety / UI-responsiveness gap.
-        time.sleep(20)
+        # Small yield between API requests. Previous 20-second gap multiplied
+        # across all saved markets could delay Daily notifications for hours.
+        # Manual pages still take priority above and API work stays serial.
+        time.sleep(3)
 
 
 def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
