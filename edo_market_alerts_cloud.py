@@ -237,7 +237,7 @@ _HOME_PAGE_CACHE = {
     "trend_statuses": {},
     "trend_since": {},
     "trend_snapshots": {},
-    "cci_alignments": {},
+    "weekly_daily_alignments": {},
 }
 _HOME_PAGE_CACHE_LOCK = threading.Lock()
 
@@ -260,9 +260,8 @@ def edo_home_trend_refresh_worker():
                 status, error = build_full_alignment(symbol, grp)
                 if not error and status:
                     save_trend_status(symbol, status)
-                    # Independent, information-only CCI25 alignment badge.
-                    # Errors clear the arrow rather than showing stale alignment.
-                    update_cci_alignment(symbol, grp, status)
+                    # Independent Weekly-to-Daily reversal arrow (never changes FULL trend).
+                    update_weekly_daily_alignment(symbol, grp)
                 elif error:
                     print('home-open trend refresh:', symbol, error, flush=True)
             except Exception as exc:
@@ -446,10 +445,10 @@ h2{font-size:18px}
 .saved-fulltrend.trend-mixed-status{background:#45380f;color:#f2c94c}
 .saved-fulltrend.trend-unconfirmed-status{background:#273341;color:#c5d0da}
 .saved-mixed-warning{display:inline-block;margin-left:6px;font-size:20px;vertical-align:middle;cursor:help}
-/* A small CCI arrow is shown only beside matching FULL trend badges. */
-.cci-inline-arrow{margin-left:5px;font-size:15px;font-weight:900;vertical-align:middle}
-.cci-inline-arrow.up{color:#53dfce}
-.cci-inline-arrow.down{color:#ffae65}
+/* Independent Weekly -> Daily reversal arrow; no CCI or FULL trend dependency. */
+.weekly-daily-inline-arrow{margin-left:5px;font-size:15px;font-weight:900;vertical-align:middle}
+.weekly-daily-inline-arrow.up{color:#53dfce}
+.weekly-daily-inline-arrow.down{color:#ffae65}
 
 .alerttrend{
     margin-top:10px;
@@ -781,13 +780,19 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 {% set saved_daily = saved_snap.get('Daily', '') %}
 {% set saved_mixed = saved_weekly in ('Bullish', 'Bearish') and saved_daily in ('Bullish', 'Bearish') and saved_weekly != saved_daily %}
 {% if saved_ts == 'FULL BULLISH' %}
-<a class="saved-fulltrend bull" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bullish trend" title="Open Trend page">🟢 ▲{% if cci_alignments.get((f['symbol'],f['grp'])) == 'BULLISH' %}<span class="cci-inline-arrow up" title="CCI(25): W/D ≤−80, 8H/4H ≤−120, closed green 8H confirmation • Information only">↑</span>{% endif %}{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
+<a class="saved-fulltrend bull" href="/trend/{{f['id']}}" title="Open Trend page">🟢 ▲{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{trend_since.get(f['symbol'])}}{% endif %}</a>
 {% elif saved_ts == 'FULL BEARISH' %}
-<a class="saved-fulltrend bear" href="/trend/{{f['id']}}" aria-label="Open {{f['symbol']}} Full Bearish trend" title="Open Trend page">🔴 ▼{% if cci_alignments.get((f['symbol'],f['grp'])) == 'BEARISH' %}<span class="cci-inline-arrow down" title="CCI(25): W/D ≥+80, 8H/4H ≥+120, closed red 8H confirmation • Information only">↓</span>{% endif %}{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{ trend_since.get(f['symbol']) }}{% endif %}</a>
+<a class="saved-fulltrend bear" href="/trend/{{f['id']}}" title="Open Trend page">🔴 ▼{% if trend_since.get(f['symbol']) %} &nbsp;⏳ {{trend_since.get(f['symbol'])}}{% endif %}</a>
 {% elif saved_ts.endswith('— MIXED') %}
-<a class="saved-fulltrend trend-mixed-status" href="/trend/{{f['id']}}" title="Weekly and Daily disagree — Open Trend page">⚠️ {{saved_ts}}</a>
+<a class="saved-fulltrend trend-mixed-status" href="/trend/{{f['id']}}" title="Weekly and Daily trend disagree">⚠️ {{saved_ts}}</a>
 {% elif saved_ts.endswith('— UNCONFIRMED') %}
-<a class="saved-fulltrend trend-unconfirmed-status" href="/trend/{{f['id']}}" title="Weekly direction unconfirmed — Open Trend page">{{saved_ts}}</a>
+<a class="saved-fulltrend trend-unconfirmed-status" href="/trend/{{f['id']}}" title="Weekly direction unconfirmed">{{saved_ts}}</a>
+{% endif %}
+{% set wd_state = weekly_daily_alignments.get((f['symbol'], f['grp']), '') %}
+{% if wd_state == 'BULLISH' %}
+<span class="weekly-daily-inline-arrow up" title="BULLISH — INLINE: Weekly candle body break + Daily retest and bullish close (independent)">↑ BULLISH — INLINE</span>
+{% elif wd_state == 'BEARISH' %}
+<span class="weekly-daily-inline-arrow down" title="BEARISH — INLINE: Weekly candle body break + Daily retest and bearish close (independent)">↓ BEARISH — INLINE</span>
 {% endif %}
 {% if saved_mixed and not saved_ts.endswith('— MIXED') %}
 <span class="saved-mixed-warning" role="img" aria-label="Mixed trend: Daily {{ saved_daily }}, Weekly {{ saved_weekly }}" title="⚠️ Mixed trend — Daily: {{ saved_daily }}; Weekly: {{ saved_weekly }}">⚠️</span>
@@ -1654,19 +1659,17 @@ def init_db():
             print("SQLite WAL setup warning:", e)
 
 
-        # Information-only CCI alignment; no effect on trading signals/alerts.
-        c.execute("""CREATE TABLE IF NOT EXISTS cci_alignment (
+        # Independent Weekly -> Daily reversal arrows. Old CCI tables are kept
+        # untouched for safe rollback, but no CCI calculations or alerts run.
+        c.execute("""CREATE TABLE IF NOT EXISTS weekly_daily_inline (
             symbol TEXT NOT NULL, grp TEXT NOT NULL,
-            state TEXT NOT NULL DEFAULT '', updated TEXT,
-            PRIMARY KEY(symbol, grp)
+            state TEXT NOT NULL DEFAULT '', level REAL, confirmed_at TEXT,
+            updated TEXT, PRIMARY KEY(symbol,grp)
         )""")
-
-        # One CCI sound per pair/direction/day; separate from trade alerts.
-        c.execute("""CREATE TABLE IF NOT EXISTS cci_inline_sound_log (
-            symbol TEXT NOT NULL, grp TEXT NOT NULL,
-            direction TEXT NOT NULL, perth_day TEXT NOT NULL,
-            sent_at TEXT NOT NULL,
-            PRIMARY KEY(symbol,grp,direction,perth_day)
+        c.execute("""CREATE TABLE IF NOT EXISTS weekly_daily_inline_sound_log (
+            symbol TEXT NOT NULL, grp TEXT NOT NULL, direction TEXT NOT NULL,
+            event_key TEXT NOT NULL, sent_at TEXT NOT NULL,
+            PRIMARY KEY(symbol,grp,direction,event_key)
         )""")
 
         # Diagnostic-only scanner history (persistent through Railway redeploys).
@@ -8406,151 +8409,137 @@ def aligned_full_trend_status(daily_break_status, weekly_state):
 
 
 # -------------------------------------------------
-# CCI(25) 4-TIMEFRAME ALIGNMENT — INFORMATION ONLY
-# Weekly and Daily: +/-80. 8H and 4H: +/-120.
-# 8H must CROSS into its extreme zone and subsequently print at least one
-# fully closed reversal-colour candle while CCI remains in that zone.
-# This is not a separate trade signal and never blocks existing patterns.
-CCI_INLINE_PERIOD = 25
-CCI_INLINE_LEVELS = {"1week": 80.0, "1day": 80.0, "8h": 120.0, "4h": 120.0}
-CCI_INLINE_INTERVALS = ("1week", "1day", "8h", "4h")
+# WEEKLY -> DAILY BODY-BREAK / RETEST ALIGNMENT (INFORMATION ONLY)
+# Replaces CCI arrows. Entirely independent of FULL trend and trading signals.
+# 1) First fully closed Weekly opposite-colour reversal candle CLOSES past
+#    the prior Weekly candle's body top (bull) or body bottom (bear).
+# 2) That prior body boundary becomes the horizontal Weekly trigger line.
+# 3) AFTER that Weekly confirmation, Daily returns into the vicinity of
+#    the line and prints a fully closed opposite-colour confirming candle
+#    that closes past BOTH the previous Daily body and the Weekly line.
+# No forming candles, no retrospective confirmation before a Weekly close.
+# -------------------------------------------------
 
 
-def cci_latest_value(closed_candles, period=CCI_INLINE_PERIOD):
-    """CCI based on typical price, using completed candles only."""
-    if len(closed_candles or []) < period:
+def weekly_daily_inline_event(closed_weekly):
+    """Newest confirmed Weekly reversal; price level is prior body's edge."""
+    if not closed_weekly or len(closed_weekly) < 3:
         return None
-    typical = [
-        (float(c["high"]) + float(c["low"]) + float(c["close"])) / 3.0
-        for c in closed_candles[-period:]
-    ]
-    average = sum(typical) / period
-    deviation = sum(abs(v - average) for v in typical) / period
-    if deviation <= 1e-15:
-        return None
-    return (typical[-1] - average) / (0.015 * deviation)
-
-
-def cci_8h_reversal_confirmed(closed_candles, direction):
-    """Return True if the current 8H extreme has a CLOSED opposite candle.
-
-    Identify the most recent crossing into the still-active CCI extreme.
-    For BUY alignment, a green candle must close AFTER CCI crossed below -120.
-    For SELL alignment, a red candle must close AFTER CCI crossed above +120.
-    A candle that is still forming, or the crossing candle itself, cannot
-    count as the subsequent confirmation.
-    """
-    n = len(closed_candles or [])
-    if n < CCI_INLINE_PERIOD + 2:
-        return False
-    level = CCI_INLINE_LEVELS["8h"]
-    last = cci_latest_value(closed_candles)
-    if last is None:
-        return False
-    in_zone = (lambda v: v <= -level) if direction == "BULLISH" else (lambda v: v >= level)
-    colour = "green" if direction == "BULLISH" else "red"
-    if not in_zone(last):
-        return False
-    # Walk backwards along the continuous overbought/oversold run.
-    # Once the preceding bar is outside the zone, that is the entry crossing.
-    cross_index = None
-    for idx in range(n-1, CCI_INLINE_PERIOD-1, -1):
-        current = cci_latest_value(closed_candles[:idx+1])
-        previous = cci_latest_value(closed_candles[:idx])
-        if current is None or previous is None:
-            break
-        if not in_zone(current):
-            break
-        if not in_zone(previous):
-            cross_index = idx
-            break
-    if cross_index is None:
-        return False
-    # The reversal candle must be later than the CCI threshold crossing.
-    return any(
-        candle_colour(closed_candles[i]) == colour
-        for i in range(cross_index+1, n)
-    )
-
-
-def cci_four_timeframe_state(symbol, grp):
-    """Independent alignment: W/D +/-80, 8H/4H +/-120, 8H candle confirmed."""
-    readings = {}
-    eight_closed = []
-    for interval in CCI_INLINE_INTERVALS:
-        candles, err = get_candles(symbol, interval, outputsize=82, grp=grp)
-        if err or not candles:
-            return ""
-        if interval == "1week":
-            closed = weekly_card_completed_candles(candles)
+    for i in range(len(closed_weekly) - 1, max(0, len(closed_weekly)-16), -1):
+        prev, curr = closed_weekly[i-1], closed_weekly[i]
+        previous_top = max(float(prev['open']), float(prev['close']))
+        previous_bottom = min(float(prev['open']), float(prev['close']))
+        prev_colour, curr_colour = candle_colour(prev), candle_colour(curr)
+        if prev_colour == 'red' and curr_colour == 'green' and float(curr['close']) > previous_top:
+            direction, level = 'BULLISH', previous_top
+        elif prev_colour == 'green' and curr_colour == 'red' and float(curr['close']) < previous_bottom:
+            direction, level = 'BEARISH', previous_bottom
         else:
-            closed = fully_closed_candles(candles, interval)
-        value = cci_latest_value(closed)
-        if value is None:
-            return ""
-        readings[interval] = value
-        if interval == "8h":
-            eight_closed = closed
-    if all(readings[tf] <= -CCI_INLINE_LEVELS[tf] for tf in CCI_INLINE_INTERVALS):
-        return "BULLISH" if cci_8h_reversal_confirmed(eight_closed, "BULLISH") else ""
-    if all(readings[tf] >= CCI_INLINE_LEVELS[tf] for tf in CCI_INLINE_INTERVALS):
-        return "BEARISH" if cci_8h_reversal_confirmed(eight_closed, "BEARISH") else ""
-    return ""
+            continue
+        start = parse_candle_utc(curr.get('datetime'))
+        if start is None:
+            continue
+        return {'direction': direction, 'level': level,
+                'weekly_closed_at': start + timedelta(days=7),
+                'weekly_start': start}
+    return None
 
 
-def update_cci_alignment(symbol, grp, trend_status):
-    """Update the independent CCI arrow and alert only on new valid alignment.
+def weekly_daily_inline_from_candles(weekly, daily, now_utc=None):
+    """Pure signal check for an already downloaded pair of candle histories.
 
-    A missing/unavailable market feed hides the arrow. New-install baselines
-    never send a historical notification; actual changes after that can alert.
-    Pushover offers no custom WIZZ sound: 'magic' is the closest available.
+    An arrow is a recent, *confirmed* Weekly-level/Daily-retest event; it is
+    not a forecast, never influences FULL or any entry pattern, and expires if
+    the Daily price closes back across the level or the setup gets too old.
     """
-    state = ""
-    if trend_status in ("FULL BULLISH", "FULL BEARISH"):
-        try:
-            candidate = cci_four_timeframe_state(symbol, grp)
-            if (trend_status == "FULL BULLISH" and candidate == "BULLISH") or (
-                trend_status == "FULL BEARISH" and candidate == "BEARISH"
-            ):
-                state = candidate
-        except Exception as exc:
-            print("CCI alignment check:", symbol, exc, flush=True)
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    w_closed = weekly_card_completed_candles(weekly, now_utc=now_utc)
+    d_closed = fully_closed_candles(daily, '1day', now_utc=now_utc)
+    event = weekly_daily_inline_event(w_closed)
+    if not event or len(d_closed) < 5:
+        return '', None, None
+    direction, level = event['direction'], event['level']
+    after = []
+    for c in d_closed:
+        dt = parse_candle_utc(c.get('datetime'))
+        if dt is not None and dt >= event['weekly_closed_at']:
+            after.append(c)
+    if len(after) < 2:
+        return '', None, None
+    # A line may be approached rather than touched to the exact pip.
+    ar = avg_range(d_closed, end=len(d_closed), length=20)
+    tolerance = max(ar * 0.35, abs(level) * 0.00035)
+    confirmation = None
+    for i in range(1, len(after)):
+        prev, curr = after[i-1], after[i]
+        prev_top = max(float(prev['open']), float(prev['close']))
+        prev_bottom = min(float(prev['open']), float(prev['close']))
+        if direction == 'BULLISH':
+            retest = float(prev['low']) <= level + tolerance and float(prev['low']) >= level - max(ar * 1.25, tolerance)
+            valid = (candle_colour(prev) == 'red' and candle_colour(curr) == 'green'
+                     and float(curr['close']) > max(level, prev_top) and retest)
+        else:
+            retest = float(prev['high']) >= level - tolerance and float(prev['high']) <= level + max(ar * 1.25, tolerance)
+            valid = (candle_colour(prev) == 'green' and candle_colour(curr) == 'red'
+                     and float(curr['close']) < min(level, prev_bottom) and retest)
+        if valid:
+            confirmation = curr
+    if confirmation is None:
+        return '', None, None
+    confirm_start = parse_candle_utc(confirmation.get('datetime'))
+    if confirm_start is None:
+        return '', None, None
+    # Keep the arrow only for a recent Daily confirmation, and only while
+    # the latest completed Daily close remains on the confirmed side.
+    if now_utc - (confirm_start + timedelta(days=1)) > timedelta(days=7):
+        return '', None, None
+    latest_close = float(d_closed[-1]['close'])
+    if (direction == 'BULLISH' and latest_close <= level) or (direction == 'BEARISH' and latest_close >= level):
+        return '', None, None
+    return direction, level, confirm_start.isoformat()
 
-    should_alert = False
+
+def update_weekly_daily_alignment(symbol, grp):
+    """Save independent arrows, alert only when a fresh new valid event appears."""
+    state, level, confirmed_at = '', None, None
     try:
-        with db_conn() as c:
-            old = c.execute(
-                "SELECT state FROM cci_alignment WHERE symbol=? AND grp=?",
-                (symbol, grp)
-            ).fetchone()
-            c.execute("""INSERT INTO cci_alignment(symbol,grp,state,updated)
-                VALUES(?,?,?,?) ON CONFLICT(symbol,grp) DO UPDATE SET
-                state=excluded.state, updated=excluded.updated""",
-                (symbol, grp, state, datetime.now(timezone.utc).isoformat()))
-            # Only a NEW valid alignment sounds; never on first installation,
-            # unchanged scans, or disappearing arrows. At most once per day.
-            if old is not None and old['state'] != state and state:
-                perth_day = datetime.now(ZoneInfo("Australia/Perth")).date().isoformat()
-                cur = c.execute("""INSERT OR IGNORE INTO cci_inline_sound_log
-                    (symbol,grp,direction,perth_day,sent_at) VALUES(?,?,?,?,?)""",
-                    (symbol, grp, state, perth_day, datetime.now(timezone.utc).isoformat()))
-                should_alert = cur.rowcount == 1
-            c.commit()
+        weekly, we = get_candles(symbol, '1week', outputsize=100, grp=grp)
+        daily, de = get_candles(symbol, '1day', outputsize=100, grp=grp)
+        if we or de or not weekly or not daily:
+            print('Weekly/Daily inline feed:', symbol, we or de, flush=True)
+            return   # Do not overwrite last known status on transient feed outage.
+        state, level, confirmed_at = weekly_daily_inline_from_candles(weekly, daily)
     except Exception as exc:
-        print("CCI alignment save:", symbol, exc, flush=True)
+        print('Weekly/Daily inline check:', symbol, exc, flush=True)
         return
-
+    should_alert = False
+    with db_conn() as c:
+        prior = c.execute('SELECT state,confirmed_at FROM weekly_daily_inline WHERE symbol=? AND grp=?',
+                          (symbol, grp)).fetchone()
+        c.execute("""INSERT INTO weekly_daily_inline(symbol,grp,state,level,confirmed_at,updated)
+                     VALUES(?,?,?,?,?,?) ON CONFLICT(symbol,grp) DO UPDATE SET
+                     state=excluded.state, level=excluded.level,
+                     confirmed_at=excluded.confirmed_at, updated=excluded.updated""",
+                  (symbol, grp, state, level, confirmed_at, datetime.now(timezone.utc).isoformat()))
+        # First deployment creates a baseline; do not announce historic signals.
+        if prior is not None and state and (prior['state'] != state or prior['confirmed_at'] != confirmed_at):
+            confirmed_dt = parse_candle_utc(confirmed_at)
+            # Pushover only for genuinely recent closes, not backlog/redeployment.
+            if confirmed_dt and datetime.now(timezone.utc) - (confirmed_dt + timedelta(days=1)) <= timedelta(hours=12):
+                key = f'{state}|{confirmed_at}'
+                inserted = c.execute("""INSERT OR IGNORE INTO weekly_daily_inline_sound_log
+                    (symbol,grp,direction,event_key,sent_at) VALUES(?,?,?,?,?)""",
+                    (symbol,grp,state,key,datetime.now(timezone.utc).isoformat()))
+                should_alert = inserted.rowcount == 1
+        c.commit()
     if should_alert:
-        label = "BULLISH — INLINE" if state == "BULLISH" else "BEARISH — INLINE"
-        ok = send_push(
-            f"CCI (25) {label}",
-            f"{symbol} • W/D {'≤−80' if state == 'BULLISH' else '≥+80'}; 8H/4H {'≤−120' if state == 'BULLISH' else '≥+120'}"
-            "\nClosed 8H reversal candle confirmed. CCI info only — not a trade signal.",
-            sound="magic"
-        )
+        label = 'BULLISH — INLINE' if state == 'BULLISH' else 'BEARISH — INLINE'
+        ok = send_push(f'{label} • Weekly/Daily',
+                       f'{symbol} • Weekly body breakout + Daily retest confirmed at {level:.5f}. Information only.',
+                       sound='magic')
         if not ok:
-            print("CCI inline sound not accepted by Pushover:", symbol, state, flush=True)
-
+            print('Weekly/Daily inline Pushover not accepted:', symbol, flush=True)
 
 
 def build_full_alignment(symbol, grp=None):
@@ -8700,21 +8689,21 @@ def active_trend_monitor():
                     # does not erase the previously processed trend state.
                     previous = save_trend_status(symbol, status)
 
-                    # Independent CCI info badge: refresh each pair at most
+                    # Independent Weekly/Daily reversal arrow; refresh at most
                     # every 30 minutes to protect broker/API rate limits.
                     try:
                         with db_conn() as c:
                             last_row = c.execute(
-                                'SELECT updated FROM cci_alignment WHERE symbol=? AND grp=?',
+                                'SELECT updated FROM weekly_daily_inline WHERE symbol=? AND grp=?',
                                 (symbol, grp)
                             ).fetchone()
                         last_dt = parse_candle_utc(last_row['updated']) if last_row else None
                         due = (last_dt is None or
                                (datetime.now(timezone.utc) - last_dt).total_seconds() >= 1800)
                         if due:
-                            update_cci_alignment(symbol, grp, status)
-                    except Exception as cci_exc:
-                        print('CCI monitor:', symbol, cci_exc, flush=True)
+                            update_weekly_daily_alignment(symbol, grp)
+                    except Exception as inline_exc:
+                        print('Weekly/Daily inline monitor:', symbol, inline_exc, flush=True)
 
                     # FULL TREND is now a dashboard indicator only.
                     # Keep the persistent state fresh for Saved Pairs / Trend pages,
@@ -9941,10 +9930,10 @@ def home():
                 'SELECT symbol,status,updated FROM trend_status'
             ).fetchall()
 
-            cci_rows = c.execute(
-                'SELECT symbol,grp,state FROM cci_alignment'
+            inline_rows = c.execute(
+                'SELECT symbol,grp,state FROM weekly_daily_inline'
             ).fetchall()
-            cci_alignments = {(r['symbol'], r['grp']): r['state'] for r in cci_rows}
+            weekly_daily_alignments = {(r['symbol'], r['grp']): r['state'] for r in inline_rows}
 
             trend_statuses = {
                 r['symbol']: r['status']
@@ -9980,7 +9969,7 @@ def home():
             _HOME_PAGE_CACHE["trend_statuses"] = trend_statuses
             _HOME_PAGE_CACHE["trend_since"] = trend_since
             _HOME_PAGE_CACHE["trend_snapshots"] = trend_snapshots
-            _HOME_PAGE_CACHE["cci_alignments"] = cci_alignments
+            _HOME_PAGE_CACHE["weekly_daily_alignments"] = weekly_daily_alignments
 
     except sqlite3.OperationalError as e:
         print("home SQLite busy; serving cached screen:", e)
@@ -9993,7 +9982,7 @@ def home():
             trend_statuses = dict(_HOME_PAGE_CACHE["trend_statuses"])
             trend_since = dict(_HOME_PAGE_CACHE.get("trend_since", {}))
             trend_snapshots = dict(_HOME_PAGE_CACHE["trend_snapshots"])
-            cci_alignments = dict(_HOME_PAGE_CACHE.get("cci_alignments", {}))
+            weekly_daily_alignments = dict(_HOME_PAGE_CACHE.get("weekly_daily_alignments", {}))
 
     return render_template_string(
         HTML,
@@ -10006,7 +9995,7 @@ def home():
         trend_statuses=trend_statuses,
         trend_since=trend_since,
         trend_snapshots=trend_snapshots,
-        cci_alignments=cci_alignments,
+        weekly_daily_alignments=weekly_daily_alignments,
         price_action_statuses=price_action_statuses,
         news_items=news_items,
         news_configured=news_configured,
