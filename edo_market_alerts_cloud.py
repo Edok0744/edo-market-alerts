@@ -4485,6 +4485,41 @@ def sr_gap_structure_is_messy(candles, old_i, retest_index, zone_centre, ar, dir
 SR_HORIZONTAL_GAP_RETEST_MIN_DEPTH_PCT = 50.0
 
 
+def sr_gap_retest_has_room(candles, direction, confirmation_index, retest_level,
+                           prior_opposite_extreme, ar):
+    """Reject an exhausted Gap Retest, including diagonal third-touch setups.
+
+    The first meaningful opposite-side swing/extreme must still be ahead of
+    the FULLY CLOSED confirmation candle. A confirmation that has already
+    reached that old low (SELL) / high (BUY), or has almost finished the
+    entire intervening leg, is too late to be a fresh Gap Retest entry.
+
+    Use only candles older than the confirmation for the opposite extreme.
+    A conservative 15% of the original move AND 0.5 average candle range
+    must remain between the confirming candle's furthest wick and the prior
+    swing target. No other pattern detector calls this function.
+    """
+    if not (0 <= confirmation_index < len(candles)):
+        return False
+    level = float(retest_level)
+    target = float(prior_opposite_extreme)
+    ar = float(ar)
+    if ar <= 0:
+        return False
+    candle = candles[confirmation_index]
+    if direction == "bearish":
+        original_leg = level - target
+        remaining = float(candle["low"]) - target
+    elif direction == "bullish":
+        original_leg = target - level
+        remaining = target - float(candle["high"])
+    else:
+        return False
+    if original_leg <= ar * 1.4:
+        return False
+    return remaining > max(ar * 0.50, original_leg * 0.15)
+
+
 def detect_bounce_retest(candles, conf):
     """
     Edo S/R Gap-and-Retest trading rule.
@@ -4620,6 +4655,15 @@ def detect_bounce_retest(candles, conf):
             retest_depth_pct = ((retest_price - departure_extreme) / move_distance) * 100.0
 
         if retest_depth_pct < SR_HORIZONTAL_GAP_RETEST_MIN_DEPTH_PCT:
+            continue
+
+        # Do not send a late Gap Retest after the confirmation candle has
+        # already reached (or nearly reached) the prior swing target. This
+        # protects both horizontal BUY and SELL retests even if the generic
+        # structural-target search cannot find a clean pivot.
+        if not sr_gap_retest_has_room(
+            candles, direction, i, retest_price, departure_extreme, ar
+        ):
             continue
 
         zone_centre = (old_price + retest_price) / 2.0
@@ -5016,6 +5060,24 @@ def detect_diagonal_gap_retest(candles, conf):
             if direction=="bullish" and confirmed_close<=projected+ar*0.10:
                 continue
             if direction=="bearish" and confirmed_close>=projected-ar*0.10:
+                continue
+            # Edo's 12H third-touch example: the first SELL confirmation is
+            # INVALID once the candle has fallen to the earlier swing LOW;
+            # mirror the check for BUY near the earlier swing HIGH. Identify
+            # the prior leg from candles between the second established line
+            # touch and the newest retest, never from the confirming candle.
+            leg_candles = candles[b + 1:test_idx]
+            if not leg_candles:
+                continue
+            prior_opposite_extreme = (
+                min(float(c["low"]) for c in leg_candles)
+                if direction == "bearish"
+                else max(float(c["high"]) for c in leg_candles)
+            )
+            if not sr_gap_retest_has_room(
+                candles, direction, i, float(candles[test_idx][kind]),
+                prior_opposite_extreme, ar
+            ):
                 continue
             target1,take_profit=sr_structure_targets(candles,direction,test_idx,confirmed_close,search_back=120)
             extreme=float(candles[i]["high" if direction=="bullish" else "low"])
