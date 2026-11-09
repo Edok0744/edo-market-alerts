@@ -8670,8 +8670,13 @@ def edo_confirmed_horizontal_range(closed_daily):
     if not closed_daily or len(closed_daily) < 24:
         return None
     history = closed_daily[-80:]
-    highs = swing_points(history, 'high', left=2, right=2)
-    lows = swing_points(history, 'low', left=2, right=2)
+    # Require real local turning points, not repeated equal-price plateaus.
+    highs = [(i,v) for i,v in swing_points(history, 'high', left=2, right=2)
+             if float(v) > max(float(history[j]['high']) for j in range(i-2,i))
+             and float(v) > max(float(history[j]['high']) for j in range(i+1,i+3))]
+    lows = [(i,v) for i,v in swing_points(history, 'low', left=2, right=2)
+            if float(v) < min(float(history[j]['low']) for j in range(i-2,i))
+            and float(v) < min(float(history[j]['low']) for j in range(i+1,i+3))]
     if len(highs) < 2 or len(lows) < 2:
         return None
     (h1, top1), (h2, top2) = highs[-2:]
@@ -8683,6 +8688,10 @@ def edo_confirmed_horizontal_range(closed_daily):
         # crossings of the two lines are otherwise poorly established.
         return None
     if min(h2,l2) < len(history)-38:
+        return None
+    # All four anchors must be finished, with a reasonably RECENT second
+    # touch on each boundary. Old ranges must not persist after a new trend.
+    if max(h2,l2) < len(history)-16:
         return None
     upper = (float(top1) + float(top2))/2.0
     lower = (float(bot1) + float(bot2))/2.0
@@ -8711,8 +8720,25 @@ def edo_confirmed_horizontal_range(closed_daily):
         return None
     if not lower-breakout_margin <= float(history[-1]['close']) <= upper+breakout_margin:
         return None
+    # A sustained directional move is NOT a range even if four OLD pivots
+    # happened to form an approximately horizontal rectangle. Compare the
+    # recent closes and reject decisive movement towards/outside one side.
+    last_n = min(10, len(history)-max(h2,l2))
+    if last_n >= 5:
+        tail = history[-last_n:]
+        first_close = float(tail[0]['close'])
+        last_close = float(tail[-1]['close'])
+        if abs(last_close-first_close) > max(width*0.36, atr*2.5):
+            return None
+    # Stay inside the actual support/resistance from the four touch points.
+    # The average boundary by itself can be too permissive after a breakdown.
+    if (float(history[-1]['close']) < min(float(bot1),float(bot2))-breakout_margin
+        or float(history[-1]['close']) > max(float(top1),float(top2))+breakout_margin):
+        return None
     return {'upper':upper,'lower':lower,'width':width,
             'high_points':(h1,h2),'low_points':(l1,l2),
+            'first_anchor_at':history[min(h1,l1)].get('datetime'),
+            'last_anchor_at':history[max(h2,l2)].get('datetime'),
             'atr':atr, 'market':'RANGING'}
 
 
@@ -8722,12 +8748,20 @@ def edo_weekly_daily_range(weekly_closed, daily_closed):
     Prefer the more actionable Daily boundary when both qualify; do not use
     an 8H, 12H, 4H, 3H or Monthly chart to derive a range classification.
     """
+    # A NEW Weekly body breakout supersedes any channel established BEFORE
+    # that reversal. An old rectangle must never override a fresh breakout.
+    latest_weekly = weekly_daily_inline_event(weekly_closed)
+    event_start = latest_weekly['weekly_start'] if latest_weekly else None
     daily_range = edo_confirmed_horizontal_range(daily_closed)
     if daily_range:
-        return dict(daily_range, source_interval='1day')
+        anchor = parse_candle_utc(daily_range.get('first_anchor_at'))
+        if event_start is None or (anchor is not None and anchor > event_start):
+            return dict(daily_range, source_interval='1day')
     weekly_range = edo_confirmed_horizontal_range(weekly_closed)
     if weekly_range:
-        return dict(weekly_range, source_interval='1week')
+        anchor = parse_candle_utc(weekly_range.get('first_anchor_at'))
+        if event_start is None or (anchor is not None and anchor > event_start):
+            return dict(weekly_range, source_interval='1week')
     return None
 
 
@@ -8745,6 +8779,13 @@ def edo_range_pullback_side_ok(range_info, direction, close):
     return False
 
 
+def edo_unconfirmed_or_ranging(weekly_event, weekly_closed, daily_closed):
+    """Only a NEW, intact four-anchor range can override a pending Weekly reversal."""
+    if edo_weekly_daily_range(weekly_closed, daily_closed):
+        return 'RANGING'
+    return weekly_event['direction'] + ' — UNCONFIRMED' if weekly_event else 'MIXED / WAIT'
+
+
 def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
     """Edo's ONE main trend method: latest Weekly body break + Daily confirmation.
 
@@ -8752,7 +8793,8 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
     trigger line. A confirmed Daily opposite-colour body breakout of >=65%
     must close beyond that Weekly line following a retest. The Daily candle
     must be fully closed and must occur AFTER the Weekly reversal closed.
-    An unconfirmed newer Weekly reversal yields MIXED / WAIT, not a stale FULL.
+    An unconfirmed Weekly reversal yields DIRECTION — UNCONFIRMED, never
+    RANGING based on old pivots. RANGING requires a real intact channel.
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
@@ -8760,16 +8802,18 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
     daily_closed = fully_closed_candles(daily, '1day', now_utc=now_utc)
     weekly_event = weekly_daily_inline_event(weekly_closed)
     if weekly_event is None or len(daily_closed) < 5:
-        return ('RANGING' if edo_weekly_daily_range(weekly_closed, daily_closed) else 'MIXED / WAIT'), None, weekly_event
+        return edo_unconfirmed_or_ranging(weekly_event, weekly_closed, daily_closed), None, weekly_event
     direction, level, confirmed_at = weekly_daily_inline_from_candles(
         weekly, daily, now_utc=now_utc)
     if direction != weekly_event['direction'] or confirmed_at is None:
-        return ('RANGING' if edo_weekly_daily_range(weekly_closed, daily_closed) else 'MIXED / WAIT'), None, weekly_event
+        # The Weekly body-break is directional evidence; do not label it
+        # RANGING just because the Daily 65% close is still pending.
+        return edo_unconfirmed_or_ranging(weekly_event, weekly_closed, daily_closed), None, weekly_event
     # Find actual fully closed Daily confirmation to save its REAL timestamp.
     confirmation = next((c for c in reversed(daily_closed)
                          if parse_candle_utc(c.get('datetime')) == parse_candle_utc(confirmed_at)), None)
     if confirmation is None:
-        return ('RANGING' if edo_weekly_daily_range(weekly_closed, daily_closed) else 'MIXED / WAIT'), None, weekly_event
+        return edo_unconfirmed_or_ranging(weekly_event, weekly_closed, daily_closed), None, weekly_event
     status = 'FULL BULLISH' if direction == 'BULLISH' else 'FULL BEARISH'
     return status, {'break_candle': confirmation, 'level': level,
                     'level_method': '1day', 'weekly_event': weekly_event}, weekly_event
