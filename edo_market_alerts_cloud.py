@@ -6132,9 +6132,63 @@ def median_value(values):
     return (clean[mid - 1] + clean[mid]) / 2.0
 
 
+def confirmed_spike_sr_bounce(closed_candles, side):
+    """Check a completed reversal wick against PRE-EXISTING support/resistance.
+
+    Works with either 1week or 1month bars; uses historical confirmed pivots
+    only (2 candles on both sides) and excludes the signal candle itself.
+    A close through the historical level is a breakout, not a bounce.
+    Returns the tested level or None. No use of forward/future candles.
+    """
+    if len(closed_candles) < 14 or side not in ('upper', 'lower'):
+        return None
+    current = closed_candles[-1]
+    hist = closed_candles[:-1][-52:]
+    normal = median_value([max(0.0, float(x['high']) - float(x['low']))
+                           for x in hist[-16:]])
+    if normal <= 0:
+        return None
+    upper = side == 'upper'
+    kind = 'high' if upper else 'low'
+    pivots = swing_points(hist, kind, left=2, right=2)
+    if not pivots:
+        return None
+    edge = float(current['high'] if upper else current['low'])
+    close = float(current['close'])
+    body_edge = max(float(current['open']), close) if upper else min(float(current['open']), close)
+    # Price must actually visit the previous swing level (within part of a
+    # normal candle range); reject a candle nowhere near old S/R.
+    max_distance = normal * 0.50
+    options = []
+    for i, raw_level in pivots:
+        level = float(raw_level)
+        if abs(edge - level) > max_distance:
+            continue
+        # Upper wick returns BELOW resistance; lower wick returns ABOVE support.
+        # Small tolerance is only for tiny close-through / feed differences.
+        if upper:
+            if close > level + normal * 0.08 or body_edge > level + normal * 0.20:
+                continue
+        else:
+            if close < level - normal * 0.08 or body_edge < level - normal * 0.20:
+                continue
+        # A recently broken old level is no longer a reliable S/R reference.
+        # A past close that remains substantially beyond it invalidates it.
+        subsequent = hist[i+1:]
+        if upper and any(float(x['close']) > level + normal * 0.30 for x in subsequent):
+            continue
+        if not upper and any(float(x['close']) < level - normal * 0.30 for x in subsequent):
+            continue
+        options.append((i, level, abs(edge - level)))
+    if not options:
+        return None
+    # Nearest price level first; use most recent swing as a tie-breaker.
+    return sorted(options, key=lambda x: (x[2], -x[0]))[0][1]
+
+
 def detect_weekly_spike(closed_weekly):
     """
-    Edo Weekly Spike warning — TREND FILTERED.
+    Edo Weekly Spike warning — TREND + SUPPORT/RESISTANCE FILTERED.
 
     Warning only, never a BUY/SELL signal.
 
@@ -6154,6 +6208,7 @@ def detect_weekly_spike(closed_weekly):
       - at least 35% of the current candle's full range
       - at least 2.0x the current candle body
 
+    Every spike must reject an established historical support/resistance pivot.
     Requiring both a strong historical ratio AND meaningful absolute size
     prevents a small wick from looking abnormal only because recent same-side
     wicks happened to be tiny.
@@ -6245,9 +6300,17 @@ def detect_weekly_spike(closed_weekly):
             "Unusually long lower wick may show rejection at the bottom / possible bullish reversal area."
         )
 
+    # IMPORTANT: an oversized wick alone is not a valid abnormal SPIKE.
+    # It MUST actually reject previously confirmed support/resistance.
+    sr_level = confirmed_spike_sr_bounce(closed_weekly, side)
+    if sr_level is None:
+        return None
+
     date = current.get("datetime", "")
+    sr_text = "resistance" if side == "upper" else "support"
     message = (
         f"{label} wick spike on the newest fully CLOSED Weekly candle ({date}). "
+        f"Confirmed bounce/rejection of prior {sr_text} near {sr_level:.5f}. "
         f"Prior Weekly trend: {prior_trend.upper()}. "
         f"Wick is about {ratio:.1f}x its recent normal size. {meaning} "
         f"Warning only — wait for your normal candle confirmation before trading."
@@ -6264,6 +6327,8 @@ def detect_weekly_spike(closed_weekly):
         "lower_wick": lower,
         "body": body,
         "range": current_range,
+        "sr_level": sr_level,
+        "sr_type": sr_text,
     }
 
 
@@ -6474,16 +6539,113 @@ def fully_closed_monthly_candles(candles, now_utc=None):
             and monthly_candle_close_utc(c) <= now_utc]
 
 
-def detect_monthly_spike(closed_monthly):
-    """Identical trend-before-spike and wick thresholds to existing Weekly rule."""
-    result = detect_weekly_spike(closed_monthly)
-    if not result:
+def detect_monthly_support_bounce(closed_monthly):
+    """Forex Monthly abnormal support rejection — separate from wick-only spikes.
+
+    Require two ALREADY CONFIRMED historical swing lows forming a support area,
+    a fully closed month returning to that area, and an observable rejection.
+    A red or green doji/hammer qualifies; the candle need not be green.  The
+    signal is a cautionary support-bounce watch, not an automatic BUY entry.
+    """
+    if not closed_monthly or len(closed_monthly) < 18:
         return None
-    result = dict(result)
-    result["message"] = (result["message"]
-                         .replace("Weekly", "Monthly")
-                         .replace("weekly", "monthly"))
-    return result
+    # All abnormal-spike variants need a pre-existing trend, never a
+    # directionless candle that merely happens to be near a support level.
+    if local_structure_trend(closed_monthly, len(closed_monthly) - 1) != 'bearish':
+        return None
+    current = closed_monthly[-1]
+    history = closed_monthly[:-1]
+    o, h, l, c = (float(current[k]) for k in ('open', 'high', 'low', 'close'))
+    full = h - l
+    if full <= 0:
+        return None
+    body = abs(c - o)
+    lower = min(o, c) - l
+    recent = history[-18:]
+    ranges = [max(0.0, float(x['high']) - float(x['low'])) for x in recent]
+    median_range = median_value(ranges)
+    if median_range <= 0:
+        return None
+
+    # Historical support must be visible BEFORE the current month. Two
+    # independent lows, separated by at least three monthly candles, are
+    # required; the current candle never forms an historical anchor.
+    subset = history[-48:]
+    pivots = swing_points(subset, 'low', left=2, right=2)
+    if len(pivots) < 2:
+        return None
+    tolerance = median_range * 0.40
+    candidates = []
+    for a in range(len(pivots) - 1):
+        for b in range(a + 1, len(pivots)):
+            ia, va = pivots[a]
+            ib, vb = pivots[b]
+            va, vb = float(va), float(vb)
+            if ib - ia < 3 or abs(va - vb) > tolerance:
+                continue
+            support = (va + vb) / 2.0
+            if abs(l - support) > median_range * 0.55:
+                continue
+            # An actual bounce must return inside/above support, not finish
+            # decisively underneath an already broken support zone.
+            if c < support - median_range * 0.12:
+                continue
+            candidates.append((ib, support, ia, va, vb))
+    if not candidates:
+        return None
+
+    # A meaningful lower-tail rejection (including red candles) or a
+    # small-bodied indecision candle rejecting the support area.  Strong
+    # downward candles finishing close to their lows are NOT bounce signals.
+    doji = body <= full * 0.30
+    rejection = (lower >= full * 0.23 and lower >= body * 0.45
+                 and c >= l + full * 0.30)
+    indecision = (doji and lower >= full * 0.18
+                  and c >= l + full * 0.25)
+    if not (rejection or indecision):
+        return None
+    # A Monthly bounce must end back at/above the old support zone. The
+    # current candle's high/low alone is not confirmation of a bounce.
+    if c < max(candidates, key=lambda row: row[0])[1] - median_range * 0.12:
+        return None
+
+    # Abnormal behaviour relative to typical monthly bars or a clearly
+    # visible wick reversal. Avoid flagging every tiny doji at support.
+    if full < median_range * 0.90 and lower < median_range * 0.42:
+        return None
+
+    _, support, _, _, _ = max(candidates, key=lambda row: row[0])
+    ratio = lower / max(median_range, 1e-12)
+    date = current.get('datetime', '')
+    candle_type = 'doji / small-body' if doji else ('bearish' if c < o else 'bullish')
+    msg = (
+        f'Monthly SUPPORT BOUNCE / abnormal rejection on newest fully CLOSED '
+        f'Monthly candle ({date}). Historical support around {support:.5f} '
+        f'has at least two earlier confirmed swing-low touches. '
+        f'The {candle_type} candle tested support and rejected the low '
+        f'(lower wick {ratio:.2f}x normal monthly range). '
+        f'Potential bullish reversal watch only — wait for a separate '
+        f'closed-candle BUY confirmation before trading.'
+    )
+    return {'side': 'support_bounce', 'label': 'SUPPORT BOUNCE',
+            'ratio': ratio, 'date': date, 'prior_trend': 'support',
+            'message': msg, 'support': support,
+            'upper_wick': max(0., h - max(o, c)),
+            'lower_wick': lower, 'body': body, 'range': full}
+
+
+def detect_monthly_spike(closed_monthly):
+    """Existing extreme-wick spike OR new support-bounce reversal watch."""
+    result = detect_weekly_spike(closed_monthly)
+    if result:
+        result = dict(result)
+        result["message"] = (result["message"]
+                             .replace("Weekly", "Monthly")
+                             .replace("weekly", "monthly"))
+        return result
+    # Preserve the existing spike warning and additionally recognise a
+    # support rejection that does not meet the extreme 4x-wick spike rule.
+    return detect_monthly_support_bounce(closed_monthly)
 
 
 def collect_monthly_spike(symbol, grp="FOREX"):
@@ -6514,7 +6676,10 @@ def notify_monthly_spike(symbol, spike):
             c.commit()
     except sqlite3.IntegrityError:
         return False
-    sent = send_push(f"🟣 {symbol} [FOREX] — MONTHLY SPIKE", spike["message"])
+    title = (f"🟣 {symbol} [FOREX] — MONTHLY SUPPORT BOUNCE"
+             if spike.get('side') == 'support_bounce'
+             else f"🟣 {symbol} [FOREX] — MONTHLY SPIKE")
+    sent = send_push(title, spike["message"])
     if not sent:
         # Allow a later check to retry an unsuccessful Pushover request.
         with db_conn() as c:
@@ -6541,7 +6706,7 @@ def monthly_spike_monitor():
                 index += 1
                 spike, latest_date, error = collect_monthly_spike(symbol)
                 record_scan_health("Monthly Spike", symbol, "1month", error=error,
-                    signal=f"{symbol}: {spike['label']} Monthly wick" if spike else "")
+                    signal=f"{symbol}: {spike['label']} Monthly" if spike else "")
                 if not error and latest_date:
                     with db_conn() as c:
                         state = c.execute("""SELECT last_closed_date FROM monthly_spike_state
