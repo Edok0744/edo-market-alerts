@@ -346,6 +346,7 @@ _HOME_PAGE_CACHE = {
     "markets": [],
     "favorites": [],
     "trend_statuses": {},
+    "range_sources": {},
     "trend_since": {},
     "trend_snapshots": {},
     "weekly_daily_alignments": {},
@@ -436,7 +437,13 @@ def edo_home_trend_refresh_status():
                 FROM favorites AS f
                 LEFT JOIN trend_status AS t ON t.symbol=f.symbol
             """).fetchall()
-        state['statuses'] = {r['symbol']: r['status'] for r in rows}
+            edo_ensure_range_source_table(c)
+            sources = {r['symbol']: r['source'] for r in c.execute(
+                'SELECT symbol,source FROM edo_range_source_status').fetchall()}
+        state['statuses'] = {
+            r['symbol']: (r['status'] + ' — ' + sources[r['symbol']]
+                          if r['status'] == 'RANGING' and sources.get(r['symbol'])
+                          else r['status']) for r in rows}
     except sqlite3.Error as exc:
         print('home trend status poll:', exc, flush=True)
         state['statuses'] = None  # do not force a refresh on failed reads
@@ -931,7 +938,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 
 {% for f in favorites %}
 
-<div class="market saved-market" data-trend-symbol="{{ f['symbol']|e }}" data-trend-status="{{ trend_statuses.get(f['symbol'], '')|e }}">
+<div class="market saved-market" data-trend-symbol="{{ f['symbol']|e }}" data-trend-status="{{ (trend_statuses.get(f['symbol'], '') + (' — ' + range_sources.get(f['symbol'], '') if trend_statuses.get(f['symbol']) == 'RANGING' and range_sources.get(f['symbol']) else ''))|e }}">
 
 <div>
 <span class="pill"
@@ -952,7 +959,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 <a class="edo-trend-icon-link bear" href="/trend/{{f['id']}}" title="FULL BEARISH — Weekly + Daily confirmed. Open Trend page" aria-label="FULL BEARISH: open trend detail"><img class="edo-trend-icon" src="/edo-trend-icon/bear.gif" width="40" height="40" alt="Bearish falling bear" loading="lazy"></a>
 {% if trend_since.get(f['symbol']) %}<span class="edo-trend-since" title="Trend confirmed at">⏳ {{trend_since.get(f['symbol'])}}</span>{% endif %}
 {% elif saved_ts == 'RANGING' %}
-<a class="saved-fulltrend trend-ranging-status" href="/trend/{{f['id']}}" title="Confirmed nearly horizontal range: 2 upper and 2 lower swing touches">↔ RANGING</a>
+<a class="saved-fulltrend trend-ranging-status" href="/trend/{{f['id']}}" title="Confirmed nearly horizontal range: 2 upper and 2 lower swing touches">↔ RANGING{% if range_sources.get(f['symbol']) %} — {{ range_sources.get(f['symbol']) }}{% endif %}</a>
 {% elif saved_ts.endswith('— MIXED') %}
 <a class="saved-fulltrend trend-mixed-status" href="/trend/{{f['id']}}" title="Weekly and Daily trend disagree">⚠️ {{saved_ts}}</a>
 {% elif saved_ts.endswith('— UNCONFIRMED') %}
@@ -1090,7 +1097,7 @@ Target {{m['direction']}} {{m['target']}}
 {% elif m['triggered'] and ts == 'FULL BEARISH' %}
 <div class="fulltrend fullbear">🔴 FULL BEARISH</div>
 {% elif m['triggered'] and ts == 'RANGING' %}
-<div class="fulltrend" style="color:#7fe4ec">↔ RANGING</div>
+<div class="fulltrend" style="color:#7fe4ec">↔ RANGING{% if range_sources.get(m['symbol']) %} — {{ range_sources.get(m['symbol']) }}{% endif %}</div>
 {% elif m['triggered'] and ts and ts.endswith('— MIXED') %}
 <div class="fulltrend fullmixed">⚠️ {{ts}}</div>
 {% elif m['triggered'] and ts and ts.endswith('— UNCONFIRMED') %}
@@ -9162,13 +9169,54 @@ def edo_weekly_daily_range(weekly_closed, daily_closed):
     Weekly trigger. Breakouts are rejected by the geometry/closed-price test,
     not just by comparing the FIRST touch's date with a Weekly event date.
     """
+    # Check each higher timeframe independently: a Weekly range can contain
+    # a separate Daily range. Preserve the original range geometry for trade
+    # location decisions; add all qualifying sources for display only.
     daily_range = edo_confirmed_horizontal_range(daily_closed)
-    if daily_range:
-        return dict(daily_range, source_interval='1day')
     weekly_range = edo_confirmed_horizontal_range(weekly_closed)
-    if weekly_range:
-        return dict(weekly_range, source_interval='1week')
-    return None
+    if not daily_range and not weekly_range:
+        return None
+    sources = tuple(tf for tf, valid in (
+        ('1week', weekly_range), ('1day', daily_range)) if valid)
+    selected = daily_range if daily_range else weekly_range
+    return dict(selected, source_interval=('1day' if daily_range else '1week'),
+                source_intervals=sources)
+
+
+def edo_range_display_source(range_info):
+    """Separate human-facing range origin from the RANGING trading status."""
+    if not range_info:
+        return ''
+    sources = set(range_info.get('source_intervals') or
+                  (range_info.get('source_interval'),))
+    if '1week' in sources and '1day' in sources:
+        return 'W+D'
+    if '1week' in sources:
+        return 'WEEKLY'
+    if '1day' in sources:
+        return 'DAILY'
+    return ''
+
+
+def edo_ensure_range_source_table(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS edo_range_source_status (
+        symbol TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT '',
+        updated TEXT NOT NULL DEFAULT '')""")
+
+
+def edo_store_range_source(symbol, source):
+    """Store range-origin only after successful candle calculation.
+
+    Keep the existing trend_status column exactly 'RANGING' so pullbacks,
+    gap retests and notifications keep their established behaviour.
+    """
+    with db_conn() as conn:
+        edo_ensure_range_source_table(conn)
+        conn.execute("""INSERT INTO edo_range_source_status(symbol, source, updated)
+            VALUES(?,?,?) ON CONFLICT(symbol) DO UPDATE SET
+            source=excluded.source, updated=excluded.updated""",
+            (symbol, source, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
 
 
 def edo_range_pullback_side_ok(range_info, direction, close):
@@ -9241,6 +9289,9 @@ def build_full_alignment(symbol, grp=None, refresh_inline=False):
     if de:
         return '', de
     status, event, weekly_event = weekly_daily_main_trend_from_candles(weekly, daily)
+    range_info = (edo_weekly_daily_range(weekly_card_completed_candles(weekly),
+                  fully_closed_candles(daily, '1day')) if status == 'RANGING' else None)
+    edo_store_range_source(symbol, edo_range_display_source(range_info))
     _FULL_TREND_CONFIRMED_EVENTS[symbol] = (status, event)
     weekly_state = (weekly_event['direction'].capitalize() if weekly_event else 'Mixed')
     daily_state = ('Bullish' if status == 'FULL BULLISH' else
@@ -10194,6 +10245,9 @@ def build_trend_scan(symbol, grp=None):
     _FULL_TREND_CONFIRMED_EVENTS[symbol] = (status, event)
     w_closed = weekly_card_completed_candles(weekly)
     d_closed = fully_closed_candles(daily, '1day')
+    range_info = edo_weekly_daily_range(w_closed, d_closed) if status == 'RANGING' else None
+    range_source = edo_range_display_source(range_info)
+    edo_store_range_source(symbol, range_source)
     if not w_closed or not d_closed:
         return None, 'Waiting for completed Weekly and Daily candles.'
     weekly_state = weekly_event['direction'].capitalize() if weekly_event else 'Mixed'
@@ -10205,7 +10259,9 @@ def build_trend_scan(symbol, grp=None):
     weekly_direction = weekly_event['direction'] if weekly_event else 'NONE'
     weekly_text = (f'{weekly_direction} Weekly opposite-colour body break'
                    + (f' • trigger {level:.5f}' if level is not None else ''))
-    daily_text = ('Confirmed near-horizontal four-touch range on Daily/Weekly; price remains inside support and resistance'
+    daily_text = (('Confirmed near-horizontal four-touch range on ' +
+                   {'W+D': 'Weekly AND Daily', 'WEEKLY': 'Weekly', 'DAILY': 'Daily'}.get(range_source, 'Daily/Weekly') +
+                   '; price remains inside support and resistance')
                   if status == 'RANGING' else
                   'Confirmed completed Daily close beyond Weekly trigger line'
                   if event else 'Awaiting completed Daily close beyond Weekly trigger line')
@@ -10221,7 +10277,10 @@ def build_trend_scan(symbol, grp=None):
          'closed_time_perth': (format_closed_candle_perth(event['break_candle'], '1day')
                                if event else 'Awaiting Daily confirmation')}
     ]
-    return {'results': results, 'summary': status, 'summary_icon': icon,
+    summary_display = ('RANGING — ' + range_source
+                       if status == 'RANGING' and range_source else status)
+    return {'results': results, 'summary': status,
+            'summary_display': summary_display, 'summary_icon': icon,
             'summary_css': css, 'detail': weekly_text + ' • ' + daily_text,
             'score': 1 if status == 'FULL BULLISH' else -1 if status == 'FULL BEARISH' else 0}, None
 
@@ -10521,6 +10580,10 @@ def home():
                 r['symbol']: r['status']
                 for r in trend_rows
             }
+            edo_ensure_range_source_table(c)
+            range_source_rows = c.execute(
+                'SELECT symbol,source FROM edo_range_source_status').fetchall()
+            range_sources = {r['symbol']: r['source'] for r in range_source_rows}
             trend_since = {
                 r['symbol']: format_trend_since_perth(r['updated'])
                 for r in trend_rows
@@ -10549,6 +10612,7 @@ def home():
             _HOME_PAGE_CACHE["markets"] = markets
             _HOME_PAGE_CACHE["favorites"] = favorites
             _HOME_PAGE_CACHE["trend_statuses"] = trend_statuses
+            _HOME_PAGE_CACHE["range_sources"] = range_sources
             _HOME_PAGE_CACHE["trend_since"] = trend_since
             _HOME_PAGE_CACHE["trend_snapshots"] = trend_snapshots
             _HOME_PAGE_CACHE["weekly_daily_alignments"] = weekly_daily_alignments
@@ -10562,6 +10626,7 @@ def home():
             trailing_stops = []
             price_action_statuses = {}
             trend_statuses = dict(_HOME_PAGE_CACHE["trend_statuses"])
+            range_sources = dict(_HOME_PAGE_CACHE.get("range_sources", {}))
             trend_since = dict(_HOME_PAGE_CACHE.get("trend_since", {}))
             trend_snapshots = dict(_HOME_PAGE_CACHE["trend_snapshots"])
             weekly_daily_alignments = dict(_HOME_PAGE_CACHE.get("weekly_daily_alignments", {}))
@@ -10575,6 +10640,7 @@ def home():
         selected_symbol=selected_symbol,
         selected_group=selected_group,
         trend_statuses=trend_statuses,
+        range_sources=range_sources,
         trend_since=trend_since,
         trend_snapshots=trend_snapshots,
         weekly_daily_alignments=weekly_daily_alignments,
@@ -10913,7 +10979,7 @@ def trend(i):
         symbol=f['symbol'],
         grp=f['grp'],
         results=scan['results'],
-        summary=scan['summary'],
+        summary=scan.get('summary_display', scan['summary']),
         summary_icon=scan['summary_icon'],
         summary_css=scan['summary_css'],
         detail=scan['detail'],
