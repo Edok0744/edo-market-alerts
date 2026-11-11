@@ -825,9 +825,9 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 {% endif %}
 {% set wd_state = weekly_daily_alignments.get((f['symbol'], f['grp']), '') %}
 {% if wd_state == 'BULLISH' and saved_ts != 'FULL BULLISH' %}
-<span class="weekly-daily-inline-arrow up" title="BULLISH — INLINE: Weekly candle body break + Daily retest and bullish close (independent)">↑ BULLISH — INLINE</span>
+<span class="weekly-daily-inline-arrow up" title="BULLISH — INLINE: Weekly body break + closed Daily above trigger line">↑ BULLISH — INLINE</span>
 {% elif wd_state == 'BEARISH' and saved_ts != 'FULL BEARISH' %}
-<span class="weekly-daily-inline-arrow down" title="BEARISH — INLINE: Weekly candle body break + Daily retest and bearish close (independent)">↓ BEARISH — INLINE</span>
+<span class="weekly-daily-inline-arrow down" title="BEARISH — INLINE: Weekly body break + closed Daily below trigger line">↓ BEARISH — INLINE</span>
 {% endif %}
 {% if saved_mixed and saved_ts != 'RANGING' and not saved_ts.endswith('— MIXED') %}
 <span class="saved-mixed-warning" role="img" aria-label="Mixed trend: Daily {{ saved_daily }}, Weekly {{ saved_weekly }}" title="⚠️ Mixed trend — Daily: {{ saved_daily }}; Weekly: {{ saved_weekly }}">⚠️</span>
@@ -6762,7 +6762,7 @@ def weekly_daily_direction_for_filters(symbol, grp):
                  'bearish' if status == 'FULL BEARISH' else None)
     states = {'1W': weekly_event['direction'].capitalize() if weekly_event else 'Mixed',
               '1D': direction.capitalize() if direction else 'Mixed',
-              'Used': 'Weekly→Daily 65% confirmation',
+              'Used': 'Weekly trigger + completed Daily close',
               'Market': ('Trending' if direction else 'Ranging' if status == 'RANGING' else 'Mixed / Wait')}
     return direction, states, None
 
@@ -8676,15 +8676,14 @@ def aligned_full_trend_status(daily_break_status, weekly_state):
 
 
 # -------------------------------------------------
-# WEEKLY -> DAILY BODY-BREAK / RETEST ALIGNMENT (MAIN TREND)
+# WEEKLY -> DAILY FIRST CLOSED BREAK ALIGNMENT (MAIN TREND)
 # Replaces CCI arrows. Entirely independent of FULL trend and trading signals.
 # 1) First fully closed Weekly opposite-colour reversal candle CLOSES past
 #    the prior Weekly candle's body top (bull) or body bottom (bear).
 # 2) That prior body boundary becomes the horizontal Weekly trigger line.
-# 3) AFTER that Weekly confirmation, Daily returns into the vicinity of
-#    the line and prints a fully closed opposite-colour confirming candle
-#    that closes at least 65% through the previous Daily body AND beyond
-#    BOTH the previous Daily body boundary and Weekly line.
+# 3) AFTER that Weekly confirmation, the FIRST fully closed Daily candle
+#    that finishes beyond the Weekly trigger line confirms the trend.
+#    No extra Daily retest, colour or 65% body-recovery requirement.
 # No forming candles, no retrospective confirmation before a Weekly close.
 # -------------------------------------------------
 
@@ -8714,66 +8713,51 @@ def weekly_daily_inline_event(closed_weekly):
 
 
 def weekly_daily_inline_from_candles(weekly, daily, now_utc=None):
-    """Pure signal check for an already downloaded pair of candle histories.
+    """Edo's main direction: completed Weekly body break + first closed Daily
+    candle on the correct side of the Weekly trigger line.
 
-    Return the latest confirmed Weekly-level/Daily-retest event. It is now
-    the main FULL trend method and remains active until a newer reversal or
-    a completed Daily candle crosses back over the Weekly reference level.
+    There is NO additional Daily 65% body test, opposite-colour requirement,
+    exact-line touch or retest requirement. These remain in OTHER pattern
+    strategies wherever previously configured.
+
+    A completed reversal remains in force until a newer completed Weekly
+    opposite-colour breakout creates a different trigger to confirm.
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     w_closed = weekly_card_completed_candles(weekly, now_utc=now_utc)
     d_closed = fully_closed_candles(daily, '1day', now_utc=now_utc)
     event = weekly_daily_inline_event(w_closed)
-    if not event or len(d_closed) < 5:
+    if not event or not d_closed:
         return '', None, None
     direction, level = event['direction'], event['level']
-    after = []
+    week_end = event['weekly_closed_at']
+    # FXCM Weekly candles are labelled by broker session. When the next
+    # Weekly candle exists in the feed, its actual start marks the prior
+    # candle's close; this avoids inventing a Monday/Friday cutoff.
+    for c in weekly or []:
+        next_start = parse_candle_utc(c.get('datetime'))
+        if next_start is not None and next_start > event['weekly_start']:
+            week_end = min(week_end, next_start)
+            break
+    confirmed = None
     for c in d_closed:
-        dt = parse_candle_utc(c.get('datetime'))
-        if dt is not None and dt >= event['weekly_closed_at']:
-            after.append(c)
-    if len(after) < 2:
-        return '', None, None
-    # A line may be approached rather than touched to the exact pip.
-    ar = avg_range(d_closed, end=len(d_closed), length=20)
-    tolerance = max(ar * 0.35, abs(level) * 0.00035)
-    confirmation = None
-    for i in range(1, len(after)):
-        prev, curr = after[i-1], after[i]
-        prev_top = max(float(prev['open']), float(prev['close']))
-        prev_bottom = min(float(prev['open']), float(prev['close']))
-        previous_body = prev_top - prev_bottom
-        if previous_body <= 0:
+        start = parse_candle_utc(c.get('datetime'))
+        if start is None:
             continue
-        # Edo's Daily confirmation: the first opposite-colour candle must
-        # recover/reject at least 65% of the previous candle's REAL body.
-        # It must also CLOSE beyond the entire previous body and Weekly level,
-        # as illustrated in the live chart example (not a wick-only break).
-        if direction == 'BULLISH':
-            retest = float(prev['low']) <= level + tolerance and float(prev['low']) >= level - max(ar * 1.25, tolerance)
-            body_recovered_pct = 100.0 * (float(curr['close']) - prev_bottom) / previous_body
-            valid = (candle_colour(prev) == 'red' and candle_colour(curr) == 'green'
-                     and body_recovered_pct >= 65.0
-                     and float(curr['close']) > max(level, prev_top) and retest)
-        else:
-            retest = float(prev['high']) >= level - tolerance and float(prev['high']) <= level + max(ar * 1.25, tolerance)
-            body_rejected_pct = 100.0 * (prev_top - float(curr['close'])) / previous_body
-            valid = (candle_colour(prev) == 'green' and candle_colour(curr) == 'red'
-                     and body_rejected_pct >= 65.0
-                     and float(curr['close']) < min(level, prev_bottom) and retest)
-        if valid:
-            confirmation = curr
-    if confirmation is None:
+        # A Daily candle which started before the Weekly trigger completed
+        # cannot confirm the new trend. This also excludes look-ahead.
+        if start < week_end:
+            continue
+        close = float(c['close'])
+        if ((direction == 'BULLISH' and close > level) or
+            (direction == 'BEARISH' and close < level)):
+            confirmed = c
+            break  # FIRST eligible fully closed Daily candle, not the latest.
+    if confirmed is None:
         return '', None, None
-    confirm_start = parse_candle_utc(confirmation.get('datetime'))
+    confirm_start = parse_candle_utc(confirmed.get('datetime'))
     if confirm_start is None:
-        return '', None, None
-    # This is now the MAIN market trend, not a seven-day signal. It holds
-    # until the latest completed Weekly reversal needs a new Daily confirmation
-    # or a closed Daily candle returns across its Weekly trigger level.
-    latest_close = float(d_closed[-1]['close'])
-    if (direction == 'BULLISH' and latest_close <= level) or (direction == 'BEARISH' and latest_close >= level):
         return '', None, None
     return direction, level, confirm_start.isoformat()
 
@@ -8818,7 +8802,7 @@ def update_weekly_daily_alignment(symbol, grp):
     if should_alert:
         label = 'BULLISH — INLINE' if state == 'BULLISH' else 'BEARISH — INLINE'
         ok = send_push(f'{label} • Weekly/Daily',
-                       f'{symbol} • Main trend: Weekly body breakout + Daily 65% confirmation at {level:.5f}.',
+                       f'{symbol} • Main trend: Weekly body breakout + closed Daily beyond {level:.5f}.',
                        sound=TREND_DIRECTION_PUSH_SOUND)
         if not ok:
             print('Weekly/Daily inline Pushover not accepted:', symbol, flush=True)
@@ -8955,9 +8939,9 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
     """Edo's ONE main trend method: latest Weekly body break + Daily confirmation.
 
     The most recent closed Weekly opposite-colour body breakout sets the active
-    trigger line. A confirmed Daily opposite-colour body breakout of >=65%
-    must close beyond that Weekly line following a retest. The Daily candle
-    must be fully closed and must occur AFTER the Weekly reversal closed.
+    trigger line. The FIRST fully closed Daily candle closing on the
+    correct side of that line confirms the trend. No Daily retest, colour,
+    or 65% test; the Weekly reversal must already be fully closed.
     An unconfirmed Weekly reversal yields DIRECTION — UNCONFIRMED, never
     RANGING based on old pivots. RANGING requires a real intact channel.
     """
@@ -8972,7 +8956,7 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
         weekly, daily, now_utc=now_utc)
     if direction != weekly_event['direction'] or confirmed_at is None:
         # The Weekly body-break is directional evidence; do not label it
-        # RANGING just because the Daily 65% close is still pending.
+        # RANGING just because the Daily trigger-line close is still pending.
         return edo_unconfirmed_or_ranging(weekly_event, weekly_closed, daily_closed), None, weekly_event
     # Find actual fully closed Daily confirmation to save its REAL timestamp.
     confirmation = next((c for c in reversed(daily_closed)
@@ -8985,7 +8969,7 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
 
 
 def build_full_alignment(symbol, grp=None):
-    """Main trend: ONLY confirmed Weekly body reversal + Daily 65% confirmation."""
+    """Main trend: confirmed Weekly body reversal + first Daily close beyond line."""
     clear_ohlc_cache_for_symbol(symbol, grp, intervals={'1week', '1day'})
     weekly, we = get_candles(symbol, '1week', outputsize=100, grp=grp)
     if we:
@@ -9952,15 +9936,15 @@ def build_trend_scan(symbol, grp=None):
     weekly_direction = weekly_event['direction'] if weekly_event else 'NONE'
     weekly_text = (f'{weekly_direction} Weekly opposite-colour body break'
                    + (f' • trigger {level:.5f}' if level is not None else ''))
-    daily_text = ('Confirmed Daily 65% opposite-colour body break beyond Weekly level'
-                  if event else 'Awaiting closed Daily retest and 65% body confirmation')
+    daily_text = ('Confirmed completed Daily close beyond Weekly trigger line'
+                  if event else 'Awaiting completed Daily close beyond Weekly trigger line')
     results = [
         {'label': 'Weekly body-break trigger', 'interval': '1week',
          'state': weekly_state, 'icon': '',
          'css': 'bull' if weekly_state == 'Bullish' else 'bear' if weekly_state == 'Bearish' else 'mixed',
          'reference_only': True, 'closed_time': w_closed[-1].get('datetime', ''),
          'closed_time_perth': format_closed_candle_perth(w_closed[-1], '1week')},
-        {'label': 'Daily 65% confirmation', 'interval': '1day',
+        {'label': 'Daily trigger-line confirmation', 'interval': '1day',
          'state': daily_state, 'icon': icon, 'css': css, 'reference_only': False,
          'closed_time': event['break_candle'].get('datetime', '') if event else '',
          'closed_time_perth': (format_closed_candle_perth(event['break_candle'], '1day')
