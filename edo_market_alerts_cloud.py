@@ -306,8 +306,25 @@ def edo_start_home_trend_refresh():
 
 @APP.get('/home-trend-refresh-status')
 def edo_home_trend_refresh_status():
+    # Read the shared SQLite state, not per-process Python globals alone.
+    # Railway may run more than one web worker: a manual Trend view can update
+    # the database on a different worker from the Home screen's AJAX poll.
     with _EDO_OPEN_TREND_LOCK:
-        return jsonify(dict(_EDO_OPEN_TREND_STATE))
+        state = dict(_EDO_OPEN_TREND_STATE)
+    try:
+        with db_conn() as c:
+            rows = c.execute("""
+                SELECT DISTINCT f.symbol, COALESCE(t.status, '') AS status
+                FROM favorites AS f
+                LEFT JOIN trend_status AS t ON t.symbol=f.symbol
+            """).fetchall()
+        state['statuses'] = {r['symbol']: r['status'] for r in rows}
+    except sqlite3.Error as exc:
+        print('home trend status poll:', exc, flush=True)
+        state['statuses'] = None  # do not force a refresh on failed reads
+    response = jsonify(state)
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return response
 
 
 COLORS = {
@@ -796,7 +813,7 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 
 {% for f in favorites %}
 
-<div class="market saved-market">
+<div class="market saved-market" data-trend-symbol="{{ f['symbol']|e }}" data-trend-status="{{ trend_statuses.get(f['symbol'], '')|e }}">
 
 <div>
 <span class="pill"
@@ -1220,6 +1237,23 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
             const r = await fetch('/home-trend-refresh-status?_=' + Date.now(), {cache:'no-store'});
             if (!r.ok) return;
             const d = await r.json();
+            // Saved Pairs must update when ANY scanner or the manual Trend page
+            // changes its persisted status. Do not wait for the entire saved-pair
+            // batch to finish or for an in-process revision from another worker.
+            // The next Home render keeps existing GIF icons, labels and timestamps.
+            if (d.statuses && typeof d.statuses === 'object') {
+                let changed = false;
+                document.querySelectorAll('.saved-market[data-trend-symbol]').forEach(function (row) {
+                    const symbol = row.getAttribute('data-trend-symbol');
+                    if (!Object.prototype.hasOwnProperty.call(d.statuses, symbol)) return;
+                    const latest = d.statuses[symbol] || '';
+                    if (latest !== (row.getAttribute('data-trend-status') || '')) changed = true;
+                });
+                if (changed) {
+                    edoFreshHome(true);
+                    return;
+                }
+            }
             if (edoTrendRevisionAtOpen === null) {
                 edoTrendRevisionAtOpen = d.revision;
                 // If scan already completed between page load and first poll,
