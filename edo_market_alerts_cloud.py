@@ -5737,7 +5737,67 @@ def trend_pullback_retracement_preserves_structure(candles, run_start, confirm_i
 
     return True
 
-def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local_trend=True, ranging_context=None):
+def edo_gap_break_pullback_context(candles, direction, run_start, grp="FOREX"):
+    """Edo's counter-higher-trend continuation exception, 8H (FX/CFD) / 12H (Crypto).
+
+    A confirmed SAME-direction S/R Gap Retest must be followed by a separate,
+    fully CLOSED structural break beyond the PRE-EXISTING swing and its S/R area.
+    Only pullback runs that START AFTER that break are allowed to use this
+    exception. All evidence is strictly earlier than the pullback run.
+    No future candles can establish the gap, the swing, or the break.
+    """
+    if run_start < 23 or direction not in ("bullish", "bearish"):
+        return None
+    last_index = run_start - 1
+    earliest = max(18, last_index - 45)
+    for gap_i in range(last_index - 1, earliest - 1, -1):
+        history = candles[:gap_i + 1]
+        conf = sr_confirmation_at(history, gap_i)
+        if conf is None and str(grp).upper() == "CRYPTO":
+            conf = crypto_second_candle_sr_confirmation(history, gap_i)
+        if not conf or conf.get("direction") != direction:
+            continue
+        gap = detect_bounce_retest(history, conf)
+        diagonal = detect_diagonal_gap_retest(history, conf)
+        gap = max((g for g in (gap, diagonal) if g),
+                  key=lambda g: float(g.get("score", 0.0)), default=None)
+        if not gap:
+            continue
+
+        # The swing must have already been confirmed before the Gap Retest.
+        # A pivot's right-hand confirmation candles are prior to gap_i.
+        kind = "low" if direction == "bearish" else "high"
+        key = kind
+        pivots = swing_points(candles[:gap_i - 1], kind=kind, left=2, right=2)
+        pivots = [(idx, float(price)) for idx, price in pivots
+                  if idx >= max(2, gap_i - 42)]
+        if not pivots:
+            continue
+        swing_i, swing_price = pivots[-1]
+        # A small buffer helps avoid treating a one-tick marginal close as
+        # a convincing break. Never infer a break from candle wicks alone.
+        ar = avg_range(candles, gap_i + 1, 20)
+        tolerance = max(0.0, float(ar) * 0.08)
+        for break_i in range(gap_i + 1, run_start):
+            close = float(candles[break_i]["close"])
+            if (direction == "bearish" and close < swing_price - tolerance) or (
+                direction == "bullish" and close > swing_price + tolerance
+            ):
+                return {
+                    "gap_confirmation_index": gap_i,
+                    "gap_confirmation_date": candles[gap_i].get("datetime", ""),
+                    "break_index": break_i,
+                    "break_date": candles[break_i].get("datetime", ""),
+                    "structural_level": swing_price,
+                    "structural_swing_index": swing_i,
+                    "structural_swing_date": candles[swing_i].get("datetime", ""),
+                    "direction": direction,
+                    "gap_kind": "diagonal" if gap.get("diagonal") else "horizontal",
+                }
+    return None
+
+
+def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local_trend=True, ranging_context=None, structural_break_context=None):
     """
     Edo Trend Pullback rule — NO 50% penetration requirement.
 
@@ -5800,13 +5860,13 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     # Trend Pullback ONLY: use the dominant recent-structure classifier.
     # Other EdoSignal signal families continue using their existing logic.
     trend = trend_pullback_structure_trend(candles, run_start)
-    if require_local_trend and trend != required_trend:
+    if require_local_trend and trend != required_trend and structural_break_context is None:
         return None
 
     # The counter-trend run must remain a retracement.  If it has already
     # broken the pre-pullback swing structure, the old trend is invalidated and
     # the confirmation candle must NOT create a continuation signal.
-    if ranging_context is None and not trend_pullback_retracement_preserves_structure(
+    if ranging_context is None and structural_break_context is None and not trend_pullback_retracement_preserves_structure(
         candles, run_start, i, required_trend
     ):
         return None
@@ -5837,6 +5897,8 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
         "required_trend": required_trend,
         "normal_local_trend_ok": trend == required_trend,
         "range_confirmed": bool(ranging_context),
+        "gap_break_context": structural_break_context,
+        "structural_break_exception": bool(structural_break_context),
         "context": "trend",
         "target": target,
     }
@@ -7050,7 +7112,16 @@ def apply_8h_gap_trend_filter(symbol, grp, interval, setups):
 
     higher_direction, states, error = eight_hour_gap_higher_trend(symbol, grp)
     if error:
-        return [], states, error
+        # A confirmed local Gap Retest is still a reversal candidate if the
+        # separate higher-timeframe data request temporarily fails. It does
+        # NOT by itself activate counter-trend continuation Pullbacks.
+        fallback = []
+        for setup in setups:
+            q = dict(setup)
+            if q.get("name") == "S/R GAP RETEST SETUP":
+                q["gap_trend_filter"] = "higher_tf_unavailable_reversal_candidate"
+            fallback.append(q)
+        return fallback, {"Market": "Higher TF unavailable"}, None
 
     filtered = []
     for p in setups:
@@ -7067,13 +7138,17 @@ def apply_8h_gap_trend_filter(symbol, grp, interval, setups):
             filtered.append(q)
             continue
 
-        # Clear higher-timeframe trend: continuation direction only.
-        if p.get("direction") == higher_direction:
-            q = dict(p)
-            q["gap_trend_filter"] = "with_trend"
-            q["gap_higher_tf_direction"] = higher_direction
-            q["gap_higher_tf_states"] = dict(states)
-            filtered.append(q)
+        # A fully confirmed counter-trend Gap Retest may be the FIRST
+        # reversal event. Its own gap pattern/room checks are unchanged.
+        # Only a LATER closed swing break activates opposing pullbacks.
+        q = dict(p)
+        q["gap_trend_filter"] = (
+            "with_trend" if p.get("direction") == higher_direction
+            else "potential_reversal_wait_for_structural_break"
+        )
+        q["gap_higher_tf_direction"] = higher_direction
+        q["gap_higher_tf_states"] = dict(states)
+        filtered.append(q)
 
     return filtered, states, None
 
@@ -7092,6 +7167,15 @@ def apply_strong_trend_filter(symbol, grp, interval, setups):
 
     higher_direction, states, error = strong_higher_timeframe_trend(symbol, grp, interval)
     if error:
+        # A fully established local Gap -> closed swing break is independent
+        # of the API's Weekly/Daily availability. Preserve only those proved
+        # structural exceptions; never guess the normal trend direction.
+        qualified = [dict(p) for p in setups if p.get("structural_break_exception")
+                     and interval in ("8h", "12h")]
+        if qualified:
+            for p in qualified:
+                p["higher_tf_warning"] = "Higher timeframe temporarily unavailable; confirmed local structure break"
+            return qualified, {"Market": "Higher TF unavailable"}, None
         return [], states, error
 
     filtered = []
@@ -7099,10 +7183,12 @@ def apply_strong_trend_filter(symbol, grp, interval, setups):
         if p.get("name") != "TREND PULLBACK SETUP":
             filtered.append(p)
             continue
-        if higher_direction is not None and p.get("direction") != higher_direction:
-            continue
-        if higher_direction is None and states.get('Market') != 'Ranging':
-            continue
+        structural_exception = bool(p.get("structural_break_exception")) and interval in ("8h", "12h")
+        if not structural_exception:
+            if higher_direction is not None and p.get("direction") != higher_direction:
+                continue
+            if higher_direction is None and states.get('Market') != 'Ranging':
+                continue
         q = dict(p)
         q["higher_tf_filter"] = True
         q["higher_tf_direction"] = higher_direction
@@ -7389,12 +7475,26 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         except Exception as range_exc:
             print('Edo confirmed ranging check:',symbol,range_exc,flush=True)
         for conf in recent_confirmations(closed_candles, lookback=7):
+            # Reversal sequence: Gap Retest -> closed swing/zone break ->
+            # at least TWO NEW opposite-colour pullback candles -> confirmation.
+            # Higher-timeframe FULL trend may disagree after this local break.
+            gap_break_context = None
+            if interval in ("8h", "12h"):
+                run_colour = "green" if conf.get("direction") == "bearish" else "red"
+                count, start = count_same_colour_before(
+                    closed_candles, conf["index"], run_colour
+                )
+                if count >= 2:
+                    gap_break_context = edo_gap_break_pullback_context(
+                        closed_candles, conf["direction"], start, grp
+                    )
             pullback = detect_trend_pullback(
                 closed_candles,
                 conf,
                 allow_sr_exception=False,
                 require_local_trend=(ranging_context is None),
-                ranging_context=ranging_context
+                ranging_context=ranging_context,
+                structural_break_context=gap_break_context,
             )
             if not pullback:
                 continue
@@ -7427,6 +7527,20 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                 found.append(add_turning_point_gap_strength(closed_candles, diagonal_setup, interval))
 
     # Avoid duplicate descriptions of the same setup/direction/confirmation.
+    # A simultaneous same-direction Gap Retest takes priority over a
+    # two-candle Pullback. Do not show/push both for the same closed candle.
+    # Other signal families and independent candle dates are untouched.
+    gap_first_keys = {
+        (p.get("direction"), p.get("confirmation_date"))
+        for p in found if p.get("name") == "S/R GAP RETEST SETUP"
+    }
+    if gap_first_keys:
+        found = [
+            p for p in found
+            if p.get("name") != "TREND PULLBACK SETUP" or
+            (p.get("direction"), p.get("confirmation_date")) not in gap_first_keys
+        ]
+
     unique = {}
     for p in found:
         key = (p["name"], p["direction"], p["confirmation_date"])
@@ -8218,12 +8332,26 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         except Exception as range_exc:
             print('Edo confirmed ranging check:',symbol,range_exc,flush=True)
         for conf in recent_confirmations(closed_candles, lookback=7):
+            # Reversal sequence: Gap Retest -> closed swing/zone break ->
+            # at least TWO NEW opposite-colour pullback candles -> confirmation.
+            # Higher-timeframe FULL trend may disagree after this local break.
+            gap_break_context = None
+            if interval in ("8h", "12h"):
+                run_colour = "green" if conf.get("direction") == "bearish" else "red"
+                count, start = count_same_colour_before(
+                    closed_candles, conf["index"], run_colour
+                )
+                if count >= 2:
+                    gap_break_context = edo_gap_break_pullback_context(
+                        closed_candles, conf["direction"], start, grp
+                    )
             pullback = detect_trend_pullback(
                 closed_candles,
                 conf,
                 allow_sr_exception=False,
                 require_local_trend=(ranging_context is None),
-                ranging_context=ranging_context
+                ranging_context=ranging_context,
+                structural_break_context=gap_break_context,
             )
             if not pullback:
                 continue
@@ -8251,6 +8379,20 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             diagonal_setup = detect_diagonal_gap_retest(closed_candles, sr_conf)
             if diagonal_setup:
                 found.append(add_turning_point_gap_strength(closed_candles, diagonal_setup, interval))
+
+    # A simultaneous same-direction Gap Retest takes priority over a
+    # two-candle Pullback. Do not show/push both for the same closed candle.
+    # Other signal families and independent candle dates are untouched.
+    gap_first_keys = {
+        (p.get("direction"), p.get("confirmation_date"))
+        for p in found if p.get("name") == "S/R GAP RETEST SETUP"
+    }
+    if gap_first_keys:
+        found = [
+            p for p in found
+            if p.get("name") != "TREND PULLBACK SETUP" or
+            (p.get("direction"), p.get("confirmation_date")) not in gap_first_keys
+        ]
 
     unique = {}
     for p in found:
