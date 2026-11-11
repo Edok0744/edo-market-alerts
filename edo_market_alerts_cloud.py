@@ -263,33 +263,59 @@ _HOME_PAGE_CACHE_LOCK = threading.Lock()
 # Refresh the saved-pair trend badges when HOME opens, not only when a Trend
 # detail page is viewed. Work runs off-request to keep the iPhone UI responsive.
 _EDO_OPEN_TREND_LOCK = threading.Lock()
-_EDO_OPEN_TREND_STATE = {"running": False, "started": 0.0, "completed": 0.0, "revision": 0}
-_EDO_OPEN_TREND_COOLDOWN = 180  # Avoid repeated broker/API downloads on every page refresh.
+_EDO_OPEN_TREND_STATE = {"running": False, "started": 0.0, "completed": 0.0, "revision": 0,
+                         "current_pair": "", "checked": 0, "total": 0,
+                         "successful": 0, "failed": 0}
+_EDO_OPEN_TREND_COOLDOWN = 180  # Protect the broker/API from refresh storms.
 
 def edo_home_trend_refresh_worker():
     try:
         with db_conn() as c:
-            pairs = c.execute("SELECT DISTINCT symbol, grp FROM favorites ORDER BY symbol").fetchall()
+            # Check missing/unconfirmed labels before already confirmed trends.
+            # One pair at a time respects the existing API throttle.
+            pairs = c.execute("""
+                SELECT DISTINCT f.symbol, f.grp
+                FROM favorites f LEFT JOIN trend_status t ON t.symbol=f.symbol
+                ORDER BY CASE
+                    WHEN t.status IS NULL OR t.status='' THEN 0
+                    WHEN t.status LIKE '%UNCONFIRMED' OR t.status='MIXED / WAIT' THEN 1
+                    ELSE 2 END, f.symbol
+            """).fetchall()
+        with _EDO_OPEN_TREND_LOCK:
+            _EDO_OPEN_TREND_STATE.update(current_pair='', checked=0,
+                                         total=len(pairs), successful=0, failed=0)
         for pair in pairs:
             symbol, grp = pair['symbol'], pair['grp']
-            # A temporary feed error must not overwrite the last known state.
             if str(grp).upper() == 'FOREX' and forex_weekend_closed():
                 continue
+            with _EDO_OPEN_TREND_LOCK:
+                _EDO_OPEN_TREND_STATE['current_pair'] = symbol
             try:
-                status, error = build_full_alignment(symbol, grp)
+                # Reuse the SAME Weekly + Daily candles to compute the trend
+                # and the arrow. The old code requested both feeds twice.
+                status, error = build_full_alignment(symbol, grp, refresh_inline=True)
                 if not error and status:
                     save_trend_status(symbol, status)
-                    # Weekly-to-Daily arrow uses the same confirmed main trend.
-                    update_weekly_daily_alignment(symbol, grp)
-                elif error:
-                    print('home-open trend refresh:', symbol, error, flush=True)
+                    with _EDO_OPEN_TREND_LOCK:
+                        _EDO_OPEN_TREND_STATE['successful'] += 1
+                else:
+                    if error:
+                        print('home-open trend refresh:', symbol, error, flush=True)
+                    with _EDO_OPEN_TREND_LOCK:
+                        _EDO_OPEN_TREND_STATE['failed'] += 1
             except Exception as exc:
                 print('home-open trend refresh failed:', symbol, exc, flush=True)
+                with _EDO_OPEN_TREND_LOCK:
+                    _EDO_OPEN_TREND_STATE['failed'] += 1
+            finally:
+                with _EDO_OPEN_TREND_LOCK:
+                    _EDO_OPEN_TREND_STATE['checked'] += 1
     except Exception as exc:
         print('home-open trend refresh worker:', exc, flush=True)
     finally:
         with _EDO_OPEN_TREND_LOCK:
             _EDO_OPEN_TREND_STATE['running'] = False
+            _EDO_OPEN_TREND_STATE['current_pair'] = ''
             _EDO_OPEN_TREND_STATE['completed'] = time.time()
             _EDO_OPEN_TREND_STATE['revision'] += 1
 
@@ -8796,15 +8822,24 @@ def weekly_daily_inline_from_candles(weekly, daily, now_utc=None):
     return direction, level, confirm_start.isoformat()
 
 
-def update_weekly_daily_alignment(symbol, grp):
-    """Mirror main-trend arrow; alert once when the confirmed direction changes."""
+def update_weekly_daily_alignment(symbol, grp, candles=None):
+    """Mirror main-trend arrow; alert once when the confirmed direction changes.
+
+    A caller that already fetched both timeframes should pass those candles,
+    avoiding unnecessary duplicate broker requests during Home refresh.
+    """
     state, level, confirmed_at = '', None, None
     try:
-        weekly, we = get_candles(symbol, '1week', outputsize=100, grp=grp)
-        daily, de = get_candles(symbol, '1day', outputsize=260, grp=grp)
-        if we or de or not weekly or not daily:
-            print('Weekly/Daily inline feed:', symbol, we or de, flush=True)
-            return   # Do not overwrite last known status on transient feed outage.
+        if candles is None:
+            weekly, we = get_candles(symbol, '1week', outputsize=100, grp=grp)
+            daily, de = get_candles(symbol, '1day', outputsize=260, grp=grp)
+            if we or de or not weekly or not daily:
+                print('Weekly/Daily inline feed:', symbol, we or de, flush=True)
+                return
+        else:
+            weekly, daily = candles
+            if not weekly or not daily:
+                return
         main_status, main_event, _ = weekly_daily_main_trend_from_candles(weekly, daily)
         if main_event:
             state = 'BULLISH' if main_status == 'FULL BULLISH' else 'BEARISH'
@@ -9002,7 +9037,7 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
                     'level_method': '1day', 'weekly_event': weekly_event}, weekly_event
 
 
-def build_full_alignment(symbol, grp=None):
+def build_full_alignment(symbol, grp=None, refresh_inline=False):
     """Main trend: confirmed Weekly body reversal + first Daily close beyond line."""
     clear_ohlc_cache_for_symbol(symbol, grp, intervals={'1week', '1day'})
     weekly, we = get_candles(symbol, '1week', outputsize=100, grp=grp)
@@ -9017,6 +9052,12 @@ def build_full_alignment(symbol, grp=None):
     daily_state = ('Bullish' if status == 'FULL BULLISH' else
                    'Bearish' if status == 'FULL BEARISH' else 'Mixed')
     save_trend_snapshot(symbol, {'Weekly': weekly_state, 'Daily': daily_state})
+    if refresh_inline:
+        # Do not download the same Weekly/Daily candles twice for each pair.
+        try:
+            update_weekly_daily_alignment(symbol, grp, candles=(weekly, daily))
+        except Exception as exc:
+            print('home inline update:', symbol, exc, flush=True)
     return status, None
 
 
