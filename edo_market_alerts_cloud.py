@@ -5738,62 +5738,89 @@ def trend_pullback_retracement_preserves_structure(candles, run_start, confirm_i
     return True
 
 def edo_gap_break_pullback_context(candles, direction, run_start, grp="FOREX"):
-    """Edo's counter-higher-trend continuation exception, 8H (FX/CFD) / 12H (Crypto).
+    """Permit a counter-higher-timeframe Pullback ONLY in a fresh local reversal.
 
-    A confirmed SAME-direction S/R Gap Retest must be followed by a separate,
-    fully CLOSED structural break beyond the PRE-EXISTING swing and its S/R area.
-    Only pullback runs that START AFTER that break are allowed to use this
-    exception. All evidence is strictly earlier than the pullback run.
-    No future candles can establish the gap, the swing, or the break.
+    In order: independently confirmed same-direction Gap Retest, later fully
+    closed break of the already-established swing, then a NEW run of 2+ opposing
+    candles. The reversal evidence must be recent and continuous: old gaps and
+    breaks cannot authorise an unrelated later BUY/SELL. The confirmation index
+    passed by the caller is excluded from all evidence.
     """
     if run_start < 23 or direction not in ("bullish", "bearish"):
         return None
-    last_index = run_start - 1
-    earliest = max(18, last_index - 45)
-    for gap_i in range(last_index - 1, earliest - 1, -1):
+
+    # 8h/12h: six bars from the break to the first pullback bar, and at most
+    # twelve bars from the Gap Retest to the structural break. This is a local
+    # transition, not permission to trade against Weekly/Daily for weeks.
+    max_gap_to_break = 12
+    max_break_to_run = 6
+    last_gap = run_start - 2  # Must leave one distinct bar for a later break.
+    first_gap = max(18, run_start - (max_gap_to_break + max_break_to_run + 1))
+
+    # Search newest qualifying gap first; never let an older event override it.
+    for gap_i in range(last_gap, first_gap - 1, -1):
         history = candles[:gap_i + 1]
         conf = sr_confirmation_at(history, gap_i)
         if conf is None and str(grp).upper() == "CRYPTO":
             conf = crypto_second_candle_sr_confirmation(history, gap_i)
         if not conf or conf.get("direction") != direction:
             continue
-        gap = detect_bounce_retest(history, conf)
+        horizontal = detect_bounce_retest(history, conf)
         diagonal = detect_diagonal_gap_retest(history, conf)
-        gap = max((g for g in (gap, diagonal) if g),
+        gap = max((g for g in (horizontal, diagonal) if g),
                   key=lambda g: float(g.get("score", 0.0)), default=None)
         if not gap:
             continue
 
-        # The swing must have already been confirmed before the Gap Retest.
-        # A pivot's right-hand confirmation candles are prior to gap_i.
-        kind = "low" if direction == "bearish" else "high"
-        key = kind
+        # Swing must be identifiable using only candles preceding the gap.
+        kind = "high" if direction == "bullish" else "low"
         pivots = swing_points(candles[:gap_i - 1], kind=kind, left=2, right=2)
         pivots = [(idx, float(price)) for idx, price in pivots
                   if idx >= max(2, gap_i - 42)]
         if not pivots:
             continue
         swing_i, swing_price = pivots[-1]
-        # A small buffer helps avoid treating a one-tick marginal close as
-        # a convincing break. Never infer a break from candle wicks alone.
         ar = avg_range(candles, gap_i + 1, 20)
         tolerance = max(0.0, float(ar) * 0.08)
-        for break_i in range(gap_i + 1, run_start):
-            close = float(candles[break_i]["close"])
-            if (direction == "bearish" and close < swing_price - tolerance) or (
-                direction == "bullish" and close > swing_price + tolerance
-            ):
-                return {
-                    "gap_confirmation_index": gap_i,
-                    "gap_confirmation_date": candles[gap_i].get("datetime", ""),
-                    "break_index": break_i,
-                    "break_date": candles[break_i].get("datetime", ""),
-                    "structural_level": swing_price,
-                    "structural_swing_index": swing_i,
-                    "structural_swing_date": candles[swing_i].get("datetime", ""),
-                    "direction": direction,
-                    "gap_kind": "diagonal" if gap.get("diagonal") else "horizontal",
-                }
+
+        break_end = min(run_start - 1, gap_i + max_gap_to_break)
+        for break_i in range(gap_i + 1, break_end + 1):
+            if run_start - break_i > max_break_to_run:
+                continue
+            breakout = float(candles[break_i]["close"])
+            if not ((direction == "bearish" and breakout < swing_price - tolerance) or
+                    (direction == "bullish" and breakout > swing_price + tolerance)):
+                continue
+
+            # Only accept the FIRST real break after the gap: an older break
+            # followed by another run must not continually renew the exception.
+            previous_closes = [float(c["close"]) for c in candles[gap_i + 1:break_i]]
+            if any((c < swing_price - tolerance if direction == "bearish" else
+                    c > swing_price + tolerance) for c in previous_closes):
+                continue
+
+            # The new structure must remain intact until the new pullback starts.
+            # Any close back through the structural line cancels authorisation.
+            intervening = candles[break_i + 1:run_start]
+            if any((float(c["close"]) > swing_price + tolerance if direction == "bearish"
+                    else float(c["close"]) < swing_price - tolerance)
+                   for c in intervening):
+                continue
+
+            return {
+                "gap_confirmation_index": gap_i,
+                "gap_confirmation_date": candles[gap_i].get("datetime", ""),
+                "break_index": break_i,
+                "break_date": candles[break_i].get("datetime", ""),
+                "structural_level": swing_price,
+                "structural_swing_index": swing_i,
+                "structural_swing_date": candles[swing_i].get("datetime", ""),
+                "direction": direction,
+                "gap_kind": "diagonal" if gap.get("diagonal") else "horizontal",
+                "bars_gap_to_break": break_i - gap_i,
+                "bars_break_to_pullback": run_start - break_i,
+                "reversal_authorisation": "RECENT GAP RETEST → CLOSED SWING BREAK",
+            }
     return None
 
 
@@ -6409,6 +6436,8 @@ def describe_setup(p, interval=None):
             detail += f" • D1: {htf.get('1D','?')} • W1: {htf.get('1W','?')}"
             if p.get('higher_tf_warning'):
                 detail += f" • {p['higher_tf_warning']}"
+            if p.get('higher_tf_exception_reason'):
+                detail += f" • {p['higher_tf_exception_reason']}"
         level_text = f"Close: {p['confirmation_close']:.5f}"
     else:
         detail = f"Range reversal • {p['run_count']} candles • {p['penetration']:.0f}% confirmation"
@@ -7190,6 +7219,16 @@ def apply_strong_trend_filter(symbol, grp, interval, setups):
             if higher_direction is None and states.get('Market') != 'Ranging':
                 continue
         q = dict(p)
+        # Explain any genuine counter-trend permission; normal aligned setups
+        # retain the existing label and trading logic.
+        if structural_exception and higher_direction is not None and p.get("direction") != higher_direction:
+            context = p.get("gap_break_context") or {}
+            q["higher_tf_exception_reason"] = (
+                f"Counter-trend permitted: {context.get('gap_kind', 'S/R')} Gap Retest "
+                f"{context.get('gap_confirmation_date', '?')}; "
+                f"closed swing break {context.get('break_date', '?')} "
+                f"at {context.get('structural_level', 0):.6g}"
+            )
         q["higher_tf_filter"] = True
         q["higher_tf_direction"] = higher_direction
         q["higher_tf_states"] = dict(states)
@@ -8145,6 +8184,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 f"Weekly {htf.get('1W', 'unknown')}. "
                 f"Direction source: {used_tf} {used_state}. "
                 f"{p.get('higher_tf_warning', '')}. "
+                f"{p.get('higher_tf_exception_reason', '')}. "
             )
         else:
             trend_line = ""
