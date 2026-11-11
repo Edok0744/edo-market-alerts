@@ -3515,7 +3515,57 @@ def fxcm_cfd_symbol(symbol):
     }.get(s, s)
 
 
-def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
+def _edo_cfd_fxcm_weekly_from_daily(daily_candles, now_utc=None):
+    """Make CFD weekly candles from the SAME FXCM Bid D1 bars as its Daily trend.
+
+    A Sunday FXCM session belongs to the following ISO trading week.  Only
+    already-completed daily candles can contribute, and the still-forming
+    current weekly candle is explicitly marked.  This avoids mixing SPX500
+    with SPY or US30 with DIA and saves the Twelve Data weekly requests.
+    """
+    from datetime import timedelta
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    current_monday = (now_utc - timedelta(days=now_utc.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    weeks = {}
+    for c in daily_candles or []:
+        if c.get('_fxcm_forming'):
+            continue
+        dt = parse_candle_utc(c.get('datetime'))
+        if dt is None:
+            continue
+        # FXCM's Sunday session is part of the following trading week.
+        effective = dt + timedelta(days=1) if dt.weekday() == 6 else dt
+        monday = (effective - timedelta(days=effective.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        bucket = weeks.setdefault(monday, [])
+        bucket.append((dt, c))
+    results = []
+    for monday, entries in sorted(weeks.items()):
+        entries.sort(key=lambda x: x[0])
+        rows = [c for _, c in entries]
+        if not rows:
+            continue
+        # The earliest bucket may have begun before the downloaded history.
+        # Never infer a historical complete week from a truncated first bar.
+        if monday == min(weeks) and len(rows) < 3:
+            continue
+        results.append({
+            'datetime': monday.strftime('%Y-%m-%d %H:%M:%S'),
+            'open': float(rows[0]['open']),
+            'high': max(float(c['high']) for c in rows),
+            'low': min(float(c['low']) for c in rows),
+            'close': float(rows[-1]['close']),
+            '_source_symbol': rows[-1].get('_source_symbol', ''),
+            '_source_label': rows[-1].get('_source_label', 'FXCM Bid') + ' (Weekly from FXCM D1)',
+            '_fxcm_native': True,
+            '_fxcm_forming': monday >= current_monday,
+        })
+    return results
+
+
+def fxcm_service_get_ohlc(symbol, interval, outputsize=140, shared_cfd_cache=False):
     """Read FXCM Bid candles from EdoSignal's private Railway FXCM service."""
     if not FXCM_SERVICE_URL:
         return None, "FXCM service URL is not configured."
@@ -3530,18 +3580,49 @@ def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
     if not tf:
         return None, f"FXCM service does not provide {interval}."
 
+    # Only CFD requests share a short-lived, disk-backed FXCM response cache.
+    # This works across Gunicorn workers and avoids repeat index requests
+    # when Home trends, Weekly patterns and Price Action open together.
+    # Forex's existing fetch behaviour is intentionally not changed.
+    cfd_cache_path = None
+    cfd_cache_ttl = 0
+    if shared_cfd_cache:
+        cfd_cache_ttl = {'D1': 420, 'H8': 240, 'H4': 210}.get(tf, 180)
+        cache_spec = f'{symbol.upper()}|{tf}|{int(outputsize)}'
+        cfd_cache_path = os.path.join(
+            _EDO_TWELVE_CACHE_DIR,
+            'fxcm_cfd_' + hashlib.sha256(cache_spec.encode('utf-8')).hexdigest() + '.json')
+        cached_response = _edo_load_twelve_cache(cfd_cache_path, cfd_cache_ttl)
+        if cached_response is not None and cached_response.get('ok') and cached_response.get('rows'):
+            payload = cached_response
+        else:
+            payload = None
+    else:
+        payload = None
+
     try:
-        r = requests.get(
-            FXCM_SERVICE_URL + "/candles",
-            params={
-                "symbol": symbol,
-                "timeframe": tf,
-                "count": max(10, min(int(outputsize), 500)),
-            },
-            timeout=20
-        )
-        r.raise_for_status()
-        payload = r.json()
+        if payload is None:
+            r = requests.get(
+                FXCM_SERVICE_URL + "/candles",
+                params={
+                    "symbol": symbol,
+                    "timeframe": tf,
+                    "count": max(10, min(int(outputsize), 500)),
+                },
+                timeout=20
+            )
+            r.raise_for_status()
+            payload = r.json()
+            if (cfd_cache_path and payload.get('ok') and payload.get('rows')):
+                try:
+                    os.makedirs(_EDO_TWELVE_CACHE_DIR, exist_ok=True)
+                    temp_file = (cfd_cache_path + '.' + str(os.getpid()) + '.' +
+                                 str(threading.get_ident()) + '.tmp')
+                    with open(temp_file, 'w', encoding='utf-8') as f:
+                        json.dump({'saved_at': time.time(), 'response': payload}, f)
+                    os.replace(temp_file, cfd_cache_path)
+                except OSError as exc:
+                    print('CFD FXCM cache write skipped', exc, flush=True)
 
         if not payload.get("ok"):
             return None, "FXCM service error: " + str(payload.get("error", "Unknown error"))
@@ -3597,7 +3678,7 @@ def fxcm_service_get_ohlc(symbol, interval, outputsize=140):
 
 
 def get_ohlc(symbol, interval, outputsize=140, grp=None):
-    """Download OHLC oldest -> newest. Forex and key CFDs use FXCM; Crypto uses Bybit; other data uses Twelve Data."""
+    """Download OHLC oldest -> newest. CFDs use FXCM Bid Daily/Weekly; Crypto uses Bybit."""
     cache_key = (grp or "", symbol.upper().strip(), interval)
     now = time.time()
     ttl = ohlc_cache_seconds(interval)
@@ -3636,34 +3717,48 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
     # FXCM Bid candles instead of Twelve Data ETF proxies (SPY/DIA/QQQ).
     # This prevents a proxy ETF candle sequence from creating a Trend Pullback
     # that is not visible on Edo's FXCM SPX500/US30/NAS100 chart.
-    if grp == "CFD" and interval in {"4h", "8h", "1day"}:
+    if grp == "CFD" and interval in {"4h", "8h", "1day", "1week"}:
         fxcm_symbol = fxcm_cfd_symbol(symbol)
-        fxcm_candles, fxcm_error = fxcm_service_get_ohlc(
-            fxcm_symbol, interval, outputsize
-        )
-        if fxcm_candles:
-            for c in fxcm_candles:
-                c["_source_symbol"] = fxcm_symbol
-                c["_source_label"] = f"FXCM {fxcm_symbol} Bid"
-            if len(fxcm_candles) < min(40, outputsize):
-                return None, (
-                    f"Not enough valid {interval} FXCM CFD candles returned "
-                    f"for {fxcm_symbol}."
-                )
+        # Use the SAME broker D1 candles for the CFD Daily/Weekly trend.
+        # There is no FXCM native 1week endpoint in Edo's helper service.
+        # The previous weekly SPY/DIA index-proxy fallback could disagree with
+        # the real CFD Daily candles and consumed scarce Twelve Data credits.
+        source_interval = '1day' if interval == '1week' else interval
+        requested = 500 if source_interval == '1day' else outputsize
+        source_key = ('CFD', symbol.upper().strip(), source_interval)
+        with _CACHE_LOCK:
+            prior = _OHLC_CACHE.get(source_key)
+            source_candles = (prior['candles'] if prior and
+                now - prior['saved_at'] < ohlc_cache_seconds(source_interval)
+                and len(prior['candles']) >= (min(350, requested) if source_interval == '1day' else outputsize)
+                else None)
+        fxcm_error = None
+        if source_candles is None:
+            source_candles, fxcm_error = fxcm_service_get_ohlc(
+                fxcm_symbol, source_interval, requested, shared_cfd_cache=True
+            )
+        if source_candles:
+            for c in source_candles:
+                c['_source_symbol'] = fxcm_symbol
+                c['_source_label'] = f'FXCM {fxcm_symbol} Bid'
+            if len(source_candles) < min(40, requested):
+                return None, (f'Not enough {source_interval} FXCM CFD candles for {fxcm_symbol}.')
             with _CACHE_LOCK:
-                _OHLC_CACHE[cache_key] = {
-                    "saved_at": now,
-                    "candles": fxcm_candles
-                }
-            print("CFD market source", symbol, "-> FXCM", fxcm_symbol)
-            return fxcm_candles[-outputsize:], None
-
-        # IMPORTANT: do not silently fall back to SPY/DIA/QQQ for these signal
-        # timeframes. A proxy can have different candles and create false visual
-        # matches. Show a data error instead of issuing a mismatched signal.
-        return None, (
-            f"FXCM CFD chart data unavailable for {fxcm_symbol}: {fxcm_error}"
-        )
+                _OHLC_CACHE[source_key] = {'saved_at': now, 'candles': source_candles}
+            if interval == '1week':
+                result = _edo_cfd_fxcm_weekly_from_daily(source_candles)
+                if len(result) < 40:
+                    return None, (f'Not enough completed FXCM CFD Weekly history for {fxcm_symbol} '
+                                  f'({len(result)} weekly candles).')
+                with _CACHE_LOCK:
+                    _OHLC_CACHE[cache_key] = {'saved_at': now, 'candles': result}
+                print('CFD weekly source', symbol, '-> FXCM D1 grouped weeks', len(result))
+                return result[-outputsize:], None
+            print('CFD market source', symbol, '-> FXCM', fxcm_symbol)
+            return source_candles[-outputsize:], None
+        # Do NOT silently fall back to an ETF proxy: its price/volume and
+        # candle breaks are different from the index CFDs Edo trades.
+        return None, f'FXCM CFD candle data unavailable for {fxcm_symbol}: {fxcm_error}'
 
     # Crypto uses the same Bybit USDT perpetual market Edo trades.
     # The newest raw candle may still be forming. Signal logic continues to
