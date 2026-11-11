@@ -9067,108 +9067,107 @@ def update_weekly_daily_alignment(symbol, grp, candles=None):
 
 
 def edo_confirmed_horizontal_range(closed_daily):
-    """Recognise an existing nearly-horizontal range from COMPLETED Weekly or Daily bars.
+    """Detect an ACTIVE near-horizontal four-touch range from completed bars.
 
-    Points 1,2 = TWO previously confirmed swing highs; A,B = TWO previously
-    confirmed swing lows. The newest two pivot highs and lows must be distinct,
-    near-horizontal and approximately parallel. Merely unclear direction is
-    never enough. Uses no forming candles and no future bars to create pivots.
+    1,2 are two distinct confirmed resistance pivots; A,B are two distinct
+    confirmed support pivots. Only historical completed bars are supplied.
+    A current range can form while an older Weekly trend trigger still exists.
     """
     if not closed_daily or len(closed_daily) < 24:
         return None
     history = closed_daily[-80:]
-    # Require real local turning points, not repeated equal-price plateaus.
-    highs = [(i,v) for i,v in swing_points(history, 'high', left=2, right=2)
-             if float(v) > max(float(history[j]['high']) for j in range(i-2,i))
-             and float(v) > max(float(history[j]['high']) for j in range(i+1,i+3))]
-    lows = [(i,v) for i,v in swing_points(history, 'low', left=2, right=2)
-            if float(v) < min(float(history[j]['low']) for j in range(i-2,i))
-            and float(v) < min(float(history[j]['low']) for j in range(i+1,i+3))]
+    count = len(history)
+    # Strict turning points, confirmed by two later CLOSED bars. Equal-price
+    # plateaus alone must not count as separate touches.
+    highs = [(i, float(v)) for i, v in swing_points(history, 'high', left=2, right=2)
+             if float(v) > max(float(history[j]['high']) for j in range(i-2, i))
+             and float(v) > max(float(history[j]['high']) for j in range(i+1, i+3))]
+    lows = [(i, float(v)) for i, v in swing_points(history, 'low', left=2, right=2)
+            if float(v) < min(float(history[j]['low']) for j in range(i-2, i))
+            and float(v) < min(float(history[j]['low']) for j in range(i+1, i+3))]
     if len(highs) < 2 or len(lows) < 2:
         return None
-    (h1, top1), (h2, top2) = highs[-2:]
-    (l1, bot1), (l2, bot2) = lows[-2:]
-    if h2-h1 < 4 or l2-l1 < 4:
+    atr = avg_range(history, end=count, length=20)
+    if atr <= 0:
         return None
-    if max(h1,l1) >= min(h2,l2):
-        # Both older anchors should exist before the newest boundary tests;
-        # crossings of the two lines are otherwise poorly established.
+    # Examine several recent pivot combinations. Requiring just the LAST two
+    # highs and lows misses an otherwise clear range containing a smaller
+    # intermediate swing, like Edo's EUR/USD Daily chart.
+    options = []
+    recent_highs, recent_lows = highs[-7:], lows[-7:]
+    for hi in range(len(recent_highs)-1):
+        for hj in range(hi+1, len(recent_highs)):
+            (h1, top1), (h2, top2) = recent_highs[hi], recent_highs[hj]
+            if h2-h1 < 4:
+                continue
+            for li in range(len(recent_lows)-1):
+                for lj in range(li+1, len(recent_lows)):
+                    (l1, bot1), (l2, bot2) = recent_lows[li], recent_lows[lj]
+                    if l2-l1 < 4:
+                        continue
+                    # Each boundary needs two independently completed tests.
+                    # The first high/low pair must precede the second pair.
+                    if max(h1, l1) >= min(h2, l2):
+                        continue
+                    latest_touch = max(h2, l2)
+                    if latest_touch < count-18:
+                        continue
+                    upper = (top1+top2)/2.0
+                    lower = (bot1+bot2)/2.0
+                    width = upper-lower
+                    if width <= 0 or width < 2.0*atr:
+                        continue
+                    upper_delta = top2-top1
+                    lower_delta = bot2-bot1
+                    # Almost horizontal, reasonably parallel (not a descending
+                    # channel). Small offsets between touches are expected.
+                    if abs(upper_delta) > width*0.20 or abs(lower_delta) > width*0.20:
+                        continue
+                    if abs(upper_delta-lower_delta) > width*0.15:
+                        continue
+                    if min(top1,top2)-max(bot1,bot2) < width*0.58:
+                        continue
+                    margin = min(width*0.10, atr*0.40)
+                    # Check the ENTIRE completed structure, not only candles
+                    # since the last touch: an older fake rectangle followed
+                    # by a real breakout must never be called RANGING.
+                    first_touch = min(h1, l1)
+                    if any(float(c['close']) > upper+margin or
+                           float(c['close']) < lower-margin
+                           for c in history[first_touch:]):
+                        continue
+                    # Latest closed price must still be within historical
+                    # support/resistance; no stale range after breakdown.
+                    last_close = float(history[-1]['close'])
+                    if not lower-margin <= last_close <= upper+margin:
+                        continue
+                    if not (min(bot1,bot2)-margin <= last_close <= max(top1,top2)+margin):
+                        continue
+                    options.append((latest_touch, -abs(upper_delta)-abs(lower_delta),
+                                    {'upper':upper, 'lower':lower, 'width':width,
+                                     'high_points':(h1,h2),'low_points':(l1,l2),
+                                     'first_anchor_at':history[first_touch].get('datetime'),
+                                     'last_anchor_at':history[latest_touch].get('datetime'),
+                                     'atr':atr, 'market':'RANGING'}))
+    if not options:
         return None
-    if min(h2,l2) < len(history)-38:
-        return None
-    # All four anchors must be finished, with a reasonably RECENT second
-    # touch on each boundary. Old ranges must not persist after a new trend.
-    if max(h2,l2) < len(history)-16:
-        return None
-    upper = (float(top1) + float(top2))/2.0
-    lower = (float(bot1) + float(bot2))/2.0
-    width = upper-lower
-    atr = avg_range(history, end=len(history), length=20)
-    if width <= 0 or atr <= 0 or width < 2.0*atr:
-        return None
-    # A range may have a gentle slope, never a clearly sloping channel.
-    upper_delta = float(top2)-float(top1)
-    lower_delta = float(bot2)-float(bot1)
-    if abs(upper_delta) > width*0.20 or abs(lower_delta) > width*0.20:
-        return None
-    if abs(upper_delta-lower_delta) > width*0.15:
-        return None
-    # Two nearly parallel lines must keep a reasonable separation at their
-    # existing endpoints, even when their test candles differ.
-    if min(float(top1),float(top2))-max(float(bot1),float(bot2)) < width*0.58:
-        return None
-    # No established breakout: completed closes must respect the boundaries.
-    breakout_margin = min(width*0.12, atr*0.45)
-    recent = history[max(h2,l2)+1:]
-    if not recent:
-        recent = history[-3:]
-    if any(float(c['close']) > upper+breakout_margin or
-           float(c['close']) < lower-breakout_margin for c in recent):
-        return None
-    if not lower-breakout_margin <= float(history[-1]['close']) <= upper+breakout_margin:
-        return None
-    # A sustained directional move is NOT a range even if four OLD pivots
-    # happened to form an approximately horizontal rectangle. Compare the
-    # recent closes and reject decisive movement towards/outside one side.
-    last_n = min(10, len(history)-max(h2,l2))
-    if last_n >= 5:
-        tail = history[-last_n:]
-        first_close = float(tail[0]['close'])
-        last_close = float(tail[-1]['close'])
-        if abs(last_close-first_close) > max(width*0.36, atr*2.5):
-            return None
-    # Stay inside the actual support/resistance from the four touch points.
-    # The average boundary by itself can be too permissive after a breakdown.
-    if (float(history[-1]['close']) < min(float(bot1),float(bot2))-breakout_margin
-        or float(history[-1]['close']) > max(float(top1),float(top2))+breakout_margin):
-        return None
-    return {'upper':upper,'lower':lower,'width':width,
-            'high_points':(h1,h2),'low_points':(l1,l2),
-            'first_anchor_at':history[min(h1,l1)].get('datetime'),
-            'last_anchor_at':history[max(h2,l2)].get('datetime'),
-            'atr':atr, 'market':'RANGING'}
+    # Prefer the newest four-touch channel, then the flattest boundaries.
+    return max(options, key=lambda option:(option[0],option[1]))[2]
 
 
 def edo_weekly_daily_range(weekly_closed, daily_closed):
-    """Only completed WEEKLY or DAILY candles may establish RANGING.
+    """Use only COMPLETED Daily/Weekly four-touch horizontal ranges.
 
-    Prefer the more actionable Daily boundary when both qualify; do not use
-    an 8H, 12H, 4H, 3H or Monthly chart to derive a range classification.
+    An intact new sideways structure can supersede an older directional
+    Weekly trigger. Breakouts are rejected by the geometry/closed-price test,
+    not just by comparing the FIRST touch's date with a Weekly event date.
     """
-    # A NEW Weekly body breakout supersedes any channel established BEFORE
-    # that reversal. An old rectangle must never override a fresh breakout.
-    latest_weekly = weekly_daily_inline_event(weekly_closed)
-    event_start = latest_weekly['weekly_start'] if latest_weekly else None
     daily_range = edo_confirmed_horizontal_range(daily_closed)
     if daily_range:
-        anchor = parse_candle_utc(daily_range.get('first_anchor_at'))
-        if event_start is None or (anchor is not None and anchor > event_start):
-            return dict(daily_range, source_interval='1day')
+        return dict(daily_range, source_interval='1day')
     weekly_range = edo_confirmed_horizontal_range(weekly_closed)
     if weekly_range:
-        anchor = parse_candle_utc(weekly_range.get('first_anchor_at'))
-        if event_start is None or (anchor is not None and anchor > event_start):
-            return dict(weekly_range, source_interval='1week')
+        return dict(weekly_range, source_interval='1week')
     return None
 
 
@@ -9208,6 +9207,12 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
     weekly_closed = weekly_card_completed_candles(weekly, now_utc=now_utc)
     daily_closed = fully_closed_candles(daily, '1day', now_utc=now_utc)
     weekly_event = weekly_daily_inline_event(weekly_closed)
+    # The latest confirmed horizontal four-touch range is a current market
+    # structure, not an unconfirmed trend. Its support/resistance must still
+    # contain every relevant closed price; a breakout removes this override.
+    active_range = edo_weekly_daily_range(weekly_closed, daily_closed)
+    if active_range is not None:
+        return 'RANGING', None, weekly_event
     if weekly_event is None or len(daily_closed) < 5:
         return edo_unconfirmed_or_ranging(weekly_event, weekly_closed, daily_closed), None, weekly_event
     direction, level, confirmed_at = weekly_daily_inline_from_candles(
@@ -10200,7 +10205,9 @@ def build_trend_scan(symbol, grp=None):
     weekly_direction = weekly_event['direction'] if weekly_event else 'NONE'
     weekly_text = (f'{weekly_direction} Weekly opposite-colour body break'
                    + (f' • trigger {level:.5f}' if level is not None else ''))
-    daily_text = ('Confirmed completed Daily close beyond Weekly trigger line'
+    daily_text = ('Confirmed near-horizontal four-touch range on Daily/Weekly; price remains inside support and resistance'
+                  if status == 'RANGING' else
+                  'Confirmed completed Daily close beyond Weekly trigger line'
                   if event else 'Awaiting completed Daily close beyond Weekly trigger line')
     results = [
         {'label': 'Weekly body-break trigger', 'interval': '1week',
