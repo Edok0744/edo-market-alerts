@@ -1,4 +1,4 @@
-import os, time, sqlite3, threading, json, base64
+import os, time, sqlite3, threading, json, base64, hashlib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, render_template_string, redirect, send_from_directory, Response
@@ -93,7 +93,7 @@ CHECK_SECONDS = int(os.environ.get('CHECK_SECONDS', '900'))
 # to kill a worker. The limiter now uses a tiny file + Linux file lock.
 # This keeps the API protection shared between workers on the same service
 # without holding the main EdoSignal database open.
-TWELVE_CALL_LIMIT = int(os.environ.get('TWELVE_CALL_LIMIT', '5'))
+TWELVE_CALL_LIMIT = max(1, min(5, int(os.environ.get('TWELVE_CALL_LIMIT', '5'))))
 TWELVE_CALL_WINDOW = 60.0
 
 _API_LIMIT_FILE = os.environ.get(
@@ -224,11 +224,103 @@ def wait_for_twelve_credit(max_wait=2.0):
         time.sleep(min(wait_seconds, remaining))
 
 
+# Market-data response cache shared by all workers of this Railway service.
+# Never cache API errors or include the API key in the cache payload.
+_EDO_TWELVE_CACHE_DIR = os.environ.get(
+    'EDO_TWELVE_CACHE_DIR', os.path.join(os.path.dirname(os.path.abspath(DB)), '.edo_twelve_cache')
+)
+
+
+def _edo_background_market_worker():
+    # Web requests run in Gunicorn's main thread; all signal-monitor threads
+    # are spawned with daemon=True. Only monitors may wait for quota credits.
+    return threading.current_thread().daemon and threading.current_thread() is not threading.main_thread()
+
+
+def _edo_twelve_cache_ttl(endpoint, params):
+    if endpoint.rstrip('/').endswith('/price'):
+        return 15
+    interval = str(params.get('interval', '')).lower()
+    return {
+        '1min': 15, '1h': 90, '2h': 120, '3h': 180,
+        '4h': 210, '6h': 240, '8h': 270, '12h': 300,
+        '1day': 420, '1week': 1200, '1month': 2700,
+    }.get(interval, 120)
+
+
+def _edo_twelve_cache_path(endpoint, params):
+    # Include outputsize and timezone, but never write the API key to disk.
+    safe_params = {k: str(v) for k, v in params.items() if str(k).lower() != 'apikey'}
+    encoded = json.dumps([endpoint, safe_params], sort_keys=True, separators=(',', ':'))
+    digest = hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+    return os.path.join(_EDO_TWELVE_CACHE_DIR, digest + '.json')
+
+
+def _edo_load_twelve_cache(path, ttl):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        if (isinstance(payload, dict)
+                and time.time() - float(payload.get('saved_at', 0)) < ttl
+                and isinstance(payload.get('response'), dict)):
+            return payload['response']
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
 def twelve_get_json(endpoint, params, timeout=15):
-    """All Twelve Data requests pass through the shared fail-fast limiter."""
-    wait_for_twelve_credit(max_wait=2.0)
-    r = requests.get(endpoint, params=params, timeout=timeout)
-    return r.json()
+    """Share one response per symbol/interval/size across monitor threads/workers.
+
+    An initial cold cache may take several minutes to populate at five credits
+    per minute. Background scan threads wait; HTTP requests fail quickly instead
+    of blocking Gunicorn. Failed responses are never cached.
+    """
+    ttl = _edo_twelve_cache_ttl(endpoint, params)
+    path = _edo_twelve_cache_path(endpoint, params)
+    cached = _edo_load_twelve_cache(path, ttl)
+    if cached is not None:
+        return cached
+
+    background = _edo_background_market_worker()
+    os.makedirs(_EDO_TWELVE_CACHE_DIR, exist_ok=True)
+    # Single-flight across workers: a concurrent request for the same candles
+    # must not spend a second API credit when the first request is underway.
+    lock_handle = open(path + '.lock', 'a+b')
+    try:
+        if fcntl is not None:
+            if background:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            else:
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise TwelveDataCoolingDown('Market data is refreshing in the background.')
+        # A different worker may have filled the cache while we were waiting.
+        cached = _edo_load_twelve_cache(path, ttl)
+        if cached is not None:
+            return cached
+        wait_for_twelve_credit(max_wait=85.0 if background else 2.0)
+        r = requests.get(endpoint, params=params, timeout=timeout)
+        r.raise_for_status()
+        result = r.json()
+        if (isinstance(result, dict) and result.get('status') != 'error'
+                and ((isinstance(result.get('values'), list) and bool(result['values']))
+                     or (endpoint.rstrip('/').endswith('/price') and 'price' in result))):
+            try:
+                tmp = path + '.tmp.' + str(os.getpid()) + '.' + str(threading.get_ident())
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump({'saved_at': time.time(), 'response': result}, f)
+                os.replace(tmp, path)
+            except OSError:
+                pass  # Data remains usable even if cache storage is unavailable.
+        return result
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_handle.close()
 
 
 def ohlc_cache_seconds(interval):
@@ -8351,7 +8443,9 @@ def pattern_signal_monitor():
 
             # Mark checked even on a normal API/data error so a broken symbol
             # cannot spin rapidly and monopolise background capacity.
-            last_checked[key] = time.time()
+            # A failed API read is not a completed pattern scan. Revisit after
+            # a short backoff instead of waiting another whole timeframe cycle.
+            last_checked[key] = time.time() if not error else time.time() - max(0, due - 120)
 
             if error:
                 print("pattern monitor error", symbol, interval, error)
@@ -9039,7 +9133,7 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
 
 def build_full_alignment(symbol, grp=None, refresh_inline=False):
     """Main trend: confirmed Weekly body reversal + first Daily close beyond line."""
-    clear_ohlc_cache_for_symbol(symbol, grp, intervals={'1week', '1day'})
+    # Respect the closed-candle cache; previously every trend check forced two fresh calls.
     weekly, we = get_candles(symbol, '1week', outputsize=100, grp=grp)
     if we:
         return '', we
