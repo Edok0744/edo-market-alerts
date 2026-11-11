@@ -4830,13 +4830,13 @@ def add_turning_point_gap_strength(candles, setup, interval):
 
 # Independent Morning / Evening Star and single-candle rejection signals.
 # These do not alter the separate Gap Retest or Trend Pullback detectors.
-STAR_PATTERN_INTERVALS = frozenset({"3h", "4h", "1day", "1week"})
+STAR_PATTERN_INTERVALS = frozenset({"1week", "1month"})
 STAR_PATTERN_NAMES = frozenset({"MORNING STAR SETUP", "EVENING STAR SETUP",
                                 "HAMMER REVERSAL SETUP", "SHOOTING STAR SETUP"})
 
 
 def detect_trendline_star(candles, i):
-    """Recognise a closed bullish/bearish star/rejection at a confirmed 3rd+ line touch.
+    """Recognise a closed bullish/bearish star/rejection at a confirmed 3rd+ line touch (Weekly/Monthly only).
 
     Two established, separated and chronologically confirmed swing anchors make
     the trendline. The current reversal test is touch three; earlier independent
@@ -7059,8 +7059,8 @@ def attach_pattern_push_history(symbol, interval, patterns):
 
 
 def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
-    if interval == "1month" and str(grp).upper() not in {"FOREX", "CRYPTO"}:
-        return None, "Monthly Trend Pullback is supported for Forex and Crypto only."
+    # Monthly special reversals apply across Forex, CFD, and Crypto;
+    # Monthly Trend Pullback remains restricted by pullback_interval_enabled().
     cache_key = f"{grp}|{symbol}|{interval}"
     now = time.time()
     cached = PATTERN_SIGNAL_CACHE.get(cache_key)
@@ -7084,7 +7084,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     found = []
 
-    # Independent trendline star/rejection signals (3H/4H/Daily/Weekly).
+    # Independent trendline star/rejection signals (Weekly/Monthly).
     if interval in STAR_PATTERN_INTERVALS:
         for star_i in range(max(35,len(closed_candles)-9), len(closed_candles)):
             star = detect_trendline_star(closed_candles, star_i)
@@ -7884,8 +7884,8 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
-    if interval == "1month" and str(grp).upper() not in {"FOREX", "CRYPTO"}:
-        return None, None, "Monthly Trend Pullback is supported for Forex and Crypto only."
+    # Monthly CFD is enabled for Weekly/Monthly special reversals only;
+    # other CFD Monthly patterns remain excluded by their dedicated gates.
     """
     Collect Edo's trading setups from fully closed candles only: normal Trend Pullback (4H trend-filtered; 8H/Daily/Weekly near S/R, no 50%) and S/R Gap-Retest (8H/Daily/Weekly, 50% rules).
 
@@ -7921,7 +7921,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     found = []
 
-    # Independent trendline star/rejection signals (3H/4H/Daily/Weekly).
+    # Independent trendline star/rejection signals (Weekly/Monthly).
     if interval in STAR_PATTERN_INTERVALS:
         for star_i in range(max(35,len(closed_candles)-9), len(closed_candles)):
             star = detect_trendline_star(closed_candles, star_i)
@@ -8251,8 +8251,8 @@ def pattern_signal_monitor():
                         continue
                     if interval == "8h" and grp == "CRYPTO":
                         continue
-                    if interval == "1month" and grp not in {"FOREX", "CRYPTO"}:
-                        continue
+                    # Monthly special reversals are supported for every market group.
+                    # The per-pattern timeframe filters retain existing restrictions.
                     # Do not waste the serial scan queue on timeframe/group
                     # combinations that have NO active signal family.
                     if not (pullback_interval_enabled(grp, interval)
@@ -10494,7 +10494,6 @@ def signal(i):
     signal_timeframes = [
         x for x in PATTERN_TIMEFRAMES
         if not (f['grp'] == 'CRYPTO' and x['value'] == '8h')
-        and not (f['grp'] == 'CFD' and x['value'] == '1month')
         and not (f['grp'] != 'CRYPTO' and x['value'] == '12h')
     ]
     allowed = {x["value"]: x["label"] for x in signal_timeframes}
