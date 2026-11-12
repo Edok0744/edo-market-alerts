@@ -7103,12 +7103,28 @@ def weekly_daily_direction_for_filters(symbol, grp):
     if we or de:
         return None, {}, we or de
     status, _, weekly_event = weekly_daily_main_trend_from_candles(weekly, daily)
-    direction = ('bullish' if status == 'FULL BULLISH' else
-                 'bearish' if status == 'FULL BEARISH' else None)
+    confirmed_direction = ('bullish' if status == 'FULL BULLISH' else
+                           'bearish' if status == 'FULL BEARISH' else None)
+    # Edo lower-TF Pullback rule: Daily confirmed direction first; when Daily
+    # is MIXED/UNCONFIRMED, fall back to the LAST CLOSED Weekly body-break
+    # direction. Never interpret MIXED itself as permission to trade both
+    # ways. Only a separately CONFIRMED four-touch Daily/Weekly range can
+    # permit BUY and SELL Pullbacks. Applies equally to 4H, 8H and 12H.
+    weekly_fallback = (str(weekly_event.get('direction', '')).lower()
+                       if weekly_event else None)
+    if weekly_fallback not in ('bullish', 'bearish'):
+        weekly_fallback = None
+    is_confirmed_range = status == 'RANGING'
+    direction = (None if is_confirmed_range else
+                 confirmed_direction or weekly_fallback)
     states = {'1W': weekly_event['direction'].capitalize() if weekly_event else 'Mixed',
-              '1D': direction.capitalize() if direction else 'Mixed',
-              'Used': 'Weekly trigger + completed Daily close',
-              'Market': ('Trending' if direction else 'Ranging' if status == 'RANGING' else 'Mixed / Wait')}
+              '1D': confirmed_direction.capitalize() if confirmed_direction else 'Mixed',
+              'Used': ('Confirmed four-touch Weekly/Daily range' if is_confirmed_range else
+                       'Weekly trigger + completed Daily close' if confirmed_direction else
+                       'Closed Weekly direction fallback (Daily awaiting confirmation)' if weekly_fallback else
+                       'Awaiting Weekly/Daily trend confirmation'),
+              'Market': ('Ranging' if is_confirmed_range else
+                         'Trending' if direction else 'Mixed / Wait')}
     return direction, states, None
 
 
@@ -7185,8 +7201,9 @@ def apply_8h_gap_trend_filter(symbol, grp, interval, setups):
 def apply_strong_trend_filter(symbol, grp, interval, setups):
     """Apply Daily/Weekly alignment ONLY to lower-TF Trend Pullbacks.
 
-    Established trend: continuation only. Weekly/Daily conflict: Daily wins,
-    flagged MIXED. Both ranging: either direction, flagged RANGING — CAUTION.
+    Confirmed Daily direction wins; if Daily is MIXED, the closed Weekly
+    direction is the fallback. Both directions require a confirmed four-touch
+    Weekly/Daily range. MIXED alone never authorises counter-trend Pullbacks.
     Never changes Gap Retests, higher-timeframe Pullbacks or other strategies.
     """
     if not pullback_higher_tf_enabled(grp, interval):
