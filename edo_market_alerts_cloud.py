@@ -1427,7 +1427,12 @@ Use Pushover on your iPhone. Enable Pushover in Withings notifications for ScanW
 
                 const result = await response.json();
 
-                if (result.ok) {
+                if (result.ok && result.queued) {
+                    if (refreshStatus) refreshStatus.textContent =
+                        '✓ News refresh started. The current news stays visible while it finishes.';
+                    refreshBtn.disabled = false;
+                    refreshBtn.textContent = oldText;
+                } else if (result.ok) {
                     if (refreshStatus) refreshStatus.textContent = '✓ News updated.';
                     setTimeout(function () {
                         window.location.replace('/?news=' + Date.now());
@@ -2464,7 +2469,7 @@ def _download_forex_factory_calendar():
                     "Pragma": "no-cache",
                     "Connection": "close",
                 },
-                timeout=20,
+                timeout=(5, 7),
                 allow_redirects=True,
             )
 
@@ -10632,45 +10637,54 @@ def news_reactions_api():
     return jsonify(news_reaction_payload())
 
 
+# Manual news refresh is dispatched outside the web request. Forex Factory/DNS
+# failures can take 40+ seconds; that used to kill Gunicorn's sync worker.
+_EDO_NEWS_JOB_LOCK_FILE = os.path.abspath(DB) + '.manual_news.lock'
+_EDO_NEWS_JOB_RUNNING = False
+_EDO_NEWS_JOB_THREAD_LOCK = threading.Lock()
+
+def _edo_manual_news_job():
+    global _EDO_NEWS_JOB_RUNNING
+    lock_handle = None
+    acquired = False
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(_EDO_NEWS_JOB_LOCK_FILE)), exist_ok=True)
+        lock_handle = open(_EDO_NEWS_JOB_LOCK_FILE, 'a+b')
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                print('manual news refresh already running in another worker', flush=True)
+                return
+        ok, error = refresh_economic_news()
+        if error:
+            print('manual Forex Factory refresh:', error, flush=True)
+    except Exception as exc:
+        print('manual Forex Factory refresh failed:', exc, flush=True)
+    finally:
+        if lock_handle is not None:
+            if acquired and fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+        with _EDO_NEWS_JOB_THREAD_LOCK:
+            _EDO_NEWS_JOB_RUNNING = False
+
 @APP.route('/refresh-news', methods=['POST'])
 def refresh_news_now():
-    """
-    Manual Forex Factory calendar refresh for AJAX use.
-    The browser stays on the HOME page.
-    This does not use Twelve Data credits.
-    """
+    """Immediately acknowledge manual news update; never block a web worker."""
+    global _EDO_NEWS_JOB_RUNNING
+    with _EDO_NEWS_JOB_THREAD_LOCK:
+        if _EDO_NEWS_JOB_RUNNING:
+            return jsonify(ok=True, queued=True, message='News update already running.'), 202
+        _EDO_NEWS_JOB_RUNNING = True
     try:
-        ok, error = refresh_economic_news()
-
-        cached_count = 0
-        try:
-            with db_conn() as c:
-                cached_count = c.execute(
-                    "SELECT COUNT(*) AS n FROM economic_news"
-                ).fetchone()["n"]
-        except Exception:
-            pass
-
-        if error:
-            print("manual Forex Factory refresh:", error)
-            return jsonify(
-                ok=False,
-                error=str(error),
-                cached_high_impact_events=cached_count
-            ), 200
-
-        return jsonify(
-            ok=True,
-            cached_high_impact_events=cached_count,
-            source=_get_news_feed_status().get("source_url", "")
-        ), 200
-
-    except Exception as e:
-        print("manual Forex Factory refresh error", e)
-        return jsonify(
-            ok=False,
-            error="News refresh failed temporarily."
-        ), 200
+        threading.Thread(target=_edo_manual_news_job, name='edo-manual-news', daemon=True).start()
+    except Exception:
+        with _EDO_NEWS_JOB_THREAD_LOCK:
+            _EDO_NEWS_JOB_RUNNING = False
+        return jsonify(ok=False, error='Unable to start news refresh.'), 503
+    return jsonify(ok=True, queued=True, message='News update started in background.'), 202
 
 
 @APP.after_request
@@ -11281,51 +11295,48 @@ def health():
 
 
 init_db()
-# Keep trend/pattern processing state across restart so new valid signals are not missed.
-threading.Thread(
-    target=monitor,
-    daemon=True
-).start()
 
-threading.Thread(
-    target=trailing_stop_monitor,
-    daemon=True
-).start()
+# A Gunicorn worker imports this module separately from every other worker.
+# Starting all monitor threads on every import duplicates scans, requests,
+# SQLite writes and notifications. Elect one worker with a POSIX file lock.
+_EDO_MONITOR_LEADER_HANDLE = None
+_EDO_MONITOR_LEADER_LOCK_PATH = os.path.abspath(DB) + '.monitor_leader.lock'
 
-threading.Thread(
-    target=active_trend_monitor,
-    daemon=True
-).start()
+def _edo_start_monitors_once():
+    global _EDO_MONITOR_LEADER_HANDLE
+    handle = None
+    try:
+        os.makedirs(os.path.dirname(_EDO_MONITOR_LEADER_LOCK_PATH), exist_ok=True)
+        handle = open(_EDO_MONITOR_LEADER_LOCK_PATH, 'a+b')
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                print('EdoSignal background monitors already owned by another worker', flush=True)
+                return False
+        _EDO_MONITOR_LEADER_HANDLE = handle  # keep fd open for worker lifetime
+        for name, target in (
+            ('edo-price-alerts', monitor),
+            ('edo-trailing-stop', trailing_stop_monitor),
+            ('edo-trend', active_trend_monitor),
+            ('edo-patterns', pattern_signal_monitor),
+            ('edo-monthly-spike', monthly_spike_monitor),
+            ('edo-weekly-spike', weekly_spike_monitor),
+            ('edo-economic-news', economic_news_monitor),
+            ('edo-news-warning', economic_news_warning_monitor),
+            ('edo-news-reaction', economic_news_reaction_monitor),
+        ):
+            threading.Thread(target=target, name=name, daemon=True).start()
+        print('EdoSignal background monitors started by worker', os.getpid(), flush=True)
+        return True
+    except Exception:
+        if handle is not None:
+            handle.close()
+        _EDO_MONITOR_LEADER_HANDLE = None
+        raise
 
-threading.Thread(
-    target=pattern_signal_monitor,
-    daemon=True
-).start()
-
-# Forex-only Monthly Spike warning has its own scanner and stored state.
-threading.Thread(target=monthly_spike_monitor, daemon=True).start()
-
-# Weekly Spike warning is one of Edo's intended signals.
-# It is a warning only and uses fully closed Weekly candles.
-threading.Thread(
-    target=weekly_spike_monitor,
-    daemon=True
-).start()
-
-threading.Thread(
-    target=economic_news_monitor,
-    daemon=True
-).start()
-
-threading.Thread(
-    target=economic_news_warning_monitor,
-    daemon=True
-).start()
-
-threading.Thread(
-    target=economic_news_reaction_monitor,
-    daemon=True
-).start()
+_edo_start_monitors_once()
 
 
 if __name__ == '__main__':
