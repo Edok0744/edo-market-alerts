@@ -3577,6 +3577,33 @@ def _edo_cfd_fxcm_weekly_from_daily(daily_candles, now_utc=None):
     return results
 
 
+# Shared short FXCM backoff across Gunicorn workers. A failed DNS/connect attempt
+# must not block every symbol's page request in succession. Only successful
+# broker responses are cached; no stale or synthetic candles are used as signals.
+_EDO_FXCM_COOLDOWN_PATH = os.path.join(_EDO_TWELVE_CACHE_DIR, 'fxcm_unreachable_until.json')
+_EDO_FXCM_COOLDOWN_SECONDS = 90
+
+
+def _edo_fxcm_cooling_down():
+    try:
+        with open(_EDO_FXCM_COOLDOWN_PATH, 'r', encoding='utf-8') as stream:
+            return time.time() < float(json.load(stream).get('until', 0))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _edo_fxcm_mark_unreachable():
+    try:
+        os.makedirs(_EDO_TWELVE_CACHE_DIR, exist_ok=True)
+        tmp = (_EDO_FXCM_COOLDOWN_PATH + '.' + str(os.getpid()) + '.' +
+               str(threading.get_ident()) + '.tmp')
+        with open(tmp, 'w', encoding='utf-8') as stream:
+            json.dump({'until': time.time() + _EDO_FXCM_COOLDOWN_SECONDS}, stream)
+        os.replace(tmp, _EDO_FXCM_COOLDOWN_PATH)
+    except OSError as exc:
+        print('FXCM cooldown file unavailable:', exc, flush=True)
+
+
 def fxcm_service_get_ohlc(symbol, interval, outputsize=140, shared_cfd_cache=False):
     """Read FXCM Bid candles from EdoSignal's private Railway FXCM service."""
     if not FXCM_SERVICE_URL:
@@ -3612,20 +3639,41 @@ def fxcm_service_get_ohlc(symbol, interval, outputsize=140, shared_cfd_cache=Fal
     else:
         payload = None
 
+    # Forex and CFD can share successful FXCM responses across threads/workers.
+    # Do not use old candles after the cache TTL: a signal must never be
+    # generated from a stale response just because the provider is unreachable.
+    if cfd_cache_path is None:
+        cache_spec = f'{symbol.upper()}|{tf}|{int(outputsize)}'
+        cfd_cache_path = os.path.join(
+            _EDO_TWELVE_CACHE_DIR,
+            'fxcm_forex_' + hashlib.sha256(cache_spec.encode('utf-8')).hexdigest() + '.json')
+        ttl = {'D1': 420, 'H8': 240, 'H4': 210, 'H12': 270}.get(tf, 180)
+        payload = _edo_load_twelve_cache(cfd_cache_path, ttl)
+
     try:
         if payload is None:
-            r = requests.get(
-                FXCM_SERVICE_URL + "/candles",
-                params={
-                    "symbol": symbol,
-                    "timeframe": tf,
-                    "count": max(10, min(int(outputsize), 500)),
-                },
-                timeout=20
-            )
-            r.raise_for_status()
-            payload = r.json()
-            if (cfd_cache_path and payload.get('ok') and payload.get('rows')):
+            if _edo_fxcm_cooling_down():
+                return None, 'FXCM connection temporarily unavailable; retrying shortly.'
+            try:
+                r = requests.get(
+                    FXCM_SERVICE_URL + "/candles",
+                    params={
+                        "symbol": symbol,
+                        "timeframe": tf,
+                        "count": max(10, min(int(outputsize), 500)),
+                    },
+                    # A 20s wait in each symbol/TF can exceed Gunicorn's
+                    # default 30s request timeout. Bound the connect and read.
+                    timeout=(2, 4),
+                )
+                r.raise_for_status()
+                payload = r.json()
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as exc:
+                _edo_fxcm_mark_unreachable()
+                print('FXCM service temporarily unreachable:', type(exc).__name__, flush=True)
+                return None, 'FXCM service temporarily unreachable; retrying shortly.'
+            if (isinstance(payload, dict) and payload.get('ok') and payload.get('rows')):
                 try:
                     os.makedirs(_EDO_TWELVE_CACHE_DIR, exist_ok=True)
                     temp_file = (cfd_cache_path + '.' + str(os.getpid()) + '.' +
@@ -3634,7 +3682,7 @@ def fxcm_service_get_ohlc(symbol, interval, outputsize=140, shared_cfd_cache=Fal
                         json.dump({'saved_at': time.time(), 'response': payload}, f)
                     os.replace(temp_file, cfd_cache_path)
                 except OSError as exc:
-                    print('CFD FXCM cache write skipped', exc, flush=True)
+                    print('FXCM response cache write skipped', exc, flush=True)
 
         if not payload.get("ok"):
             return None, "FXCM service error: " + str(payload.get("error", "Unknown error"))
@@ -3817,7 +3865,11 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
                 except (IndexError, TypeError, ValueError, OverflowError):
                     pass
 
-            if len(candles) < 40:
+            # Monthly spike detection needs 14 completed monthly candles,
+            # not 40 years/months of history. Keep the original 40-bar
+            # requirement for every other Crypto timeframe.
+            min_crypto_history = 14 if interval == "1month" else 40
+            if len(candles) < min_crypto_history:
                 return None, (
                     f"Not enough {interval} Bybit candle history returned "
                     f"for {resolved_symbol}."
@@ -6867,7 +6919,7 @@ def weekly_spike_monitor():
 
 
 # -------------------------------------------------
-# FOREX MONTHLY ABNORMAL SPIKE — SAME WEEKLY RULES
+# MONTHLY ABNORMAL SPIKE — FOREX, CFD AND CRYPTO; SAME WEEKLY RULES
 # -------------------------------------------------
 def monthly_candle_close_utc(candle):
     """Use the next UTC calendar-month boundary, never a fixed 30-day period."""
@@ -6890,7 +6942,7 @@ def fully_closed_monthly_candles(candles, now_utc=None):
 
 
 def detect_monthly_support_bounce(closed_monthly):
-    """Forex Monthly abnormal support rejection — separate from wick-only spikes.
+    """Monthly abnormal support rejection — separate from wick-only spikes.
 
     Require two ALREADY CONFIRMED historical swing lows forming a support area,
     a fully closed month returning to that area, and an observable rejection.
@@ -6998,24 +7050,68 @@ def detect_monthly_spike(closed_monthly):
     return detect_monthly_support_bounce(closed_monthly)
 
 
+def _edo_cfd_monthly_from_fxcm_daily(daily_candles):
+    """Aggregate FXCM CFD Bid D1 candles into UTC calendar months.
+
+    This keeps the Monthly CFD spike source consistent with the real FXCM
+    instrument used by the Daily/Weekly scanners, rather than a Twelve Data
+    index/ETF proxy. A forming daily candle never contributes.
+    """
+    months = {}
+    for candle in daily_candles or []:
+        if candle.get("_fxcm_forming"):
+            continue
+        stamp = parse_candle_utc(candle.get("datetime"))
+        if stamp is None:
+            continue
+        month_start = stamp.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        months.setdefault(month_start, []).append((stamp, candle))
+    grouped = []
+    for month_start, entries in sorted(months.items()):
+        entries.sort(key=lambda item: item[0])
+        rows = [row for _, row in entries]
+        # A truncated first month can distort the historical wick/range norms.
+        if month_start == min(months) and len(rows) < 12:
+            continue
+        grouped.append({
+            "datetime": month_start.strftime("%Y-%m-%d %H:%M:%S"),
+            "open": float(rows[0]["open"]),
+            "high": max(float(row["high"]) for row in rows),
+            "low": min(float(row["low"]) for row in rows),
+            "close": float(rows[-1]["close"]),
+            "_source_label": "FXCM CFD Bid (Monthly from FXCM D1)",
+        })
+    return grouped
+
+
 def collect_monthly_spike(symbol, grp="FOREX"):
-    """Forex only. Source is Twelve Data monthly data (FXCM service lacks M1)."""
-    if grp != "FOREX":
-        return None, None, "Monthly spikes are Forex-only."
-    candles, error = get_ohlc(symbol, "1month", outputsize=80, grp="FOREX")
-    if error:
-        return None, None, error
+    """Use the same Monthly spike rules for Forex, FXCM CFDs and Bybit Crypto."""
+    grp = str(grp).upper()
+    if grp not in ("FOREX", "CFD", "CRYPTO"):
+        return None, None, "Unsupported market for Monthly spikes."
+    if grp == "CFD":
+        # The FXCM helper exposes D1 but not 1-month. Use the real CFD's D1
+        # history, avoiding an ETF/index proxy and conserving Twelve Data.
+        daily, error = get_ohlc(symbol, "1day", outputsize=500, grp="CFD")
+        if error:
+            return None, None, error
+        candles = _edo_cfd_monthly_from_fxcm_daily(daily)
+    else:
+        candles, error = get_ohlc(symbol, "1month", outputsize=80, grp=grp)
+        if error:
+            return None, None, error
     closed = fully_closed_monthly_candles(candles)
     if len(closed) < 14:
         return None, None, "Not enough fully closed Monthly candle history."
     return detect_monthly_spike(closed), closed[-1].get("datetime", ""), None
 
 
-def notify_monthly_spike(symbol, spike):
-    """A unique persistent record prevents repeated alerts for the same month."""
+def notify_monthly_spike(symbol, grp, spike):
+    """Persist one notification per market/symbol/month/side, without replays."""
     if not spike or not spike.get("date") or not spike.get("side"):
         return False
-    key = ("FOREX", symbol, spike["date"], spike["side"])
+    grp = str(grp).upper()
+    key = (grp, symbol, spike["date"], spike["side"])
     try:
         with db_conn() as c:
             c.execute("""
@@ -7026,9 +7122,9 @@ def notify_monthly_spike(symbol, spike):
             c.commit()
     except sqlite3.IntegrityError:
         return False
-    title = (f"🟣 {symbol} [FOREX] — MONTHLY SUPPORT BOUNCE"
+    title = (f"🟣 {symbol} [{grp}] — MONTHLY SUPPORT BOUNCE"
              if spike.get('side') == 'support_bounce'
-             else f"🟣 {symbol} [FOREX] — MONTHLY SPIKE")
+             else f"🟣 {symbol} [{grp}] — MONTHLY SPIKE")
     sent = send_push(title, spike["message"])
     if not sent:
         # Allow a later check to retry an unsuccessful Pushover request.
@@ -7040,7 +7136,7 @@ def notify_monthly_spike(symbol, spike):
 
 
 def monthly_spike_monitor():
-    """Low-priority Forex-only scan, one saved pair every two minutes."""
+    """Low-priority scan across Forex, CFD and Crypto, one pair per cycle."""
     time.sleep(240)
     index = 0
     while True:
@@ -7049,18 +7145,22 @@ def monthly_spike_monitor():
                 time.sleep(15)
                 continue
             with db_conn() as c:
-                rows = c.execute("SELECT symbol FROM favorites WHERE grp='FOREX' ORDER BY symbol").fetchall()
+                rows = c.execute(
+                    "SELECT symbol, grp FROM favorites "
+                    "WHERE grp IN ('FOREX','CFD','CRYPTO') ORDER BY grp,symbol"
+                ).fetchall()
             if rows:
                 index %= len(rows)
                 symbol = rows[index]["symbol"]
+                grp = rows[index]["grp"]
                 index += 1
-                spike, latest_date, error = collect_monthly_spike(symbol)
+                spike, latest_date, error = collect_monthly_spike(symbol, grp)
                 record_scan_health("Monthly Spike", symbol, "1month", error=error,
                     signal=f"{symbol}: {spike['label']} Monthly" if spike else "")
                 if not error and latest_date:
                     with db_conn() as c:
                         state = c.execute("""SELECT last_closed_date FROM monthly_spike_state
-                                             WHERE grp='FOREX' AND symbol=?""", (symbol,)).fetchone()
+                                             WHERE grp=? AND symbol=?""", (grp, symbol)).fetchone()
                         previous = state["last_closed_date"] if state else None
                         latest_close_utc = monthly_candle_close_utc({"datetime": latest_date})
                         # A restart must not replay an old monthly candle as a new alert.
@@ -7086,7 +7186,7 @@ def monthly_spike_monitor():
                                       (latest_date, datetime.now(timezone.utc).isoformat(), symbol))
                             c.commit()
                             if spike:
-                                notify_monthly_spike(symbol, spike)
+                                notify_monthly_spike(symbol, grp, spike)
         except Exception as exc:
             print("monthly spike monitor error", exc)
         time.sleep(120)
