@@ -1002,8 +1002,8 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 
 {% set active_analysis_tf = analysis_ready_pairs.get((f['grp'], f['symbol']), '') %}
 {% if active_analysis_tf %}
-<a class="edo-analysis-icon" href="/signal/{{f['id']}}?tf={{active_analysis_tf}}&view=1&analysis=1#analysis-top"
-   title="Open five-point signal analysis ({{active_analysis_tf}})" aria-label="Open five-point signal analysis for {{f['symbol']}}">
+<a class="edo-analysis-icon" href="/signal/{{f['id']}}?tf={{active_analysis_tf}}&view=1#analysis-top"
+   title="Go to five-point analysis (tap panel to expand) — {{active_analysis_tf}}" aria-label="Open five-point signal analysis for {{f['symbol']}}">
 <button type="button" class="edo-analysis-btn" style="background:#334e70;color:#fff" aria-label="Open signal strength details">📊 5</button>
 </a>
 {% endif %}
@@ -1799,7 +1799,7 @@ a{text-decoration:none}
                 </div>
                 <div class="pattern-detail">{{ newest['detail'] }}</div>
                 {% if newest.get('analysis') %}
-                <details id="analysis-top" class="edo-analysis-details" {% if expand_analysis %}open{% endif %} style="margin-top:12px;border:1px solid #365a77;border-radius:12px;padding:11px">
+                <details id="analysis-top" class="edo-analysis-details" style="margin-top:12px;border:1px solid #365a77;border-radius:12px;padding:11px">
                   <summary style="cursor:pointer;font-weight:850;color:#75d7ff">📊 Five-point analysis — {{ newest['analysis']['score'] if newest['analysis']['score'] is not none else '—' }}/100 · {{newest['analysis']['rating']}} ▾</summary>
                   <div class="pattern-detail" style="margin-top:12px;line-height:1.8">
                     <b>1. Signal Strength:</b> {{newest['analysis']['score'] if newest['analysis']['score'] is not none else 'Unavailable'}}/100 — {{newest['analysis']['rating']}}<br>
