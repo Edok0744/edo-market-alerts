@@ -1009,8 +1009,8 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 </a>
 
 {% set pa = price_action_statuses.get(f['symbol'], {}) %}
-<a class="price-action-link" href="/signal/{{f['id']}}?view=1" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — WAIT') }}">
-<button class="price-action-btn {{ pa.get('css', '') }}" type="button" aria-label="{{ pa.get('label', 'Price Action — WAIT') }}">
+<a class="price-action-link" href="/signal/{{f['id']}}?view=1" aria-label="Price Action" title="{{ pa.get('label', 'Price Action — no active setup') }}">
+<button class="price-action-btn {{ pa.get('css', '') }}" type="button" aria-label="{{ pa.get('label', 'Price Action — no active setup') }}">
 <svg class="price-action-icon" viewBox="0 0 32 32" role="img" aria-hidden="true">
   <rect x="1.5" y="1.5" width="29" height="29" rx="7" fill="#07111f" stroke="#20c9ff" stroke-width="1.5"/>
   <line x1="6" y1="24" x2="26" y2="24" stroke="#8a6cff" stroke-width="1.5" opacity=".9"/>
@@ -5948,6 +5948,43 @@ def edo_gap_break_pullback_context(candles, direction, run_start, grp="FOREX"):
     return None
 
 
+
+# Forming status is separate from the existing generic WAIT status.
+# Only closed candles are evaluated. A precursor is not a READY signal.
+_edo_forming_scan = threading.local()
+
+
+def edo_forming_pullback(candles, grp, interval):
+    """Conservative genuine WAIT: 2+ clean closed retracement candles,
+    established local trend, unbroken structure, and (for Daily/Weekly)
+    a pre-existing support/resistance level. No speculative candle is used.
+    """
+    if not pullback_interval_enabled(grp, interval) or len(candles) < 40:
+        return ''
+    next_i = len(candles)
+    for run_colour, direction, trend in (
+        ('red', 'BUY', 'bullish'), ('green', 'SELL', 'bearish')
+    ):
+        count, run_start = count_same_colour_before(candles, next_i, run_colour)
+        if count < 2:
+            continue
+        good, _ = clean_pullback_run(candles, run_start, next_i, run_colour)
+        if not good or trend_pullback_structure_trend(candles, run_start) != trend:
+            continue
+        if not trend_pullback_retracement_preserves_structure(candles, run_start, next_i, trend):
+            continue
+        if interval not in ('4h', '8h', '12h'):
+            # Confirm the context from *existing* levels; the latest closed
+            # pullback candle is a temporary reference point, NOT a trigger.
+            candidate = {'direction': trend, 'confirmation_index':next_i-1,
+                         'run_start':run_start}
+            near_sr, _, _ = trend_pullback_near_structural_sr(candles, candidate, interval)
+            if not near_sr:
+                continue
+        return direction
+    return ''
+
+
 def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local_trend=True, ranging_context=None, structural_break_context=None):
     """
     Edo Trend Pullback rule — NO 50% penetration requirement.
@@ -8168,14 +8205,23 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             "Review the naked chart before trading."
         )
     else:
-        signal = "WAIT"
-        icon, css = "🟡", "wait"
+        # An ordinary lack of a signal is neutral, NOT a developing signal.
+        forming_direction = edo_forming_pullback(closed_candles, grp, interval)
+        if forming_direction and not forex_weekend_blocked:
+            signal = "WAIT — " + forming_direction + " PULLBACK FORMING"
+            icon, css = "🟡", "wait"
+            summary = "Clean closed pullback candles detected; waiting for a fully closed confirmation candle. Not a READY trade."
+        else:
+            signal = "NO SIGNAL"
+            icon, css = "⚪", "neutral"
         if forex_weekend_blocked:
             summary = (
                 "Forex market is closed for the weekend. New Price Action signals "
                 "are paused until the normal Forex session reopens. Older valid "
                 "setups may be shown below for reference only."
             )
+        elif forming_direction:
+            pass  # keep genuine forming WAIT message
         elif found:
             summary = (
                 "No new trigger • Previous setup shown below"
@@ -8752,6 +8798,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     Returns:
       setups, latest_closed_date, error
     """
+    _edo_forming_scan.direction = ''
     candles, error = get_candles(symbol, interval, outputsize=140, grp=grp)
     if error:
         return None, None, error
@@ -8764,6 +8811,11 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         return None, None, f"Not enough fully closed {interval} candle history returned."
 
     latest_closed_date = closed_candles[-1].get("datetime", "")
+    _edo_forming_scan.direction = ''
+    try:
+        _edo_forming_scan.direction = edo_forming_pullback(closed_candles, grp, interval)
+    except Exception as forming_error:
+        print('forming pullback assessment unavailable', grp, symbol, interval, forming_error, flush=True)
 
     # HARD FRESHNESS RULE FOR FXCM SIGNALS:
     # Never turn an old broker candle into a current READY/phone alert.
@@ -8777,6 +8829,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
                 "stale FXCM candle suppressed",
                 grp, symbol, interval, latest_closed_date
             )
+            _edo_forming_scan.direction = ''
             return [], latest_closed_date, None
 
     found = []
@@ -8998,13 +9051,14 @@ def save_price_action_status(grp, symbol, setups, latest_closed_date):
         c.commit()
 
 
-def save_timeframe_ready_status(grp, symbol, interval, setups, latest_closed_date):
+def save_timeframe_ready_status(grp, symbol, interval, setups, latest_closed_date, forming_direction=""):
     """Store independent unread status; only fully closed current-candle setups count."""
     current = [p for p in (setups or []) if p.get('confirmation_date') == latest_closed_date]
     buy = any(p.get('direction') == 'bullish' for p in current)
     sell = any(p.get('direction') == 'bearish' for p in current)
-    status = 'READY' if buy != sell else 'WAIT'
-    direction = 'BUY' if buy and not sell else ('SELL' if sell and not buy else '')
+    status = 'READY' if buy != sell else ('FORMING' if forming_direction in ('BUY', 'SELL') and not (buy or sell) else 'WAIT')
+    direction = ('BUY' if buy and not sell else ('SELL' if sell and not buy else
+                 (forming_direction if status == 'FORMING' else '')))
     with db_conn() as c:
         c.execute("""
             INSERT INTO price_action_timeframe_status
@@ -9201,7 +9255,8 @@ def pattern_signal_monitor():
                         found = next((n for n in names if token in n.upper()), '')
                         record_scan_health(family, symbol, interval,
                                            signal=f"{symbol} {interval}: {found}" if found else '')
-                save_timeframe_ready_status(grp, symbol, interval, setups, latest_closed_date)
+                save_timeframe_ready_status(grp, symbol, interval, setups, latest_closed_date,
+                                            getattr(_edo_forming_scan, "direction", ""))
                 if interval == "4h":
                     save_price_action_status(grp, symbol, setups, latest_closed_date)
                 notify_new_pattern_setups(
@@ -11208,15 +11263,15 @@ def home():
                         'label': 'Price Action — READY SELL' + (' — NEW' if is_new else ' — REVIEWED')
                     }
                 else:
-                    price_action_statuses[r['symbol']] = {'css':'','label':'Price Action — WAIT'}
+                    price_action_statuses[r['symbol']] = {'css':'','label':'Price Action — no active setup'}
 
-            # Yellow dot means one or more scanned timeframes are currently WAIT.
-            # This mirrors the scanner's actual WAIT state, not MIXED / WAIT trend.
+            # Dot only on a validated forming pullback waiting for confirmation.
+            # A generic WAIT / no setup never causes a dot.
             # Exclude records without a recorded update (if any).
             saved_wait_timeframes = {}
             wait_rows = c.execute("""
                 SELECT grp,symbol,interval FROM price_action_timeframe_status
-                WHERE status='WAIT' AND updated IS NOT NULL AND updated != ''
+                WHERE status='FORMING' AND direction IN ('BUY','SELL') AND updated IS NOT NULL AND updated != ''
                 ORDER BY grp,symbol,interval
             """).fetchall()
             for wr in wait_rows:
@@ -11541,7 +11596,8 @@ def signal(i):
         if setup_error:
             print("manual pattern notification error", f['symbol'], selected_tf, setup_error)
         else:
-            save_timeframe_ready_status(f['grp'], f['symbol'], selected_tf, setups, latest_closed_date)
+            save_timeframe_ready_status(f['grp'], f['symbol'], selected_tf, setups, latest_closed_date,
+                                        getattr(_edo_forming_scan, 'direction', ''))
             if request.args.get("view") == "1":
                 if "tf" in request.args:
                     # Only an explicit timeframe button click clears its NEW label.
