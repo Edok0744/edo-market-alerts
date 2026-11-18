@@ -1805,6 +1805,7 @@ a{text-decoration:none}
                     <b>1. Signal Strength:</b> {{newest['analysis']['score'] if newest['analysis']['score'] is not none else 'Unavailable'}}/100 — {{newest['analysis']['rating']}}<br>
                     <span>{{newest['analysis']['reason']}}</span><br>
                     <b>2. Higher-Timeframe Agreement:</b> {{newest['analysis']['higher']}}<br>
+                    <span><b>Weekly + Daily Pullbacks:</b> {{newest['analysis'].get('pullback_agreement', 'Not available')}}</span><br>
                     <b>3. Reward-to-Risk:</b> {{newest['analysis']['rr_text']}}<br>
                     {% if newest['analysis']['entry'] is not none %}<span>Illustrative entry {{'%.5f'|format(newest['analysis']['entry'])}}, stop {{'%.5f'|format(newest['analysis']['stop'])}}, target {{'%.5f'|format(newest['analysis']['target'])}}</span><br>{% endif %}
                     <b>4. Market Volatility:</b> {{newest['analysis']['volatility']}}<br>
@@ -1836,7 +1837,8 @@ a{text-decoration:none}
                        <b>1. Signal Strength:</b> {{p['analysis']['score'] if p['analysis']['score'] is not none else 'Unavailable'}}/100 — {{p['analysis']['rating']}}<br>
                        {{p['analysis']['reason']}}<br>
                        <b>2. Higher Timeframe:</b> {{p['analysis']['higher']}}<br>
-                       <b>3. Reward-to-Risk:</b> {{p['analysis']['rr_text']}}<br>
+                       <span><b>Weekly + Daily Pullbacks:</b> {{newest['analysis'].get('pullback_agreement', 'Not available')}}</span><br>
+                    <b>3. Reward-to-Risk:</b> {{p['analysis']['rr_text']}}<br>
                        {% if p['analysis']['entry'] is not none %}Illustrative entry {{'%.5f'|format(p['analysis']['entry'])}}, stop {{'%.5f'|format(p['analysis']['stop'])}}, target {{'%.5f'|format(p['analysis']['target'])}}<br>{% endif %}
                        <b>4. Volatility:</b> {{p['analysis']['volatility']}}<br>
                        <b>5. Historical Performance:</b> {{p['analysis']['history']}}<br>
@@ -7672,13 +7674,103 @@ def edo_analysis_history_update(grp, symbol, interval, candles, records):
         return {}
 
 
-def edo_analysis_for_pattern(pattern, candles, snapshots):
+# Weekly -> Daily pullback confluence, advisory ONLY (not a new signal).
+# A Daily setup earns a small bonus when a CONFIRMED, same-direction Weekly
+# pullback was recorded in the previous 21 days. No future candles are used.
+EDO_PULLBACK_AGREEMENT_DAYS = 21
+
+
+def edo_pullback_confirmation_dt(value):
+    try:
+        raw = str(value or '').strip().replace('Z', '+00:00')
+        dt = datetime.fromisoformat(raw.replace(' ', 'T'))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def edo_pullback_agreement_init(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS edo_confirmed_pullbacks (
+        grp TEXT NOT NULL, symbol TEXT NOT NULL, interval TEXT NOT NULL,
+        direction TEXT NOT NULL, confirmation_date TEXT NOT NULL,
+        PRIMARY KEY(grp,symbol,interval,direction,confirmation_date)
+    )""")
+
+
+def edo_record_confirmed_pullbacks(grp, symbol, interval, patterns):
+    # Save existing, fully closed pullback signals only. Ignore every other
+    # signal family; no alerts or trade execution occurs in this code.
+    if interval not in ('1week', '1day'):
+        return
+    records = []
+    for p in patterns:
+        if p.get('name') != 'TREND PULLBACK SETUP':
+            continue
+        if p.get('direction') not in ('bullish', 'bearish'):
+            continue
+        date = p.get('confirmation_date', '')
+        if edo_pullback_confirmation_dt(date) is not None:
+            records.append((str(grp).upper(), str(symbol).upper(), interval,
+                            p['direction'], date))
+    if not records:
+        return
+    try:
+        with db_conn() as conn:
+            edo_pullback_agreement_init(conn)
+            conn.executemany("""INSERT OR IGNORE INTO edo_confirmed_pullbacks
+                (grp,symbol,interval,direction,confirmation_date)
+                VALUES (?,?,?,?,?)""", records)
+            conn.commit()
+    except Exception as exc:
+        print('Optional pullback agreement storage:',type(exc).__name__,flush=True)
+
+
+def edo_pullback_agreement(grp, symbol, interval, pattern):
+    # The Weekly signal must PRECEDE the Daily confirmation. This prevents
+    # an old historical signal from receiving a future-information boost.
+    if interval != '1day' or pattern.get('name') != 'TREND PULLBACK SETUP':
+        return {'bonus': 0, 'text': 'Weekly + Daily pullback agreement: not applicable'}
+    moment = edo_pullback_confirmation_dt(pattern.get('confirmation_date'))
+    if moment is None:
+        return {'bonus': 0, 'text': 'Weekly + Daily pullback agreement: dates unavailable'}
+    try:
+        with db_conn() as conn:
+            edo_pullback_agreement_init(conn)
+            rows = conn.execute("""SELECT direction, confirmation_date
+                FROM edo_confirmed_pullbacks
+                WHERE grp=? AND symbol=? AND interval='1week'""",
+                (str(grp).upper(),str(symbol).upper())).fetchall()
+    except Exception as exc:
+        print('Optional pullback agreement lookup:',type(exc).__name__,flush=True)
+        return {'bonus': 0, 'text': 'Weekly + Daily pullback agreement: unavailable'}
+    qualifying = []
+    for row in rows:
+        date = edo_pullback_confirmation_dt(row['confirmation_date'])
+        if date is None:
+            continue
+        age_days = (moment-date).total_seconds()/86400
+        if 0 <= age_days <= EDO_PULLBACK_AGREEMENT_DAYS:
+            qualifying.append((date, row['direction']))
+    if not qualifying:
+        return {'bonus': 0, 'text': 'Weekly + Daily pullback agreement: no recent confirmed Weekly pullback'}
+    # Latest Weekly pullback takes priority; an opposite later signal cancels
+    # agreement with an earlier same-direction one.
+    latest_date, latest_direction = max(qualifying, key=lambda item: item[0])
+    if latest_direction != pattern.get('direction'):
+        return {'bonus': 0, 'text': 'Weekly + Daily pullback agreement: conflicting directions (no bonus)'}
+    side = 'BUY' if latest_direction == 'bullish' else 'SELL'
+    return {'bonus': 5,
+            'text': f'Weekly + Daily {side} pullbacks confirmed within 21 days (+5 strength points)'}
+
+
+def edo_analysis_for_pattern(pattern, candles, snapshots, agreement=None):
     # Score components are transparent heuristic POINTS, not hit probability.
     idx = edo_analysis_candle_index(candles,pattern)
     if idx is None or idx < 15:
         return {'score':None,'rating':'Unavailable','reason':'Insufficient dated candle history',
                 'higher':'Unknown','rr_text':'Not available','volatility':'Not available',
-                'entry':None,'stop':None,'target':None,'history':'Collecting data'}
+                'entry':None,'stop':None,'target':None,'history':'Collecting data',
+                'pullback_agreement':'Weekly + Daily pullback agreement: unavailable'}
     bar = candles[idx]
     entry = float(pattern.get('confirmation_close') or bar['close'])
     side = pattern.get('direction')
@@ -7725,13 +7817,15 @@ def edo_analysis_for_pattern(pattern, candles, snapshots):
     relative=candle_range/atr if atr>0 else None
     volatility='Normal' if relative is not None and .45<=relative<=1.8 else 'High / extended' if relative is not None and relative>1.8 else 'Low / quiet' if relative is not None else 'ATR unavailable'
     vol_points=20 if relative is not None and .45<=relative<=1.8 else 9 if relative is not None else 0
-    score=min(100,structure_points+higher_points+rr_points+vol_points)
+    agreement = agreement or {'bonus': 0, 'text': 'Weekly + Daily pullback agreement: not applicable'}
+    agreement_bonus = int(agreement.get('bonus', 0))
+    score=min(100,structure_points+higher_points+rr_points+vol_points+agreement_bonus)
     rating='Strong' if score>=80 else 'Moderate' if score>=60 else 'Caution'
-    return {'score':score,'rating':rating,'reason':f'Structure {structure_points}/30 | Higher TF {higher_points}/25 | R:R {rr_points}/25 | Volatility {vol_points}/20',
+    return {'score':score,'rating':rating,'reason':f'Structure {structure_points}/30 | Higher TF {higher_points}/25 | R:R {rr_points}/25 | Volatility {vol_points}/20 | Pullback agreement +{agreement_bonus}',
             'higher':higher,'rr_text':f'{rr:.2f}:1 (illustrative)' if rr is not None else 'No suitable historical structure target',
             'volatility':f'{volatility} | ATR14 {atr:.5f}' if atr>0 else volatility,
             'entry':entry if stop is not None else None,'stop':stop,'target':target,
-            'history':'Collecting data'}
+            'history':'Collecting data', 'pullback_agreement':agreement.get('text','')}
 
 
 def edo_add_analysis(grp,symbol,interval,closed_candles,found):
@@ -7740,9 +7834,11 @@ def edo_add_analysis(grp,symbol,interval,closed_candles,found):
             row=conn.execute('SELECT weekly,daily FROM trend_snapshot WHERE symbol=?',(symbol,)).fetchone()
         snapshot={'Weekly':row['weekly'] or '', 'Daily':row['daily'] or ''} if row else {}
     except Exception: snapshot={}
+    edo_record_confirmed_pullbacks(grp,symbol,interval,found)
     assessed=[]
     for p in found:
-        a=edo_analysis_for_pattern(p,closed_candles,snapshot)
+        agreement=edo_pullback_agreement(grp,symbol,interval,p)
+        a=edo_analysis_for_pattern(p,closed_candles,snapshot,agreement)
         assessed.append((p,a))
     counts=edo_analysis_history_update(grp,symbol,interval,closed_candles,assessed)
     for p,a in assessed:
