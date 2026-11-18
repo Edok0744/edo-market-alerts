@@ -997,6 +997,14 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 </button>
 </a>
 
+{% set active_analysis_tf = analysis_ready_pairs.get((f['grp'], f['symbol']), '') %}
+{% if active_analysis_tf %}
+<a class="edo-analysis-icon" href="/signal/{{f['id']}}?tf={{active_analysis_tf}}&view=1&analysis=1#analysis-top"
+   title="Open five-point signal analysis ({{active_analysis_tf}})" aria-label="Open five-point signal analysis for {{f['symbol']}}">
+<button type="button" class="edo-analysis-btn" style="background:#334e70;color:#fff" aria-label="Open signal strength details">📊 5</button>
+</a>
+{% endif %}
+
 <a href="/favorite/delete/{{f['id']}}">
 <button class="danger">Delete</button>
 </a>
@@ -1787,6 +1795,21 @@ a{text-decoration:none}
                     {{ newest['icon'] }} {{ newest['name'] }}
                 </div>
                 <div class="pattern-detail">{{ newest['detail'] }}</div>
+                {% if newest.get('analysis') %}
+                <details id="analysis-top" class="edo-analysis-details" {% if expand_analysis %}open{% endif %} style="margin-top:12px;border:1px solid #365a77;border-radius:12px;padding:11px">
+                  <summary style="cursor:pointer;font-weight:850;color:#75d7ff">📊 Five-point analysis — {{ newest['analysis']['score'] if newest['analysis']['score'] is not none else '—' }}/100 · {{newest['analysis']['rating']}} ▾</summary>
+                  <div class="pattern-detail" style="margin-top:12px;line-height:1.8">
+                    <b>1. Signal Strength:</b> {{newest['analysis']['score'] if newest['analysis']['score'] is not none else 'Unavailable'}}/100 — {{newest['analysis']['rating']}}<br>
+                    <span>{{newest['analysis']['reason']}}</span><br>
+                    <b>2. Higher-Timeframe Agreement:</b> {{newest['analysis']['higher']}}<br>
+                    <b>3. Reward-to-Risk:</b> {{newest['analysis']['rr_text']}}<br>
+                    {% if newest['analysis']['entry'] is not none %}<span>Illustrative entry {{'%.5f'|format(newest['analysis']['entry'])}}, stop {{'%.5f'|format(newest['analysis']['stop'])}}, target {{'%.5f'|format(newest['analysis']['target'])}}</span><br>{% endif %}
+                    <b>4. Market Volatility:</b> {{newest['analysis']['volatility']}}<br>
+                    <b>5. Historical Performance:</b> {{newest['analysis']['history']}}<br>
+                    <span style="color:#f2c94c">Advisory only. Strength is not win probability. Prices are hypothetical, not orders; past outcomes do not predict future returns.</span>
+                  </div>
+                </details>
+                {% endif %}
                 {% if newest['level_text'] %}
                 <div class="level">{{ newest['level_text'] }}</div>
                 {% endif %}
@@ -1803,6 +1826,21 @@ a{text-decoration:none}
                 <div class="pattern">
                     <div class="pattern-title {{ p['css'] }}">{{ p['icon'] }} {{ p['name'] }}</div>
                     <div class="pattern-detail">{{ p['detail'] }}</div>
+                    {% if p.get('analysis') %}
+                    <details class="edo-analysis-details" style="margin-top:10px;border:1px solid #365a77;border-radius:12px;padding:10px">
+                      <summary style="cursor:pointer;font-weight:800;color:#75d7ff">📊 Five-point analysis — {{p['analysis']['score'] if p['analysis']['score'] is not none else '—'}}/100 · {{p['analysis']['rating']}} ▾</summary>
+                      <div class="pattern-detail" style="line-height:1.8;margin-top:10px">
+                       <b>1. Signal Strength:</b> {{p['analysis']['score'] if p['analysis']['score'] is not none else 'Unavailable'}}/100 — {{p['analysis']['rating']}}<br>
+                       {{p['analysis']['reason']}}<br>
+                       <b>2. Higher Timeframe:</b> {{p['analysis']['higher']}}<br>
+                       <b>3. Reward-to-Risk:</b> {{p['analysis']['rr_text']}}<br>
+                       {% if p['analysis']['entry'] is not none %}Illustrative entry {{'%.5f'|format(p['analysis']['entry'])}}, stop {{'%.5f'|format(p['analysis']['stop'])}}, target {{'%.5f'|format(p['analysis']['target'])}}<br>{% endif %}
+                       <b>4. Volatility:</b> {{p['analysis']['volatility']}}<br>
+                       <b>5. Historical Performance:</b> {{p['analysis']['history']}}<br>
+                       <span style="color:#f2c94c">Advisory only. Not a probability or trade recommendation.</span>
+                      </div>
+                    </details>
+                    {% endif %}
                     {% if p['level_text'] %}
                     <div class="level">{{ p['level_text'] }}</div>
                     {% endif %}
@@ -7559,6 +7597,158 @@ def attach_pattern_push_history(symbol, interval, patterns):
     return patterns
 
 
+
+# ---------------------------------------------------------------------------
+# EdoSignal 3: OPTIONAL five-point analysis (never filters or changes signals)
+# ---------------------------------------------------------------------------
+def edo_analysis_candle_index(candles, pattern):
+    when = str(pattern.get('confirmation_date') or '')[:19].replace('T', ' ')
+    for i in range(len(candles)-1, -1, -1):
+        if str(candles[i].get('datetime', ''))[:19].replace('T', ' ') == when:
+            return i
+    return None  # Never invent an entry point for an unmatched candle.
+
+
+def edo_analysis_history_init(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS edo_signal_analysis_history (
+        grp TEXT NOT NULL, symbol TEXT NOT NULL, interval TEXT NOT NULL,
+        pattern_name TEXT NOT NULL, direction TEXT NOT NULL,
+        confirmation_date TEXT NOT NULL, entry REAL NOT NULL,
+        stop REAL NOT NULL, target REAL NOT NULL,
+        result TEXT NOT NULL DEFAULT 'PENDING',
+        PRIMARY KEY(grp,symbol,interval,pattern_name,direction,confirmation_date)
+    )""")
+
+
+def edo_analysis_history_update(grp, symbol, interval, candles, records):
+    # Outcomes require later FULLY CLOSED candles. If stop and target are both
+    # hit in the same candle, mark AMBIGUOUS rather than claiming a win.
+    try:
+        with db_conn() as conn:
+            edo_analysis_history_init(conn)
+            for p, a in records:
+                if a.get('entry') is None or a.get('stop') is None or a.get('target') is None:
+                    continue
+                conn.execute("""INSERT OR IGNORE INTO edo_signal_analysis_history
+                    (grp,symbol,interval,pattern_name,direction,confirmation_date,entry,stop,target)
+                    VALUES (?,?,?,?,?,?,?,?,?)""", (grp,symbol,interval,p['name'],p['direction'],
+                       p['confirmation_date'],a['entry'],a['stop'],a['target']))
+            historical = conn.execute("""SELECT * FROM edo_signal_analysis_history
+                WHERE grp=? AND symbol=? AND interval=? AND result='PENDING'
+                ORDER BY confirmation_date DESC LIMIT 200""",(grp,symbol,interval)).fetchall()
+            dates = [str(c.get('datetime',''))[:19].replace('T',' ') for c in candles]
+            for item in historical:
+                cutoff = str(item['confirmation_date'])[:19].replace('T',' ')
+                indices = [k for k, dt in enumerate(dates) if dt > cutoff]
+                result = 'PENDING'
+                for k in indices[:25]:
+                    bar = candles[k]
+                    hi,lo = float(bar['high']),float(bar['low'])
+                    if item['direction']=='bullish':
+                        hit_target = hi >= item['target']; hit_stop = lo <= item['stop']
+                    else:
+                        hit_target = lo <= item['target']; hit_stop = hi >= item['stop']
+                    if hit_target or hit_stop:
+                        result = 'AMBIGUOUS' if hit_target and hit_stop else ('TARGET' if hit_target else 'STOP')
+                        break
+                if result=='PENDING' and len(indices)>=25: result='EXPIRED'
+                if result!='PENDING':
+                    conn.execute("""UPDATE edo_signal_analysis_history SET result=?
+                         WHERE grp=? AND symbol=? AND interval=? AND pattern_name=?
+                           AND direction=? AND confirmation_date=?""",
+                        (result,grp,symbol,interval,item['pattern_name'],
+                         item['direction'],item['confirmation_date']))
+            conn.commit()
+            rows = conn.execute("""SELECT pattern_name,direction,result,
+                         COUNT(*) AS n FROM edo_signal_analysis_history
+                         WHERE grp=? AND symbol=? AND interval=? AND result IN ('TARGET','STOP')
+                         GROUP BY pattern_name,direction,result""",(grp,symbol,interval)).fetchall()
+        return {(r['pattern_name'],r['direction'],r['result']): int(r['n']) for r in rows}
+    except Exception as exc:
+        print('EdoSignal analysis history unavailable:',type(exc).__name__,flush=True)
+        return {}
+
+
+def edo_analysis_for_pattern(pattern, candles, snapshots):
+    # Score components are transparent heuristic POINTS, not hit probability.
+    idx = edo_analysis_candle_index(candles,pattern)
+    if idx is None or idx < 15:
+        return {'score':None,'rating':'Unavailable','reason':'Insufficient dated candle history',
+                'higher':'Unknown','rr_text':'Not available','volatility':'Not available',
+                'entry':None,'stop':None,'target':None,'history':'Collecting data'}
+    bar = candles[idx]
+    entry = float(pattern.get('confirmation_close') or bar['close'])
+    side = pattern.get('direction')
+    lookback=candles[max(0,idx-40):idx]
+    recent=candles[max(0,idx-8):idx+1]
+    previous=candles[max(0,idx-15):idx+1]
+    ranges=[]
+    for j in range(1,len(previous)):
+        cur=previous[j]; last=previous[j-1]
+        ranges.append(max(float(cur['high'])-float(cur['low']),
+                          abs(float(cur['high'])-float(last['close'])),
+                          abs(float(cur['low'])-float(last['close']))))
+    atr=sum(ranges[-14:])/len(ranges[-14:]) if ranges else 0.0
+    if side=='bullish':
+        stop=min(float(x['low']) for x in recent)
+        candidates=[float(lookback[j]['high']) for j in range(2,len(lookback)-2)
+            if float(lookback[j]['high'])>entry+0.5*atr
+            and all(float(lookback[j]['high'])>=float(lookback[k]['high']) for k in range(j-2,j+3) if k!=j)]
+        target=min(candidates,key=lambda x:x-entry) if candidates else None
+    else:
+        stop=max(float(x['high']) for x in recent)
+        candidates=[float(lookback[j]['low']) for j in range(2,len(lookback)-2)
+            if float(lookback[j]['low'])<entry-0.5*atr
+            and all(float(lookback[j]['low'])<=float(lookback[k]['low']) for k in range(j-2,j+3) if k!=j)]
+        target=max(candidates) if candidates else None
+    risk=abs(entry-stop)
+    reward=abs(target-entry) if target is not None else None
+    rr=(reward/risk if risk>0 and reward is not None and reward>0 else None)
+    if risk<=0 or target is None or rr is None: stop=target=None
+    weekly=str(snapshots.get('Weekly','')).lower()
+    daily=str(snapshots.get('Daily','')).lower()
+    wanted='bullish' if side=='bullish' else 'bearish'
+    aligned=sum(x==wanted for x in (daily,weekly))
+    opposed=sum(x in ('bullish','bearish') and x!=wanted for x in (daily,weekly))
+    higher=f"Daily: {daily.title() or 'Unknown'} | Weekly: {weekly.title() or 'Unknown'}"
+    higher_points = 25 if aligned==2 else 16 if aligned==1 and opposed==0 else 9 if aligned==1 else 5
+    name=pattern.get('name','')
+    # The detector already validated this pattern; no signal is rejected here.
+    structure_points=22 if name=='S/R GAP RETEST SETUP' else 19 if name=='TREND PULLBACK SETUP' else 20
+    if pattern.get('turning_point_strength') in ('STRONG','VERY STRONG'): structure_points+=5
+    structure_points=min(30,structure_points)
+    rr_points=(25 if rr>=3 else 20 if rr>=2 else 13 if rr>=1.2 else 6) if rr is not None else 0
+    candle_range=float(bar['high'])-float(bar['low'])
+    relative=candle_range/atr if atr>0 else None
+    volatility='Normal' if relative is not None and .45<=relative<=1.8 else 'High / extended' if relative is not None and relative>1.8 else 'Low / quiet' if relative is not None else 'ATR unavailable'
+    vol_points=20 if relative is not None and .45<=relative<=1.8 else 9 if relative is not None else 0
+    score=min(100,structure_points+higher_points+rr_points+vol_points)
+    rating='Strong' if score>=80 else 'Moderate' if score>=60 else 'Caution'
+    return {'score':score,'rating':rating,'reason':f'Structure {structure_points}/30 | Higher TF {higher_points}/25 | R:R {rr_points}/25 | Volatility {vol_points}/20',
+            'higher':higher,'rr_text':f'{rr:.2f}:1 (illustrative)' if rr is not None else 'No suitable historical structure target',
+            'volatility':f'{volatility} | ATR14 {atr:.5f}' if atr>0 else volatility,
+            'entry':entry if stop is not None else None,'stop':stop,'target':target,
+            'history':'Collecting data'}
+
+
+def edo_add_analysis(grp,symbol,interval,closed_candles,found):
+    try:
+        with db_conn() as conn:
+            row=conn.execute('SELECT weekly,daily FROM trend_snapshot WHERE symbol=?',(symbol,)).fetchone()
+        snapshot={'Weekly':row['weekly'] or '', 'Daily':row['daily'] or ''} if row else {}
+    except Exception: snapshot={}
+    assessed=[]
+    for p in found:
+        a=edo_analysis_for_pattern(p,closed_candles,snapshot)
+        assessed.append((p,a))
+    counts=edo_analysis_history_update(grp,symbol,interval,closed_candles,assessed)
+    for p,a in assessed:
+        wins=counts.get((p['name'],p['direction'],'TARGET'),0)
+        losses=counts.get((p['name'],p['direction'],'STOP'),0)
+        n=wins+losses
+        a['history']=(f'{wins}/{n} targets reached ({wins*100/n:.0f}%) in historical monitored setups; not a forecast' if n>=10 else f'Collecting data ({n}/10 completed outcomes)')
+    return assessed
+
 def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     # Monthly special reversals apply across Forex, CFD, and Crypto;
     # Monthly Trend Pullback remains restricted by pullback_interval_enabled().
@@ -7886,6 +8076,23 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     # Weekly Spike disabled: Edo wants ONLY his requested trading signals.
     weekly_spike = None
 
+    # Analysis is advisory only. It never changes detection, prioritisation,
+    # alerts, or which pattern appears on the screen.
+    try:
+        analysis_pairs=edo_add_analysis(grp,symbol,interval,closed_candles,found)
+        pattern_analysis={ (id(p)):a for p,a in analysis_pairs }
+    except Exception as analysis_error:
+        print('Optional signal analysis error:',repr(analysis_error),flush=True)
+        pattern_analysis={}
+    described_patterns=[]
+    for p in found[:4]:
+        described=describe_setup(p,interval)
+        described['analysis']=pattern_analysis.get(id(p),{'score':None,'rating':'Unavailable',
+            'higher':'Unknown','rr_text':'Unavailable','volatility':'Unavailable',
+            'history':'Collecting data','reason':'Analysis temporarily unavailable',
+            'entry':None,'stop':None,'target':None})
+        described_patterns.append(described)
+
     data = {
         "price": closed_candles[-1]["close"],
         "latest_closed_date": latest_closed_date,
@@ -7896,7 +8103,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         "signal_css": css,
         "summary": summary,
         "patterns": attach_pattern_push_history(
-            symbol, interval, [describe_setup(p, interval) for p in found[:4]]
+            symbol, interval, described_patterns
         ),
         "rejected_setups": [
             p.get("rejection_reason", "")
@@ -9280,8 +9487,10 @@ def weekly_daily_inline_from_candles(weekly, daily, now_utc=None):
     exact-line touch or retest requirement. These remain in OTHER pattern
     strategies wherever previously configured.
 
-    A completed reversal remains in force until a newer completed Weekly
-    opposite-colour breakout creates a different trigger to confirm.
+    The WEEKLY event remains in force until a newer closed Weekly trigger.
+    However a FULL state also requires the newest fully closed Daily candle
+    to remain beyond that event's trigger line. A stale historical Daily
+    confirmation alone is never enough for an ongoing FULL direction.
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
@@ -9315,6 +9524,21 @@ def weekly_daily_inline_from_candles(weekly, daily, now_utc=None):
             confirmed = c
             break  # FIRST eligible fully closed Daily candle, not the latest.
     if confirmed is None:
+        return '', None, None
+    # Critical stale-status guard: the old implementation checked only the
+    # FIRST qualifying Daily close and then kept FULL BULLISH/BEARISH forever,
+    # even if newer closed Daily prices reversed through that Weekly line.
+    # Check ONLY completed Daily candles, and only those after the Weekly
+    # trigger became eligible. Never use the forming current Daily candle.
+    latest_eligible = next((c for c in reversed(d_closed)
+        if (parse_candle_utc(c.get('datetime')) is not None and
+            parse_candle_utc(c.get('datetime')) >= week_end)), None)
+    if latest_eligible is None:
+        return '', None, None
+    latest_close = float(latest_eligible['close'])
+    latest_agrees = ((direction == 'BULLISH' and latest_close > level) or
+                     (direction == 'BEARISH' and latest_close < level))
+    if not latest_agrees:
         return '', None, None
     confirm_start = parse_candle_utc(confirmed.get('datetime'))
     if confirm_start is None:
@@ -9570,8 +9794,23 @@ def weekly_daily_main_trend_from_candles(weekly, daily, now_utc=None):
     direction, level, confirmed_at = weekly_daily_inline_from_candles(
         weekly, daily, now_utc=now_utc)
     if direction != weekly_event['direction'] or confirmed_at is None:
-        # The Weekly body-break is directional evidence; do not label it
-        # RANGING just because the Daily trigger-line close is still pending.
+        # An old FULL confirmation is NOT valid once the latest completed
+        # Daily candle closes back across the weekly trigger line. Until a
+        # newer qualifying Weekly break arrives, report MIXED / WAIT rather
+        # than wrongly continuing to advertise the old FULL trend. This does
+        # not invent a bearish/bullish trigger from chart appearance alone.
+        eligible_daily = [c for c in daily_closed if
+            (parse_candle_utc(c.get('datetime')) is not None and
+             parse_candle_utc(c.get('datetime')) >= weekly_event['weekly_closed_at'])]
+        if eligible_daily:
+            latest_close = float(eligible_daily[-1]['close'])
+            level = float(weekly_event['level'])
+            weekly_dir = weekly_event['direction']
+            reversed_side = ((weekly_dir == 'BULLISH' and latest_close <= level) or
+                             (weekly_dir == 'BEARISH' and latest_close >= level))
+            if reversed_side:
+                return 'MIXED / WAIT', None, weekly_event
+        # A pending Weekly body-break remains unconfirmed, not a new FULL.
         return edo_unconfirmed_or_ranging(weekly_event, weekly_closed, daily_closed), None, weekly_event
     # Find actual fully closed Daily confirmation to save its REAL timestamp.
     confirmation = next((c for c in reversed(daily_closed)
@@ -10853,6 +11092,14 @@ def home():
                 SELECT grp,symbol,interval,direction,confirmation_date FROM price_action_timeframe_status
                 WHERE status='READY' AND confirmation_date != acknowledged_date
             """).fetchall()
+            # Include READY signals even after NEW was acknowledged.
+            # No candle API calls on the home screen.
+            ready_analysis_rows=c.execute("""SELECT grp,symbol,interval,confirmation_date
+                FROM price_action_timeframe_status WHERE status='READY'
+                ORDER BY confirmation_date DESC""").fetchall()
+            analysis_ready_pairs={}
+            for ar in ready_analysis_rows:
+                analysis_ready_pairs.setdefault((ar['grp'],ar['symbol']),ar['interval'])
             blink_ack_rows = c.execute("""
                 SELECT grp,symbol,interval,confirmation_date FROM price_action_blink_ack
             """).fetchall()
@@ -10938,6 +11185,7 @@ def home():
             favorites = _HOME_PAGE_CACHE["favorites"]
             trailing_stops = []
             price_action_statuses = {}
+            analysis_ready_pairs={}
             trend_statuses = dict(_HOME_PAGE_CACHE["trend_statuses"])
             range_sources = dict(_HOME_PAGE_CACHE.get("range_sources", {}))
             trend_since = dict(_HOME_PAGE_CACHE.get("trend_since", {}))
@@ -10958,6 +11206,7 @@ def home():
         trend_snapshots=trend_snapshots,
         weekly_daily_alignments=weekly_daily_alignments,
         price_action_statuses=price_action_statuses,
+        analysis_ready_pairs=analysis_ready_pairs,
         news_items=news_items,
         news_configured=news_configured,
         news_feed_status=news_feed_status,
@@ -11188,6 +11437,7 @@ def signal(i):
             timeframes=signal_timeframes,
             new_timeframes=new_timeframes,
             selected_tf=selected_tf,
+            expand_analysis=request.args.get('analysis')=='1',
             selected_label=allowed[selected_tf],
             price='—',
             latest_closed_date='—',
@@ -11211,6 +11461,7 @@ def signal(i):
         timeframes=signal_timeframes,
         new_timeframes=new_timeframes,
         selected_tf=selected_tf,
+        expand_analysis=request.args.get('analysis')=='1',
         selected_label=allowed[selected_tf],
         price=f"{data['price']:.5f}",
         latest_closed_date=data.get('latest_closed_date', ''),
