@@ -11812,7 +11812,7 @@ def edo_history_page():
     <td>{{t.recovery_time or 'Not observed'}}</td><td>{{t.gross_pl if t.gross_pl is not none else '—'}}</td>
     <td>{{t.data_quality}}</td></tr>{% endfor %}</tbody></table>
     {% if not trades %}<p class="sub">No FXCM trades collected yet. Trade import runs once per minute when enabled.</p>{% endif %}
-    </div><p><a class="pill" href="/">Close history</a></p></body></html>''', trades=records, n=len(records), recovered=recovered, unresolved=unresolved,
+    </div></body></html>''', trades=records, n=len(records), recovered=recovered, unresolved=unresolved,
         sync=dict(sync) if sync else None)
 
 
