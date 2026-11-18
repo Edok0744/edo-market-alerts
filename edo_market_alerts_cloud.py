@@ -1,4 +1,4 @@
-import os, time, sqlite3, threading, json, base64, hashlib
+import os, time, sqlite3, threading, json, base64, hashlib, hmac
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, render_template_string, redirect, send_from_directory, Response
@@ -32,6 +32,8 @@ PROCESS_STARTED_UTC = datetime.now(timezone.utc)
 
 DB = os.environ.get('EDO_DB', 'edo_market_alerts.db')
 FXCM_SERVICE_URL = os.environ.get("FXCM_SERVICE_URL", "").rstrip("/")
+EDO_FXCM_HISTORY_KEY = os.environ.get('EDO_FXCM_HISTORY_KEY', '').strip()
+EDO_HISTORY_PASSWORD = os.environ.get('EDO_HISTORY_PASSWORD', '')
 TWELVE_KEY = os.environ.get('TWELVE_DATA_API_KEY', '')
 PUSHOVER_APP_TOKEN = os.environ.get('PUSHOVER_APP_TOKEN', '')
 PUSHOVER_USER_KEY = os.environ.get('PUSHOVER_USER_KEY', '')
@@ -793,6 +795,7 @@ a{text-decoration:none}
 <div class="wrap">
 
 <h1>📈 EDO MARKET ALERTS</h1>
+<div style="margin:8px 0"><a href="/trade-history" style="text-decoration:none"><button type="button" title="Private read-only FXCM trade recovery journal">📜 Trade History</button></a></div>
 <div class="small">Forex • Crypto • CFD • Cloud price alarms</div>
 
 <div class="card">
@@ -11645,7 +11648,176 @@ def health():
     return jsonify(ok=True)
 
 
+
+# ================================================================
+# Read-only FXCM trade journal: separate from signal generation.
+# Only grand-youth stores personal trading information; the candle
+# service does not persist trade records. Never logs secrets/trades.
+# ================================================================
+
+def edo_history_init_db():
+    with db_conn() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS edo_fxcm_trades (
+          trade_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL,
+          open_time TEXT, close_time TEXT, entry REAL NOT NULL,
+          mark REAL, amount REAL, status TEXT NOT NULL,
+          worst_mark REAL, best_mark REAL, adverse_seen INTEGER DEFAULT 0,
+          recovery_time TEXT, gross_pl REAL, commission REAL, rollover REAL,
+          data_quality TEXT NOT NULL DEFAULT 'OBSERVED_SINCE_SYNC',
+          last_seen TEXT NOT NULL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS edo_fxcm_history_sync (
+          name TEXT PRIMARY KEY, last_success TEXT, last_error TEXT
+        )''')
+
+
+def edo_history_save_snapshot(payload):
+    now = datetime.now(timezone.utc).isoformat()
+    if not isinstance(payload, dict) or payload.get('ok') is not True:
+        return
+    all_rows = (payload.get('open') or []) + (payload.get('closed') or [])
+    with db_conn() as c:
+        for item in all_rows:
+            try:
+                tid = str(item.get('trade_id', ''))[:128]
+                symbol = str(item.get('symbol', ''))[:80]
+                side = item.get('direction')
+                entry = float(item['entry'])
+                if not tid or not symbol or side not in ('BUY', 'SELL') or not (0 < entry < 1000000000):
+                    continue
+                status = item.get('status')
+                if status not in ('OPEN', 'CLOSED'):
+                    continue
+                mark = item.get('exit')
+                mark = float(mark) if mark is not None else None
+                prev = c.execute('SELECT * FROM edo_fxcm_trades WHERE trade_id=?', (tid,)).fetchone()
+                # A prior CLOSED record is final. A single missing SDK row
+                # is not evidence of a closed trade.
+                if prev is not None and prev['status'] == 'CLOSED':
+                    continue
+                adverse = bool(prev['adverse_seen']) if prev else False
+                recovery = prev['recovery_time'] if prev else None
+                worst = prev['worst_mark'] if prev else None
+                best = prev['best_mark'] if prev else None
+                if mark is not None and 0 <= mark < 1000000000:
+                    worst = min(worst, mark) if worst is not None else mark
+                    best = max(best, mark) if best is not None else mark
+                    if (side == 'BUY' and mark < entry) or (side == 'SELL' and mark > entry):
+                        adverse = True
+                    if adverse and not recovery and ((side == 'BUY' and mark >= entry) or
+                                                      (side == 'SELL' and mark <= entry)):
+                        # Approximate: timestamp is FIRST POLL observing recovery;
+                        # it is not the exact market crossing time.
+                        recovery = now
+                if status == 'CLOSED' and mark is None:
+                    # Broker table lacked a usable close quote; do not fabricate.
+                    continue
+                # Preserve actual broker values when they exist. Never claim
+                # gross P/L is net after financing / commission.
+                gross = item.get('gross_pl') if status == 'CLOSED' else None
+                commission = item.get('commission')
+                rollover = item.get('rollover')
+                quality = 'PARTIAL_HISTORY' if not prev and status == 'CLOSED' else 'OBSERVED_SINCE_SYNC'
+                c.execute('''INSERT INTO edo_fxcm_trades (
+                  trade_id,symbol,side,open_time,close_time,entry,mark,amount,
+                  status,worst_mark,best_mark,adverse_seen,recovery_time,
+                  gross_pl,commission,rollover,data_quality,last_seen)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT(trade_id) DO UPDATE SET
+                    symbol=excluded.symbol,side=excluded.side,
+                    close_time=excluded.close_time,mark=excluded.mark,
+                    status=excluded.status,worst_mark=excluded.worst_mark,
+                    best_mark=excluded.best_mark,adverse_seen=excluded.adverse_seen,
+                    recovery_time=excluded.recovery_time,gross_pl=excluded.gross_pl,
+                    commission=excluded.commission,rollover=excluded.rollover,
+                    data_quality=edo_fxcm_trades.data_quality,last_seen=excluded.last_seen
+                ''', (tid, symbol, side, item.get('open_time'), item.get('close_time'),
+                       entry, mark, item.get('amount'), status, worst, best,
+                       int(adverse), recovery, gross, commission, rollover, quality, now))
+            except (ValueError, TypeError, OverflowError, KeyError):
+                continue
+        c.execute('''INSERT INTO edo_fxcm_history_sync(name,last_success,last_error)
+           VALUES ('last',?,NULL) ON CONFLICT(name) DO UPDATE SET
+           last_success=excluded.last_success,last_error=NULL''', (now,))
+
+
+def edo_history_sync_loop():
+    # Keep this polling cycle independent of pattern scans. No account API
+    # request ever executes on a page-rendering thread.
+    while True:
+        try:
+            if len(EDO_FXCM_HISTORY_KEY) >= 32 and FXCM_SERVICE_URL and EDO_HISTORY_PASSWORD:
+                r = requests.get(FXCM_SERVICE_URL + '/trades',
+                    headers={'X-Edo-History-Key': EDO_FXCM_HISTORY_KEY},
+                    timeout=(2.0, 5.0))
+                if r.status_code == 200:
+                    edo_history_save_snapshot(r.json())
+                elif r.status_code not in (503,):
+                    with db_conn() as c:
+                        c.execute('''INSERT INTO edo_fxcm_history_sync(name,last_error)
+                          VALUES ('last',?) ON CONFLICT(name) DO UPDATE SET
+                          last_error=excluded.last_error''', ('Broker history request returned HTTP ' + str(r.status_code),))
+        except Exception as exc:
+            with db_conn() as c:
+                c.execute('''INSERT INTO edo_fxcm_history_sync(name,last_error)
+                  VALUES ('last',?) ON CONFLICT(name) DO UPDATE SET
+                  last_error=excluded.last_error''', (type(exc).__name__,))
+        time.sleep(60)
+
+
+def edo_history_auth_ok():
+    if not EDO_HISTORY_PASSWORD:
+        return False
+    auth = request.authorization
+    return (auth is not None and auth.type.lower() == 'basic' and
+            hmac.compare_digest(auth.username or '', 'edo') and
+            hmac.compare_digest(auth.password or '', EDO_HISTORY_PASSWORD))
+
+
+@APP.route('/trade-history')
+def edo_history_page():
+    if not EDO_HISTORY_PASSWORD or len(EDO_FXCM_HISTORY_KEY) < 32:
+        return ('Trade History is not configured. Add EDO_HISTORY_PASSWORD and '
+                'EDO_FXCM_HISTORY_KEY to grand-youth, and the same '
+                'EDO_FXCM_HISTORY_KEY to caring-celebration.', 503)
+    if not edo_history_auth_ok():
+        return Response('Authentication required', status=401,
+                        headers={'WWW-Authenticate': 'Basic realm="EdoSignal Trade History"',
+                                 'Cache-Control': 'no-store'})
+    with db_conn() as c:
+        trades = c.execute('''SELECT * FROM edo_fxcm_trades
+                           ORDER BY COALESCE(open_time,last_seen) DESC LIMIT 500''').fetchall()
+        sync = c.execute("SELECT * FROM edo_fxcm_history_sync WHERE name='last'").fetchone()
+    records = [dict(t) for t in trades]
+    recovered = sum(bool(x['recovery_time']) for x in records)
+    unresolved = sum(x['status'] == 'OPEN' and not x['recovery_time'] for x in records)
+    return render_template_string('''<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Cache-Control" content="no-store"><title>EdoSignal Trade History</title>
+    <style>body{background:#0c1525;color:#e6edf7;font-family:Arial,sans-serif;max-width:1100px;margin:20px auto;padding:12px}
+    .box{background:#15263f;border-radius:12px;padding:16px;margin:12px 0}.sub{color:#afc4e0}
+    table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #3a4a60;padding:9px;text-align:left}
+    .scroll{overflow-x:auto}.pill{background:#345274;padding:5px 12px;border-radius:8px;color:white;text-decoration:none}
+    </style></head><body><a class="pill" href="/">← Back</a> <h2>📜 FXCM Trade Recovery History</h2>
+    <div class="box"><b>Tracked: {{n}} | Recovered after observed drawdown: {{recovered}} | Open awaiting recovery: {{unresolved}}</b>
+    <p class="sub">Last successful sync: {{sync.last_success if sync else 'Not yet synced'}}
+    {% if sync and sync.last_error %} | Latest sync issue: {{sync.last_error}}{% endif %}</p>
+    <p class="sub">Recovery means a sampled close-out quote returned to the entry AFTER an adverse sampled quote.
+    Overnight moves between polls can be missed; this is not a verified lifetime recovery rate.
+    Older imported trades may have incomplete histories. P/L is gross if supplied by FXCM.</p></div>
+    <div class="box scroll"><table><thead><tr><th>Pair</th><th>Side</th><th>Opened</th><th>Entry</th><th>Status</th>
+    <th>Latest/exit</th><th>Worst observed</th><th>Recovery observed</th><th>Gross P/L</th><th>History quality</th></tr></thead><tbody>
+    {% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.side}}</td><td>{{t.open_time or '—'}}</td>
+    <td>{{'%.5f'|format(t.entry)}}</td><td>{{t.status}}</td><td>{{t.mark if t.mark is not none else '—'}}</td>
+    <td>{{(t.worst_mark if t.side == 'BUY' else t.best_mark) if (t.worst_mark if t.side == 'BUY' else t.best_mark) is not none else '—'}}</td>
+    <td>{{t.recovery_time or 'Not observed'}}</td><td>{{t.gross_pl if t.gross_pl is not none else '—'}}</td>
+    <td>{{t.data_quality}}</td></tr>{% endfor %}</tbody></table>
+    {% if not trades %}<p class="sub">No FXCM trades collected yet. Trade import runs once per minute when enabled.</p>{% endif %}
+    </div><p><a class="pill" href="/">Close history</a></p></body></html>''', trades=records, n=len(records), recovered=recovered, unresolved=unresolved,
+        sync=dict(sync) if sync else None)
+
+
 init_db()
+edo_history_init_db()
 
 # A Gunicorn worker imports this module separately from every other worker.
 # Starting all monitor threads on every import duplicates scans, requests,
@@ -11668,6 +11840,7 @@ def _edo_start_monitors_once():
                 return False
         _EDO_MONITOR_LEADER_HANDLE = handle  # keep fd open for worker lifetime
         for name, target in (
+            ('edo-fxcm-history', edo_history_sync_loop),
             ('edo-price-alerts', monitor),
             ('edo-trailing-stop', trailing_stop_monitor),
             ('edo-trend', active_trend_monitor),
