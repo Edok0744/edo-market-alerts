@@ -11955,13 +11955,80 @@ def edo_history_sync_loop():
         time.sleep(60)
 
 
+# A signed, persistent, Trade History-only login (365 days).
+# No server-side session storage is needed, so Railway restarts do not log you out.
+EDO_HISTORY_LOGIN_DAYS = 365
+EDO_HISTORY_COOKIE = 'edo_history_login'
+EDO_HISTORY_LOGIN_SECONDS = EDO_HISTORY_LOGIN_DAYS * 24 * 60 * 60
+
+
+def edo_history_cookie_signature(stamp):
+    # Password rotation invalidates previously issued cookies.
+    secret = hashlib.sha256((EDO_HISTORY_PASSWORD + ':' + EDO_FXCM_HISTORY_KEY +
+                             ':edo-history-cookie-v1').encode('utf-8')).digest()
+    return hmac.new(secret, str(stamp).encode('ascii'), hashlib.sha256).hexdigest()
+
+
 def edo_history_auth_ok():
     if not EDO_HISTORY_PASSWORD:
         return False
-    auth = request.authorization
-    return (auth is not None and auth.type.lower() == 'basic' and
-            hmac.compare_digest(auth.username or '', 'edo') and
-            hmac.compare_digest(auth.password or '', EDO_HISTORY_PASSWORD))
+    token = request.cookies.get(EDO_HISTORY_COOKIE, '')
+    try:
+        stamp, signature = token.split('.', 1)
+        if not stamp.isdigit() or len(stamp) > 12 or len(signature) != 64:
+            return False
+        age = int(time.time()) - int(stamp)
+        return (0 <= age <= EDO_HISTORY_LOGIN_SECONDS and
+                hmac.compare_digest(signature, edo_history_cookie_signature(stamp)))
+    except (ValueError, TypeError):
+        return False
+
+
+@APP.route('/trade-history/login', methods=['GET', 'POST'])
+def edo_history_login():
+    if not EDO_HISTORY_PASSWORD or len(EDO_FXCM_HISTORY_KEY) < 32:
+        return ('Trade History is not configured.', 503)
+    if request.method == 'POST':
+        submitted = request.form.get('password', '')
+        if hmac.compare_digest(submitted, EDO_HISTORY_PASSWORD):
+            stamp = str(int(time.time()))
+            resp = redirect('/trade-history', code=303)
+            resp.set_cookie(EDO_HISTORY_COOKIE, stamp + '.' + edo_history_cookie_signature(stamp),
+                            max_age=EDO_HISTORY_LOGIN_SECONDS, secure=True,
+                            httponly=True, samesite='Lax', path='/trade-history')
+            resp.headers['Cache-Control'] = 'no-store'
+            return resp
+        error = 'Incorrect password. Please try again.'
+    else:
+        if edo_history_auth_ok():
+            return redirect('/trade-history')
+        error = None
+    return render_template_string('''<!doctype html><html><head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Cache-Control" content="no-store">
+    <title>EdoSignal Trade History Login</title>
+    <style>body{background:#0c1525;color:#e6edf7;font-family:Arial,sans-serif;
+    max-width:420px;margin:10vh auto;padding:18px}
+    .box{background:#15263f;border-radius:14px;padding:26px}
+    input,button{box-sizing:border-box;width:100%;padding:13px;border-radius:8px;font-size:16px}
+    input{background:#fff;border:0;margin:12px 0}button{background:#3285e4;color:white;border:0;cursor:pointer}
+    .sub{color:#afc4e0}.error{color:#ffb4b4}</style></head><body>
+    <div class="box"><h2>📜 EdoSignal Trade History</h2>
+    <p class="sub">Sign in once and stay signed in on this browser for up to 365 days.</p>
+    {% if error %}<p class="error">{{error}}</p>{% endif %}
+    <form method="post" action="/trade-history/login">
+    <label for="password">Trade History password</label>
+    <input id="password" type="password" name="password" required autofocus autocomplete="current-password">
+    <button type="submit">Sign in</button></form></div></body></html>''', error=error), 401 if error else 200, {'Cache-Control':'no-store'}
+
+
+@APP.route('/trade-history/logout', methods=['POST'])
+def edo_history_logout():
+    resp = redirect('/trade-history/login', code=303)
+    resp.delete_cookie(EDO_HISTORY_COOKIE, path='/trade-history', secure=True,
+                       httponly=True, samesite='Lax')
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 @APP.route('/trade-history')
@@ -11971,9 +12038,7 @@ def edo_history_page():
                 'EDO_FXCM_HISTORY_KEY to grand-youth, and the same '
                 'EDO_FXCM_HISTORY_KEY to caring-celebration.', 503)
     if not edo_history_auth_ok():
-        return Response('Authentication required', status=401,
-                        headers={'WWW-Authenticate': 'Basic realm="EdoSignal Trade History"',
-                                 'Cache-Control': 'no-store'})
+        return redirect('/trade-history/login')
     with db_conn() as c:
         trades = c.execute('''SELECT * FROM edo_fxcm_trades
                            ORDER BY COALESCE(open_time,last_seen) DESC LIMIT 500''').fetchall()
@@ -11987,7 +12052,7 @@ def edo_history_page():
     .box{background:#15263f;border-radius:12px;padding:16px;margin:12px 0}.sub{color:#afc4e0}
     table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #3a4a60;padding:9px;text-align:left}
     .scroll{overflow-x:auto}.pill{background:#345274;padding:5px 12px;border-radius:8px;color:white;text-decoration:none}
-    </style></head><body><a class="pill" href="/">← Back</a> <h2>📜 FXCM Trade Recovery History</h2>
+    </style></head><body><a class="pill" href="/">← Back</a> <form method="post" action="/trade-history/logout" style="display:inline;margin-left:10px"><button class="pill" type="submit" style="border:0;cursor:pointer">Log out</button></form> <h2>📜 FXCM Trade Recovery History</h2>
     <div class="box"><b>Tracked: {{n}} | Recovered after observed drawdown: {{recovered}} | Open awaiting recovery: {{unresolved}}</b>
     <p class="sub">Last successful sync: {{sync.last_success if sync else 'Not yet synced'}}
     {% if sync and sync.last_error %} | Latest sync issue: {{sync.last_error}}{% endif %}</p>
