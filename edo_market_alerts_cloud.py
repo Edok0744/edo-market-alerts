@@ -6604,6 +6604,27 @@ def describe_setup(p, interval=None):
         detail = f"Range reversal • {p['run_count']} candles • {p['penetration']:.0f}% confirmation"
         level_text = f"Close: {p['confirmation_close']:.5f}"
 
+    # Monthly bullish/bearish: previous established opposite swing is the
+    # ONLY objective. Never display the old second, farther Take Profit.
+    if interval == '1month' and p.get('monthly_swing_target_checked'):
+        if p.get('target1') is not None:
+            level_text = level_text.split(' • Target 1:')[0].split(' • Take Profit:')[0]
+            level_text += f" • Target: {float(p['target1']):.5f} ({p['monthly_swing_target_note']})"
+        else:
+            level_text = level_text.split(' • Target 1:')[0].split(' • Take Profit:')[0]
+            level_text += f" • Target: unavailable ({p['monthly_swing_target_note']})"
+
+    if p.get('edo_swing_levels_checked'):
+        level_text = level_text.split(' • Target 1:')[0].split(' • Take Profit:')[0].split(' • Target:')[0]
+        if p.get('target1') is not None:
+            level_text += f" • Target: {float(p['target1']):.5f} (previous swing)"
+        else:
+            level_text += " • Target: unavailable (no prior unbroken swing)"
+        if p.get('edo_swing_stop') is not None:
+            level_text += f" • Stop: {float(p['edo_swing_stop']):.5f} (beyond setup swing)"
+        else:
+            level_text += " • Stop: unavailable (no confirmed swing)"
+
     # Visual-only distinction: Edo uses 4H Trend Pullback mainly as an entry/re-entry
     # inside the larger trend. Detection rules are unchanged.
     display_name = p["name"]
@@ -7824,6 +7845,124 @@ def edo_pullback_agreement(grp, symbol, interval, pattern):
             'text': f'Weekly + Daily {side} pullbacks confirmed within 21 days (+5 strength points)'}
 
 
+def edo_monthly_previous_swing_target(candles, pattern):
+    """Monthly-only: latest established opposite swing before the signal.
+
+    Never use candles after the confirmation date (no future information),
+    never substitute a farther old swing, and never extend targets beyond it.
+    """
+    idx = edo_analysis_candle_index(candles, pattern)
+    if idx is None or idx < 5:
+        return None, "No established previous monthly swing"
+    side = pattern.get('direction')
+    if side not in ('bullish', 'bearish'):
+        return None, "Unknown direction"
+    # The confirmation candle is not allowed to manufacture its own target.
+    history = candles[max(0, idx - 80):idx]
+    kind = 'high' if side == 'bullish' else 'low'
+    pivots = swing_points(history, kind, left=2, right=2)
+    if not pivots:
+        return None, "No established previous monthly swing"
+    # Most RECENT established swing, not the biggest/highest distant level.
+    level = float(pivots[-1][1])
+    entry = float(pattern.get('confirmation_close') or candles[idx]['close'])
+    if (side == 'bullish' and level <= entry) or (side == 'bearish' and level >= entry):
+        return None, "Previous monthly swing already reached at confirmation"
+    return level, "Previous monthly swing high" if side == 'bullish' else "Previous monthly swing low"
+
+
+def edo_apply_monthly_swing_targets(candles, patterns):
+    """Apply the same Monthly target rule to bullish and bearish setups."""
+    for p in patterns:
+        level, note = edo_monthly_previous_swing_target(candles, p)
+        p['monthly_swing_target_checked'] = True
+        p['monthly_swing_target_note'] = note
+        p['target'] = level
+        p['target1'] = level
+        p['target1_source'] = 'previous monthly swing'
+        # Monthly has one objective: the previous swing, no extended TP.
+        p['take_profit'] = None
+        p['take_profit_source'] = None
+    return patterns
+
+
+def edo_setup_swing_levels(candles, pattern):
+    """Historical structure levels known at confirmation, for every signal type.
+
+    BUY: latest confirmed low for risk, previous confirmed high for reward.
+    SELL: latest confirmed high for risk, previous confirmed low for reward.
+    No future candles, fixed entry-distance stops, or invented far targets.
+    """
+    idx = edo_analysis_candle_index(candles, pattern)
+    side = pattern.get('direction')
+    if idx is None or idx < 4 or side not in ('bullish', 'bearish'):
+        return None, None, 'Insufficient confirmed swing history'
+    entry = float(pattern.get('confirmation_close') or candles[idx]['close'])
+    # Confirmation candle can confirm the pivot immediately before it,
+    # but cannot itself be a pivot (its right side is not closed yet).
+    start = max(0, idx-100)
+    available = candles[start:idx+1]
+    stop_kind = 'low' if side == 'bullish' else 'high'
+    target_kind = 'high' if side == 'bullish' else 'low'
+    stop_pivots = swing_points(available, stop_kind, left=2, right=1)
+    # Confirm targets using two closed candles on their right. Exclude the
+    # confirmation candle to avoid manufacturing a target from the signal.
+    target_pivots = swing_points(available[:-1], target_kind, left=2, right=2)
+    valid_stop = [float(v) for _,v in stop_pivots
+                  if (v < entry if side == 'bullish' else v > entry)]
+    valid_target = [float(v) for _,v in target_pivots
+                    if (v > entry if side == 'bullish' else v < entry)]
+    # For a pullback, the actual setup swing may be the lowest/highest bar of
+    # the retracement even if a strict pivot has not yet been confirmed.
+    if pattern.get('name') == 'TREND PULLBACK SETUP':
+        run_start = pattern.get('run_start')
+        if isinstance(run_start,int) and 0 <= run_start <= idx:
+            pullback = candles[run_start:idx+1]
+            extreme = (min(float(x['low']) for x in pullback) if side=='bullish'
+                       else max(float(x['high']) for x in pullback))
+            if (extreme < entry if side=='bullish' else extreme > entry):
+                valid_stop.append(extreme)
+    # Most recent confirmed pivot, except a still-forming pullback may
+    # require its own lower low / higher high as the actual invalidation.
+    stop_base = valid_stop[-1] if valid_stop else None
+    if pattern.get('name') == 'TREND PULLBACK SETUP' and valid_stop:
+        if side=='bullish': stop_base=min(valid_stop[-2:])
+        else: stop_base=max(valid_stop[-2:])
+    # Never skip an already-reached recent swing to hunt for a distant target.
+    latest_target = float(target_pivots[-1][1]) if target_pivots else None
+    target = latest_target if latest_target is not None and (
+        latest_target > entry if side=='bullish' else latest_target < entry) else None
+    if stop_base is None:
+        return None, target, 'No confirmed setup swing for stop'
+    prior = candles[max(0,idx-15):idx+1]
+    ranges = []
+    for j in range(1,len(prior)):
+        c, prev = prior[j],prior[j-1]
+        ranges.append(max(float(c['high'])-float(c['low']),
+                          abs(float(c['high'])-float(prev['close'])),
+                          abs(float(c['low'])-float(prev['close']))))
+    atr = sum(ranges[-14:])/len(ranges[-14:]) if ranges else 0.0
+    # 10% ATR beyond structure, not a tight stop relative to entry.
+    buffer = max(atr*0.10,abs(entry)*0.00001)
+    stop = stop_base-buffer if side=='bullish' else stop_base+buffer
+    return stop, target, 'Previous swing high' if side=='bullish' else 'Previous swing low'
+
+
+def edo_apply_all_swing_targets(candles, patterns):
+    """Set consistent structural objectives; leave setup detection untouched."""
+    for pat in patterns:
+        stop, target, note = edo_setup_swing_levels(candles,pat)
+        pat['edo_swing_levels_checked'] = True
+        pat['edo_swing_stop'] = stop
+        pat['edo_swing_target_note'] = note
+        pat['target'] = target
+        pat['target1'] = target
+        pat['target1_source'] = 'previous swing'
+        pat['take_profit'] = None
+        pat['take_profit_source'] = None
+    return patterns
+
+
 def edo_analysis_for_pattern(pattern, candles, snapshots, agreement=None):
     # Score components are transparent heuristic POINTS, not hit probability.
     idx = edo_analysis_candle_index(candles,pattern)
@@ -7845,22 +7984,18 @@ def edo_analysis_for_pattern(pattern, candles, snapshots, agreement=None):
                           abs(float(cur['high'])-float(last['close'])),
                           abs(float(cur['low'])-float(last['close']))))
     atr=sum(ranges[-14:])/len(ranges[-14:]) if ranges else 0.0
-    if side=='bullish':
-        stop=min(float(x['low']) for x in recent)
-        candidates=[float(lookback[j]['high']) for j in range(2,len(lookback)-2)
-            if float(lookback[j]['high'])>entry+0.5*atr
-            and all(float(lookback[j]['high'])>=float(lookback[k]['high']) for k in range(j-2,j+3) if k!=j)]
-        target=min(candidates,key=lambda x:x-entry) if candidates else None
-    else:
-        stop=max(float(x['high']) for x in recent)
-        candidates=[float(lookback[j]['low']) for j in range(2,len(lookback)-2)
-            if float(lookback[j]['low'])<entry-0.5*atr
-            and all(float(lookback[j]['low'])<=float(lookback[k]['low']) for k in range(j-2,j+3) if k!=j)]
-        target=max(candidates) if candidates else None
+    stop, target, _level_note = edo_setup_swing_levels(candles,pattern)
+    if pattern.get('edo_swing_levels_checked'):
+        target = pattern.get('target1')
+    if stop is None:
+        return {'score':None,'rating':'Unavailable','reason':'No confirmed setup swing stop',
+                'higher':'Unknown','rr_text':'Not available','volatility':'Not available',
+                'entry':None,'stop':None,'target':target,'history':'Collecting data',
+                'pullback_agreement':'Swing stop unavailable'}
     risk=abs(entry-stop)
     reward=abs(target-entry) if target is not None else None
     rr=(reward/risk if risk>0 and reward is not None and reward>0 else None)
-    if risk<=0 or target is None or rr is None: stop=target=None
+    if risk<=0: stop=target=None
     weekly=str(snapshots.get('Weekly','')).lower()
     daily=str(snapshots.get('Daily','')).lower()
     wanted='bullish' if side=='bullish' else 'bearish'
@@ -8121,9 +8256,13 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     # Use the same final confirmation-room rule as the automatic monitor.
     # This keeps the manual SIGNAL page and phone alerts in agreement.
+    if interval == '1month':
+        edo_apply_monthly_swing_targets(closed_candles, found)
+
     found, rejected_room_setups = apply_confirmation_room_filter(
         closed_candles, interval, found
     )
+    edo_apply_all_swing_targets(closed_candles, found)
 
     # Most recent closed candle first; on the same candle, Gap Retest wins.
     found.sort(
@@ -9003,11 +9142,15 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         if gap_htf_error:
             return None, latest_closed_date, gap_htf_error
 
+    if interval == '1month':
+        edo_apply_monthly_swing_targets(closed_candles, setups)
+
     # Reject overextended 4H/8H confirmations that have already arrived at
     # the next important historical S/R level. Rejected setups do NOT Push.
     setups, rejected_room_setups = apply_confirmation_room_filter(
         closed_candles, interval, setups
     )
+    edo_apply_all_swing_targets(closed_candles, setups)
     for rp in rejected_room_setups:
         print(
             "pattern rejected - confirmation too far into S/R",
