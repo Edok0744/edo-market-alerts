@@ -534,6 +534,25 @@ button{
 .saved-market{
     flex-wrap:nowrap;
 }
+/* Saved-pair dashboard: identity and trend on left, controls on right. */
+.saved-market{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;column-gap:12px;row-gap:9px}
+.saved-market .saved-identity{min-width:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.saved-market .saved-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:nowrap}
+.saved-market .saved-actions a{display:inline-flex;min-width:0;text-decoration:none}
+.saved-market .saved-actions button{min-height:38px;padding:8px 10px;border-radius:9px;font-size:12px}
+.saved-market .saved-actions .edo-analysis-btn{min-width:44px}
+.saved-market .saved-actions .saved-delete-btn{min-width:38px;padding:8px;font-size:17px;background:#4a2333;color:#ff8899;border:1px solid #935165}
+.saved-market .saved-actions .saved-delete-btn:hover{background:#733044}
+.saved-wait-dot{width:11px;height:11px;display:inline-block;flex:none;border-radius:50%;background:#ffe04d;box-shadow:0 0 0 2px rgba(255,224,77,.17),0 0 7px rgba(255,224,77,.45);animation:edoWaitPulse 2s ease-in-out infinite;cursor:pointer}
+@keyframes edoWaitPulse{0%,100%{opacity:.5;transform:scale(.84);box-shadow:0 0 0 1px rgba(255,224,77,.10)}50%{opacity:1;transform:scale(1.13);box-shadow:0 0 0 3px rgba(255,224,77,.18),0 0 9px rgba(255,224,77,.6)}}
+@media(prefers-reduced-motion:reduce){.saved-wait-dot{animation:none;opacity:1}}
+@media(max-width:680px){
+ .saved-market{display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
+ .saved-market .saved-identity{width:100%;margin-bottom:0;gap:6px}
+ .saved-market .saved-actions{width:100%;display:flex;justify-content:flex-end;gap:5px}
+ .saved-market .saved-actions button{padding:9px 10px;font-size:12px}
+}
+
 .saved-market > div:first-child{
     min-width:0;
 }
@@ -943,13 +962,18 @@ document.getElementById('fav_group').value=document.getElementById('group').valu
 
 <div class="market saved-market" data-trend-symbol="{{ f['symbol']|e }}" data-trend-status="{{ (trend_statuses.get(f['symbol'], '') + (' — ' + range_sources.get(f['symbol'], '') if trend_statuses.get(f['symbol']) == 'RANGING' and range_sources.get(f['symbol']) else ''))|e }}">
 
-<div>
+<div class="saved-identity">
 <span class="pill"
 style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 {{f['grp']}}
 </span>
 
 <b>{{f['symbol']}}</b>
+{% set waiting_tfs = saved_wait_timeframes.get((f['grp'],f['symbol']), []) %}
+{% if waiting_tfs %}
+<a href="/signal/{{f['id']}}?view=1" title="WAIT timeframes: {{ waiting_tfs|join(', ') }} — open Price Action" aria-label="WAIT on {{ waiting_tfs|join(', ') }}">
+<span class="saved-wait-dot" aria-hidden="true"></span></a>
+{% endif %}
 {% set saved_ts = trend_statuses.get(f['symbol'], '') %}
 {% set saved_snap = trend_snapshots.get(f['symbol'], {}) %}
 {% set saved_weekly = saved_snap.get('Weekly', '') %}
@@ -979,7 +1003,7 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 {% endif %}
 </div>
 
-<div class="saved-actions forex-actions">
+<div class="saved-actions">
 <a href="/favorite/use/{{f['id']}}">
 <button>USE</button>
 </a>
@@ -1008,8 +1032,8 @@ style="background:{{ colors[f['grp']] }}22;color:{{ colors[f['grp']] }}">
 </a>
 {% endif %}
 
-<a href="/favorite/delete/{{f['id']}}">
-<button class="danger">Delete</button>
+<a href="/favorite/delete/{{f['id']}}" onclick="return confirm('Remove {{f['symbol']|e}} from Saved Pairs? This will not delete your trade history.')" title="Delete {{f['symbol']}} from Saved Pairs" aria-label="Delete {{f['symbol']}} from Saved Pairs">
+<button class="saved-delete-btn" type="button" aria-label="Delete {{f['symbol']}}">🗑</button>
 </a>
 </div>
 
@@ -11186,6 +11210,18 @@ def home():
                 else:
                     price_action_statuses[r['symbol']] = {'css':'','label':'Price Action — WAIT'}
 
+            # Yellow dot means one or more scanned timeframes are currently WAIT.
+            # This mirrors the scanner's actual WAIT state, not MIXED / WAIT trend.
+            # Exclude records without a recorded update (if any).
+            saved_wait_timeframes = {}
+            wait_rows = c.execute("""
+                SELECT grp,symbol,interval FROM price_action_timeframe_status
+                WHERE status='WAIT' AND updated IS NOT NULL AND updated != ''
+                ORDER BY grp,symbol,interval
+            """).fetchall()
+            for wr in wait_rows:
+                saved_wait_timeframes.setdefault((wr['grp'],wr['symbol']), []).append(wr['interval'])
+
             # Any unread READY timeframe lights the HOME Price Action icon.
             unread_rows = c.execute("""
                 SELECT grp,symbol,interval,direction,confirmation_date FROM price_action_timeframe_status
@@ -11285,6 +11321,7 @@ def home():
             trailing_stops = []
             price_action_statuses = {}
             analysis_ready_pairs={}
+            saved_wait_timeframes={}
             trend_statuses = dict(_HOME_PAGE_CACHE["trend_statuses"])
             range_sources = dict(_HOME_PAGE_CACHE.get("range_sources", {}))
             trend_since = dict(_HOME_PAGE_CACHE.get("trend_since", {}))
@@ -11306,6 +11343,7 @@ def home():
         weekly_daily_alignments=weekly_daily_alignments,
         price_action_statuses=price_action_statuses,
         analysis_ready_pairs=analysis_ready_pairs,
+        saved_wait_timeframes=saved_wait_timeframes,
         news_items=news_items,
         news_configured=news_configured,
         news_feed_status=news_feed_status,
