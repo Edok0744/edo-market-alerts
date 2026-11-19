@@ -7358,6 +7358,35 @@ def weekly_daily_direction_for_filters(symbol, grp):
     return direction, states, None
 
 
+def edo_strict_higher_tf_direction(symbol, grp):
+    """Fail-closed directional permission for LOWER timeframe Price Action.
+
+    A BUY or SELL requires the completed Weekly+Daily main trend to agree.
+    MIXED, RANGING and unavailable data do not permit new lower-TF alerts.
+    """
+    weekly, we = get_candles(symbol, '1week', outputsize=100, grp=grp)
+    daily, de = get_candles(symbol, '1day', outputsize=260, grp=grp)
+    if we or de or not weekly or not daily:
+        return None
+    status, _, _ = weekly_daily_main_trend_from_candles(weekly, daily)
+    return {'FULL BULLISH': 'bullish', 'FULL BEARISH': 'bearish'}.get(status)
+
+
+def edo_filter_lower_tf_signals(symbol, grp, interval, setups, forming_direction=''):
+    """Same strict Weekly->Daily gate for manual display and auto alerts.
+
+    Preserve all pattern detection, but do not advertise counter-trend
+    lower-timeframe setups or WAIT precursors as actionable signals.
+    """
+    if interval not in ('3h', '4h', '8h', '12h'):
+        return setups, forming_direction
+    direction = edo_strict_higher_tf_direction(symbol, grp)
+    permitted = [p for p in setups if p.get('direction') == direction] if direction else []
+    expected_forming = ('BUY' if direction == 'bullish' else
+                        'SELL' if direction == 'bearish' else '')
+    return permitted, (forming_direction if forming_direction == expected_forming else '')
+
+
 def strong_higher_timeframe_trend(symbol, grp='FOREX', interval='4h'):
     """Pullback continuation direction from the new Weekly→Daily main trend."""
     if not pullback_higher_tf_enabled(grp, interval):
@@ -8227,7 +8256,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     # Edo rule:
     #   All Trend Pullbacks -> established local trend + clean 2+ candle retracement.
-    #   4H / 8H (Crypto 12H) -> higher-timeframe direction (Daily first, Weekly fallback); S/R is context
+    #   All lower timeframes (3H/4H/8H/12H) -> strict Weekly AND Daily agreement for Forex, CFD and Crypto.
     #   only and does not block the entry/re-entry signal.
     #   Daily / Weekly -> meaningful pre-existing S/R remains mandatory.
     higher_tf_states = None
@@ -8253,6 +8282,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         )
         if gap_htf_error:
             return None, gap_htf_error
+
+    # Strict Weekly -> Daily direction for ALL lower-TF signal families.
+    found, _ = edo_filter_lower_tf_signals(symbol, grp, interval, found)
 
     # Use the same final confirmation-room rule as the automatic monitor.
     # This keeps the manual SIGNAL page and phone alerts in agreement.
@@ -8346,6 +8378,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     else:
         # An ordinary lack of a signal is neutral, NOT a developing signal.
         forming_direction = edo_forming_pullback(closed_candles, grp, interval)
+        _, forming_direction = edo_filter_lower_tf_signals(
+            symbol, grp, interval, [], forming_direction
+        )
         if forming_direction and not forex_weekend_blocked:
             signal = "WAIT — " + forming_direction + " PULLBACK FORMING"
             icon, css = "🟡", "wait"
@@ -8953,6 +8988,9 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     _edo_forming_scan.direction = ''
     try:
         _edo_forming_scan.direction = edo_forming_pullback(closed_candles, grp, interval)
+        _, _edo_forming_scan.direction = edo_filter_lower_tf_signals(
+            symbol, grp, interval, [], _edo_forming_scan.direction
+        )
     except Exception as forming_error:
         print('forming pullback assessment unavailable', grp, symbol, interval, forming_error, flush=True)
 
@@ -9115,7 +9153,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         setups.extend(star_setups)
 
     # Edo rule:
-    #   4H / 8H (Crypto 12H) Trend Pullback -> Daily first, Weekly fallback; range permits both.
+    #   All lower-timeframe Trend Pullbacks -> strict Weekly AND Daily agreement; mixed/ranging blocks alerts.
     #   S/R is useful context on 4H but is NOT a mandatory blocker.
     #   Daily / Weekly Trend Pullback -> must be near meaningful S/R and do
     #   not use the 4H higher-timeframe alignment requirement.
@@ -9144,6 +9182,11 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     if interval == '1month':
         edo_apply_monthly_swing_targets(closed_candles, setups)
+
+    # Block every lower-TF counter-trend setup BEFORE alerts/status are saved.
+    setups, _edo_forming_scan.direction = edo_filter_lower_tf_signals(
+        symbol, grp, interval, setups, _edo_forming_scan.direction
+    )
 
     # Reject overextended 4H/8H confirmations that have already arrived at
     # the next important historical S/R level. Rejected setups do NOT Push.
