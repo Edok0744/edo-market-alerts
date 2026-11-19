@@ -6592,6 +6592,15 @@ def describe_setup(p, interval=None):
         level_text = f"{zone_word}: {p['level']:.5f} • Close: {p['confirmation_close']:.5f}"
     elif p["name"] == "TREND PULLBACK SETUP":
         detail = f"{p['run_count']} {p['run_colour']} pullback candles • Confirmed close"
+        if p.get('edo_range_entry'):
+            icon = '🟢↑' if bullish else '🔴↓'
+            range_line = (f"Confirmed range: {p['edo_range_label']} "
+                          f"({p.get('edo_range_source','')}); "
+                          f"boundary {p['edo_range_boundary']:.5f}, "
+                          f"opposite boundary {p['edo_range_opposite']:.5f}. ")
+        else:
+            range_line = ''
+
         if p.get("higher_tf_filter"):
             htf = p.get("higher_tf_states", {})
             detail += f" • D1: {htf.get('1D','?')} • W1: {htf.get('1W','?')}"
@@ -6632,6 +6641,16 @@ def describe_setup(p, interval=None):
         display_name = "4H PULLBACK ENTRY"
         icon = "⚪"
         css = "entry4h"
+
+    if p.get('edo_range_entry'):
+        buy = p['direction'] == 'bullish'
+        icon = '🟢↑' if buy else '🔴↓'
+        css = 'buy' if buy else 'sell'
+        display_name = ('BUY AT SUPPORT' if buy else 'SELL AT RESISTANCE') + ' — ' + display_name
+        detail += (' • CONFIRMED RANGE ' + str(p.get('edo_range_source', '')))
+        level_text += (f" • Range support: {p['edo_range_boundary']:.5f}"
+                       if buy else f" • Range resistance: {p['edo_range_boundary']:.5f}")
+        level_text += f" • Opposite range boundary: {p['edo_range_opposite']:.5f}"
 
     return {
         "name": display_name,
@@ -7358,32 +7377,90 @@ def weekly_daily_direction_for_filters(symbol, grp):
     return direction, states, None
 
 
-def edo_strict_higher_tf_direction(symbol, grp):
-    """Fail-closed directional permission for LOWER timeframe Price Action.
+def edo_higher_tf_market_permission(symbol, grp):
+    """Closed Weekly/Daily: either agreed trend or confirmed intact range.
 
-    A BUY or SELL requires the completed Weekly+Daily main trend to agree.
-    MIXED, RANGING and unavailable data do not permit new lower-TF alerts.
+    Fail closed on missing/mixed data. Range levels are calculated from the
+    same four-touch channel already displayed on the saved-pair screen.
     """
     weekly, we = get_candles(symbol, '1week', outputsize=100, grp=grp)
     daily, de = get_candles(symbol, '1day', outputsize=260, grp=grp)
     if we or de or not weekly or not daily:
-        return None
+        return None, None
     status, _, _ = weekly_daily_main_trend_from_candles(weekly, daily)
-    return {'FULL BULLISH': 'bullish', 'FULL BEARISH': 'bearish'}.get(status)
+    if status == 'FULL BULLISH':
+        return 'bullish', None
+    if status == 'FULL BEARISH':
+        return 'bearish', None
+    if status == 'RANGING':
+        w_closed = fully_closed_candles(weekly, '1week')
+        d_closed = fully_closed_candles(daily, '1day')
+        return 'ranging', edo_weekly_daily_range(w_closed, d_closed)
+    return None, None
+
+
+def edo_range_entry_ok(range_info, direction, entry):
+    """Only a confirmed boundary entry with >= 1.5:1 available range reward.
+
+    ATR is used ONLY as a risk buffer beyond support/resistance, not as a
+    substitute for Edo's actual swing stops and swing targets.
+    """
+    if not range_info or direction not in ('bullish', 'bearish'):
+        return False
+    try:
+        entry = float(entry)
+        upper, lower = float(range_info['upper']), float(range_info['lower'])
+        width, atr = float(range_info['width']), float(range_info['atr'])
+        if width <= 0 or atr <= 0 or upper <= lower:
+            return False
+        if not edo_range_pullback_side_ok(range_info, direction, entry):
+            return False
+        buffer = max(atr * 0.25, width * 0.015)
+        if direction == 'bullish':
+            risk = entry - (lower - buffer)
+            reward = upper - entry
+        else:
+            risk = (upper + buffer) - entry
+            reward = entry - lower
+        # Check both meaningful movement vs noise and the prospective R:R.
+        return risk > 0 and reward >= max(risk * 1.5, atr * 1.5)
+    except (ValueError, TypeError, KeyError):
+        return False
 
 
 def edo_filter_lower_tf_signals(symbol, grp, interval, setups, forming_direction=''):
-    """Same strict Weekly->Daily gate for manual display and auto alerts.
+    """Applies identically to Forex, CFDs and Crypto; WAIT needs trend agreement.
 
-    Preserve all pattern detection, but do not advertise counter-trend
-    lower-timeframe setups or WAIT precursors as actionable signals.
+    Trend: Weekly+Daily direction only. Four-touch range: allow only a CLOSED
+    confirmed setup at support (BUY) or resistance (SELL), with room to move.
+    No directional forming WAIT during ranges; boundary touch alone is NOT
+    confirmation. All other mixed/missing states block new lower-TF signals.
     """
     if interval not in ('3h', '4h', '8h', '12h'):
         return setups, forming_direction
-    direction = edo_strict_higher_tf_direction(symbol, grp)
-    permitted = [p for p in setups if p.get('direction') == direction] if direction else []
-    expected_forming = ('BUY' if direction == 'bullish' else
-                        'SELL' if direction == 'bearish' else '')
+    permission, range_info = edo_higher_tf_market_permission(symbol, grp)
+    if permission == 'ranging':
+        if not range_info:
+            return [], ''
+        permitted = []
+        for setup in setups:
+            entry = setup.get('confirmation_close')
+            if entry is None or not edo_range_entry_ok(range_info, setup.get('direction'), entry):
+                continue
+            q = dict(setup)
+            buy = q['direction'] == 'bullish'
+            q['edo_range_entry'] = True
+            q['edo_range_arrow'] = '↑' if buy else '↓'
+            q['edo_range_label'] = 'BUY AT SUPPORT' if buy else 'SELL AT RESISTANCE'
+            q['edo_range_source'] = edo_range_display_source(range_info)
+            q['edo_range_boundary'] = float(range_info['lower'] if buy else range_info['upper'])
+            q['edo_range_opposite'] = float(range_info['upper'] if buy else range_info['lower'])
+            permitted.append(q)
+        return permitted, ''
+    if permission not in ('bullish', 'bearish'):
+        return [], ''
+    permitted = [p for p in setups if p.get('direction') == permission]
+    expected_forming = 'BUY' if permission == 'bullish' else 'SELL'
     return permitted, (forming_direction if forming_direction == expected_forming else '')
 
 
@@ -8256,7 +8333,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
 
     # Edo rule:
     #   All Trend Pullbacks -> established local trend + clean 2+ candle retracement.
-    #   All lower timeframes (3H/4H/8H/12H) -> strict Weekly AND Daily agreement for Forex, CFD and Crypto.
+    #   All lower timeframes: Weekly/Daily trend alignment OR confirmed wide range support/resistance.
     #   only and does not block the entry/re-entry signal.
     #   Daily / Weekly -> meaningful pre-existing S/R remains mandatory.
     higher_tf_states = None
@@ -8410,11 +8487,20 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                 state_text = " | ".join(f"{k} {v}" for k, v in higher_tf_states.items())
                 summary = (
                     f"No {interval.upper()} setup passed the higher-timeframe direction filter. "
-                    f"Daily is used first; Weekly is fallback when Daily is unclear; both ranging allow either direction. "
+                    f"Only aligned Weekly/Daily direction or confirmed range boundary entries are permitted. "
                     f"Current higher-timeframe state: {state_text}."
                 )
             else:
                 summary = "No qualifying closed-candle setup"
+
+    if (bullish or bearish) and any(p.get('edo_range_entry') for p in current_patterns):
+        chosen = next((p for p in current_patterns if p.get('edo_range_entry')), None)
+        if chosen is not None and not (bullish and bearish):
+            is_buy = chosen['direction'] == 'bullish'
+            signal = '↑ BUY AT SUPPORT — RANGE' if is_buy else '↓ SELL AT RESISTANCE — RANGE'
+            icon, css = ('🟢', 'buy') if is_buy else ('🔴', 'sell')
+            summary = ('Confirmed range-boundary setup with enough room toward '
+                       'the opposite side. Review swing stop and target before trading.')
 
     # Weekly Spike disabled: Edo wants ONLY his requested trading signals.
     weekly_spike = None
@@ -8942,8 +9028,8 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
         ready_priority = 1
 
         accepted = send_push(
-            f"{icon} {symbol} [{grp}] — {p['name']}",
-            push_body,
+            f"{icon} {symbol} [{grp}] — {p['edo_range_label'] if p.get('edo_range_entry') else p['name']}",
+            range_line + push_body,
             sound=ready_sound,
             priority=ready_priority
         )
@@ -9153,7 +9239,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         setups.extend(star_setups)
 
     # Edo rule:
-    #   All lower-timeframe Trend Pullbacks -> strict Weekly AND Daily agreement; mixed/ranging blocks alerts.
+    #   All lower-timeframe setups: aligned Weekly/Daily trends OR confirmed wide range boundary entries.
     #   S/R is useful context on 4H but is NOT a mandatory blocker.
     #   Daily / Weekly Trend Pullback -> must be near meaningful S/R and do
     #   not use the 4H higher-timeframe alignment requirement.
