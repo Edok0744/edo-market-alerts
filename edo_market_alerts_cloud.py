@@ -8555,6 +8555,12 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     )
     edo_apply_all_swing_targets(closed_candles, found)
 
+    # FINAL 3H/4H safety gate: do not show a historical grey setup, NEW
+    # TRIGGER, or an unapproved forming WAIT if Weekly/Daily permission is absent.
+    # Re-check after all other setup transforms to fail closed by direction.
+    if interval in ('3h', '4h'):
+        found, _ = edo_filter_lower_tf_signals(symbol, grp, interval, found)
+
     # Most recent closed candle first; on the same candle, Gap Retest wins.
     found.sort(
         key=lambda p: (
@@ -9048,6 +9054,14 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
     if not patterns:
         return
 
+    # Last-mile alert gate. Even if a caller supplies raw detections,
+    # 3H/4H pushes require CURRENT matching Weekly/Daily pullbacks or
+    # strong aligned Weekly/Daily trend; no exceptions for market group.
+    if interval in ('3h', '4h'):
+        patterns, _ = edo_filter_lower_tf_signals(symbol, grp, interval, patterns)
+        if not patterns:
+            return
+
     tf_labels = {x["value"]: x["label"] for x in PATTERN_TIMEFRAMES}
     tf_label = tf_labels.get(interval, interval)
 
@@ -9480,6 +9494,12 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         closed_candles, interval, setups
     )
     edo_apply_all_swing_targets(closed_candles, setups)
+    # Final fail-closed check: unapproved 3H/4H patterns cannot enter
+    # saved NEW state, blink icon or Pushover notification pipeline.
+    if interval in ('3h', '4h'):
+        setups, _edo_forming_scan.direction = edo_filter_lower_tf_signals(
+            symbol, grp, interval, setups, _edo_forming_scan.direction
+        )
     for rp in rejected_room_setups:
         print(
             "pattern rejected - confirmation too far into S/R",
@@ -9500,7 +9520,7 @@ def save_price_action_status(grp, symbol, setups, latest_closed_date):
     elif bearish and not bullish:
         status, direction = "READY", "SELL"
     else:
-        status, direction = "WAIT", ""
+        status, direction = "NONE", ""
 
     with db_conn() as c:
         c.execute(
@@ -9528,7 +9548,7 @@ def save_timeframe_ready_status(grp, symbol, interval, setups, latest_closed_dat
     current = [p for p in (setups or []) if p.get('confirmation_date') == latest_closed_date]
     buy = any(p.get('direction') == 'bullish' for p in current)
     sell = any(p.get('direction') == 'bearish' for p in current)
-    status = 'READY' if buy != sell else ('FORMING' if forming_direction in ('BUY', 'SELL') and not (buy or sell) else 'WAIT')
+    status = 'READY' if buy != sell else ('FORMING' if forming_direction in ('BUY', 'SELL') and not (buy or sell) else ('NONE' if interval in ('3h', '4h') else 'WAIT'))
     direction = ('BUY' if buy and not sell else ('SELL' if sell and not buy else
                  (forming_direction if status == 'FORMING' else '')))
     with db_conn() as c:
