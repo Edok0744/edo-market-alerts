@@ -1679,6 +1679,7 @@ a{text-decoration:none}
 .entry4h{color:#aeb8c2}
 .rrblue{color:#4da3ff}
 .starcyan{color:#22e6db}
+.monthlypink{color:#FF4FD8;text-shadow:0 0 10px rgba(255,79,216,.33)}
 .error{color:#ff8a96;font-weight:800}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .tfrow{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
@@ -6529,7 +6530,14 @@ def describe_setup(p, interval=None):
     css = "buy" if bullish else "sell"
     direction_word = "Bullish" if bullish else "Bearish"
 
-    if p["name"] in STAR_PATTERN_NAMES:
+    if p['name'] == EDO_MONTHLY_SMALL_REVERSAL_NAME:
+        icon, css = ('🩷↑' if bullish else '🩷↓'), 'monthlypink'
+        detail = (f"Monthly reversal • {p['run_count']} {p['run_colour']} pullback candles "
+                  f"• small turning body {p['small_body_pct']:.0f}% of pullback average "
+                  f"• retracement {p['pullback_depth_pct']:.0f}% (max 65%) "
+                  f"• turning candle fully closed (no extra confirmation) • No S/R requirement")
+        level_text = f"Confirmed close: {p['confirmation_close']:.5f}"
+    elif p["name"] in STAR_PATTERN_NAMES:
         icon, css = "💠", "starcyan"
         touches = int(p.get('trendline_touches',3))
         detail = (f"{p.get('trendline_type','Trendline').title()} retest • "
@@ -8130,6 +8138,80 @@ def edo_analysis_for_pattern(pattern, candles, snapshots, agreement=None):
             'history':'Collecting data', 'pullback_agreement':agreement.get('text','')}
 
 
+
+# Edo's distinct MONTHLY-only small-body reversal after a 2+ candle pullback.
+# Electric fuchsia (#FF4FD8) is reserved for this family; do not reuse purple
+# monthly spikes, cyan stars, or the ordinary green/red signal colours.
+EDO_MONTHLY_SMALL_REVERSAL_NAME = 'MONTHLY SMALL-BODY PULLBACK REVERSAL'
+
+
+def edo_monthly_small_body_reversal(candles, confirmation_index):
+    """Monthly special reversal: ONE fully closed, small-bodied turning candle.
+
+    The turning candle immediately follows 2-12 closed candles of the opposite
+    colour. No following confirmation month is required. This function only
+    receives fully closed candles from the caller. It does not demand S/R or
+    Weekly/Daily directional alignment, and leaves Dojis to the abnormal
+    candle detector.
+    """
+    i = confirmation_index
+    if i < 8 or i >= len(candles):
+        return None
+    turning = candles[i]
+    direction = candle_colour(turning)
+    if direction not in ('green', 'red'):
+        return None
+    pull_colour = 'red' if direction == 'green' else 'green'
+    run_count, run_start = count_same_colour_before(candles, i, pull_colour)
+    if not (2 <= run_count <= 12):
+        return None
+    if not exact_adjacent_pullback_run(candles, run_start, i, pull_colour):
+        return None
+    pull = candles[run_start:i]
+    bodies = [abs(float(c['close']) - float(c['open'])) for c in pull]
+    average = sum(bodies) / len(bodies)
+    turning_body = abs(float(turning['close']) - float(turning['open']))
+    turning_range = float(turning['high']) - float(turning['low'])
+    # A small body is desirable but a Doji (almost no body) is excluded.
+    if average <= 0 or turning_range <= 0:
+        return None
+    if not (0.10 * average <= turning_body <= 0.30 * average):
+        return None
+    if turning_body / turning_range < 0.12:
+        return None
+    pull_low = min(float(c['low']) for c in pull)
+    pull_high = max(float(c['high']) for c in pull)
+    if direction == 'green' and float(turning['low']) < pull_low:
+        return None
+    if direction == 'red' and float(turning['high']) > pull_high:
+        return None
+    # Measured against the preceding price impulse, not an S/R requirement.
+    before = candles[max(0, run_start-12):run_start]
+    if len(before) < 3:
+        return None
+    impulse_low = min(float(c['low']) for c in before)
+    impulse_high = max(float(c['high']) for c in before)
+    impulse = impulse_high - impulse_low
+    if impulse <= 0:
+        return None
+    depth = ((impulse_high - pull_low)/impulse if direction == 'green'
+             else (pull_high - impulse_low)/impulse)
+    if depth < 0 or depth > 0.65:
+        return None
+    return {
+        'name': EDO_MONTHLY_SMALL_REVERSAL_NAME,
+        'direction': 'bullish' if direction == 'green' else 'bearish',
+        'confirmation_date': turning.get('datetime', ''),
+        'confirmation_close': float(turning['close']),
+        'confirmation_index': i,
+        'run_count': run_count,
+        'run_colour': pull_colour,
+        'small_body_pct': 100 * turning_body / average,
+        'pullback_depth_pct': 100 * depth,
+        'special_colour': '#FF4FD8',
+        'score': 0,
+    }
+
 def edo_add_analysis(grp,symbol,interval,closed_candles,found):
     try:
         with db_conn() as conn:
@@ -8182,6 +8264,14 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             star = detect_trendline_star(closed_candles, star_i)
             if star:
                 found.append(star)
+
+    # Independent electric-fuchsia Monthly small-body pullback reversal.
+    # Uses identical fully closed candles across Forex, CFDs and Crypto.
+    if interval == '1month' and str(grp).upper() in ('FOREX','CFD','CRYPTO'):
+        for rev_index in range(max(8, len(closed_candles)-9), len(closed_candles)):
+            special = edo_monthly_small_body_reversal(closed_candles, rev_index)
+            if special:
+                found.append(special)
 
     # AUD/USD only: separate Daily RR (Railway Tracks) reversal signal.
     # This does not alter any existing Trend Pullback or Gap-Retest rules.
@@ -8492,6 +8582,14 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                 )
             else:
                 summary = "No qualifying closed-candle setup"
+
+    special_monthly = [p for p in current_patterns if p.get('name') == EDO_MONTHLY_SMALL_REVERSAL_NAME]
+    if special_monthly and interval == '1month':
+        selected = special_monthly[0]
+        side = 'BUY' if selected['direction'] == 'bullish' else 'SELL'
+        signal = f"MONTHLY SMALL-BODY REVERSAL — {side}"
+        icon, css = ('🩷↑' if side == 'BUY' else '🩷↓'), 'monthlypink'
+        summary = 'Special Monthly reversal confirmed by one fully closed small-bodied candle; review chart and risk. No support/resistance requirement.'
 
     if (bullish or bearish) and any(p.get('edo_range_entry') for p in current_patterns):
         chosen = next((p for p in current_patterns if p.get('edo_range_entry')), None)
@@ -9104,6 +9202,14 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
             if star:
                 found.append(star)
 
+    # Independent electric-fuchsia Monthly small-body pullback reversal.
+    # Uses identical fully closed candles across Forex, CFDs and Crypto.
+    if interval == '1month' and str(grp).upper() in ('FOREX','CFD','CRYPTO'):
+        for rev_index in range(max(8, len(closed_candles)-9), len(closed_candles)):
+            special = edo_monthly_small_body_reversal(closed_candles, rev_index)
+            if special:
+                found.append(special)
+
     # AUD/USD only: separate Daily RR (Railway Tracks) reversal signal.
     if str(grp).upper() == "FOREX" and str(symbol).upper() == "AUD/USD" and interval == "1day":
         for rr_conf in recent_confirmations(closed_candles, lookback=9):
@@ -9237,6 +9343,8 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
 
     if interval in STAR_PATTERN_INTERVALS:
         setups.extend(star_setups)
+    if interval == '1month':
+        setups.extend(p for p in found if p.get('name') == EDO_MONTHLY_SMALL_REVERSAL_NAME)
 
     # Edo rule:
     #   All lower-timeframe setups: aligned Weekly/Daily trends OR confirmed wide range boundary entries.
@@ -9465,13 +9573,15 @@ def pattern_signal_monitor():
                         continue
                     if interval == "8h" and grp == "CRYPTO":
                         continue
-                    # Monthly special reversals are supported for every market group.
-                    # The per-pattern timeframe filters retain existing restrictions.
+                    # Monthly special reversals run for all three market groups;
+                    # new fully CLOSED Monthly signals also enter the existing
+                    # READY/NEW home-icon blink and notification pipeline.
                     # Do not waste the serial scan queue on timeframe/group
                     # combinations that have NO active signal family.
                     if not (pullback_interval_enabled(grp, interval)
                             or sr_gap_retest_interval_enabled(grp, interval)
                             or interval in STAR_PATTERN_INTERVALS
+                            or (interval == "1month" and grp in ("FOREX", "CRYPTO", "CFD"))
                             or (interval == "1day" and grp == "FOREX"
                                 and symbol.upper() == "AUD/USD")):
                         continue
