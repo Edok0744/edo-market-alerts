@@ -6647,8 +6647,10 @@ def describe_setup(p, interval=None):
     display_name = p["name"]
     if interval == "4h" and p["name"] == "TREND PULLBACK SETUP":
         display_name = "4H PULLBACK ENTRY"
-        icon = "⚪"
-        css = "entry4h"
+        # Only setups that have passed the strict higher-timeframe gate
+        # reach describe_setup; approved trades must not look grey/blocked.
+        icon = "🟢" if p.get('direction') == 'bullish' else "🔴"
+        css = "buy" if p.get('direction') == 'bullish' else "sell"
 
     if p.get('edo_range_entry'):
         buy = p['direction'] == 'bullish'
@@ -8331,8 +8333,14 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     now = time.time()
     cached = PATTERN_SIGNAL_CACHE.get(cache_key)
 
+    # A cached 3H/4H READY signal must never survive a change in the
+    # Weekly/Daily permission. Cache entries are valid only while the
+    # higher-timeframe permission matches the permission at calculation time.
+    short_tf_permission = (tuple(sorted(edo_short_tf_permissions(symbol, grp)))
+                           if interval in ('3h', '4h') else None)
     if cached and not force_refresh and now - cached["saved_at"] < PATTERN_SIGNAL_CACHE_SECONDS:
-        return cached["data"], None
+        if interval not in ('3h', '4h') or cached.get('short_tf_permission') == short_tf_permission:
+            return cached["data"], None
 
     candles, error = get_candles(symbol, interval, outputsize=140, grp=grp)
 
@@ -8612,9 +8620,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             icon, css = "💠", "starcyan"
             summary = "Trendline reversal confirmed"
         elif interval == "4h" and all(p.get("name") == "TREND PULLBACK SETUP" for p in bullish):
-            signal = "4H PULLBACK ENTRY — BUY"
-            icon, css = "⚪", "entry4h"
-            summary = "4H pullback confirmed"
+            signal = "READY TO REVIEW — 4H PULLBACK BUY"
+            icon, css = "🟢", "buy"
+            summary = "Confirmed 4H pullback with approved Weekly/Daily pullback agreement or strong aligned trend."
         else:
             signal = "READY TO REVIEW — BUY"
             icon, css = "🟢", "buy"
@@ -8626,9 +8634,9 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             icon, css = "💠", "starcyan"
             summary = "Trendline rejection confirmed"
         elif interval == "4h" and all(p.get("name") == "TREND PULLBACK SETUP" for p in bearish):
-            signal = "4H PULLBACK ENTRY — SELL"
-            icon, css = "⚪", "entry4h"
-            summary = "4H pullback confirmed"
+            signal = "READY TO REVIEW — 4H PULLBACK SELL"
+            icon, css = "🔴", "sell"
+            summary = "Confirmed 4H pullback with approved Weekly/Daily pullback agreement or strong aligned trend."
         else:
             signal = "READY TO REVIEW — SELL"
             icon, css = "🔴", "sell"
@@ -8738,7 +8746,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         "updated": datetime.now(ZoneInfo("Australia/Perth")).strftime("%d %b %Y • %H:%M Perth"),
     }
 
-    PATTERN_SIGNAL_CACHE[cache_key] = {"saved_at": now, "data": data}
+    PATTERN_SIGNAL_CACHE[cache_key] = {"saved_at": now, "data": data,
+                                       "short_tf_permission": short_tf_permission}
     return data, None
 
 
