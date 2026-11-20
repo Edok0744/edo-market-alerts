@@ -7566,6 +7566,43 @@ def edo_filter_lower_tf_signals(symbol, grp, interval, setups, forming_direction
     return permitted, (forming_direction if forming_direction == expected_forming else '')
 
 
+def edo_filter_gap_retests_all_timeframes(symbol, grp, interval, setups):
+    """Hard directional safety gate for Gap Retests on Forex/CFD/Crypto.
+
+    A clear closed Weekly+Daily trend authorises only with-trend gaps.
+    A confirmed 4-touch Weekly/Daily range authorises boundary retests only
+    when there is adequate room. Mixed/missing data fail closed.
+    Pattern detection itself, Monthly special reversals, and other setups
+    remain unchanged.
+    """
+    if not any(p.get('name') == 'S/R GAP RETEST SETUP' for p in (setups or [])):
+        return setups
+    permission, range_info = edo_higher_tf_market_permission(symbol, grp)
+    kept = []
+    for p in setups:
+        if p.get('name') != 'S/R GAP RETEST SETUP':
+            kept.append(p)
+            continue
+        direction = p.get('direction')
+        if permission in ('bullish', 'bearish') and direction == permission:
+            kept.append(p)
+        elif permission == 'ranging' and range_info and edo_range_entry_ok(
+            range_info, direction, p.get('confirmation_close')
+        ):
+            q = dict(p)
+            q['edo_range_entry'] = True
+            q['edo_range_arrow'] = '↑' if direction == 'bullish' else '↓'
+            q['edo_range_label'] = 'BUY AT SUPPORT' if direction == 'bullish' else 'SELL AT RESISTANCE'
+            q['edo_range_source'] = edo_range_display_source(range_info)
+            q['edo_range_boundary'] = float(range_info['lower'] if direction == 'bullish' else range_info['upper'])
+            q['edo_range_opposite'] = float(range_info['upper'] if direction == 'bullish' else range_info['lower'])
+            kept.append(q)
+        else:
+            print('gap retest suppressed by Weekly/Daily trend or range safety:',
+                  grp, symbol, interval, direction, permission or 'unconfirmed', flush=True)
+    return kept
+
+
 def strong_higher_timeframe_trend(symbol, grp='FOREX', interval='4h'):
     """Pullback continuation direction from the new Weekly→Daily main trend."""
     if not pullback_higher_tf_enabled(grp, interval):
@@ -8553,6 +8590,10 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     # Strict Weekly -> Daily direction for ALL lower-TF signal families.
     found, _ = edo_filter_lower_tf_signals(symbol, grp, interval, found)
 
+    # Final Gap Retest trend/range safety applies also to DAILY and WEEKLY.
+    # Ensure no rejected gap appears in current or historical Price Action cards.
+    found = edo_filter_gap_retests_all_timeframes(symbol, grp, interval, found)
+
     # Use the same final confirmation-room rule as the automatic monitor.
     # This keeps the manual SIGNAL page and phone alerts in agreement.
     if interval == '1month':
@@ -9496,6 +9537,10 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     setups, _edo_forming_scan.direction = edo_filter_lower_tf_signals(
         symbol, grp, interval, setups, _edo_forming_scan.direction
     )
+
+    # Apply identical confirmed-trend / genuine-range Gap Retest gate
+    # BEFORE persisted NEW state, blinking icons or Pushover notifications.
+    setups = edo_filter_gap_retests_all_timeframes(symbol, grp, interval, setups)
 
     # Reject overextended 4H/8H confirmations that have already arrived at
     # the next important historical S/R level. Rejected setups do NOT Push.
