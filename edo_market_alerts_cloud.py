@@ -7436,6 +7436,90 @@ def edo_range_entry_ok(range_info, direction, entry):
         return False
 
 
+# EdoSignal 4: stricter 3H/4H filter; unchanged longer timeframes.
+EDO_SHORT_TF_ADX_THRESHOLD = 25.0
+EDO_SHORT_TF_PULLBACK_DAYS = 21
+
+
+def edo_wilder_adx(closed_candles, period=14):
+    """Wilder ADX computed exclusively from fully closed OHLC candles."""
+    try:
+        prices = [(float(c['high']), float(c['low']), float(c['close'])) for c in closed_candles]
+        if len(prices) < 2 * period + 1:
+            return None
+        tr_values, plus_values, minus_values = [], [], []
+        for (ph, pl, pc), (h, l, _) in zip(prices, prices[1:]):
+            up, down = h - ph, pl - l
+            tr_values.append(max(h-l, abs(h-pc), abs(l-pc)))
+            plus_values.append(up if up > down and up > 0 else 0.0)
+            minus_values.append(down if down > up and down > 0 else 0.0)
+        tr = sum(tr_values[:period]); pdm = sum(plus_values[:period]); mdm = sum(minus_values[:period])
+        dx_values = []
+        for i in range(period - 1, len(tr_values)):
+            if i >= period:
+                tr += tr_values[i] - tr / period
+                pdm += plus_values[i] - pdm / period
+                mdm += minus_values[i] - mdm / period
+            pdi, mdi = (100 * pdm / tr, 100 * mdm / tr) if tr > 0 else (0.0, 0.0)
+            dx_values.append(100 * abs(pdi - mdi) / (pdi + mdi) if pdi + mdi else 0.0)
+        if len(dx_values) < period:
+            return None
+        adx = sum(dx_values[:period]) / period
+        for value in dx_values[period:]:
+            adx = ((period - 1) * adx + value) / period
+        return adx
+    except (KeyError, ValueError, TypeError, ZeroDivisionError):
+        return None
+
+
+def edo_matching_weekly_daily_pullbacks(grp, symbol, at_time=None):
+    """Last recorded Weekly and Daily closed pullbacks must match within 21d."""
+    at_time = at_time or datetime.now(timezone.utc)
+    cutoff = at_time - timedelta(days=EDO_SHORT_TF_PULLBACK_DAYS)
+    try:
+        with db_conn() as conn:
+            edo_pullback_agreement_init(conn)
+            rows = conn.execute("SELECT interval, direction, confirmation_date FROM edo_confirmed_pullbacks WHERE grp=? AND symbol=? AND interval IN ('1week','1day')", (str(grp).upper(), str(symbol).upper())).fetchall()
+    except Exception as exc:
+        print('3H/4H pullback agreement unavailable:', type(exc).__name__, flush=True)
+        return None
+    latest = {}
+    for row in rows:
+        date = edo_pullback_confirmation_dt(row['confirmation_date'])
+        if date is None or not cutoff <= date <= at_time:
+            continue
+        interval = row['interval']
+        if interval not in latest or date > latest[interval][0]:
+            latest[interval] = (date, row['direction'])
+    if '1week' not in latest or '1day' not in latest:
+        return None
+    weekly_date, weekly_side = latest['1week']
+    daily_date, daily_side = latest['1day']
+    if weekly_side == daily_side and weekly_side in ('bullish','bearish') and weekly_date <= daily_date:
+        return weekly_side
+    return None
+
+
+def edo_short_tf_permissions(symbol, grp):
+    """3H/4H: matching closed pullbacks OR strong FULL weekly/daily trend."""
+    allowed = set()
+    agreed = edo_matching_weekly_daily_pullbacks(grp, symbol)
+    if agreed:
+        allowed.add(agreed)
+    weekly, we = get_candles(symbol, '1week', outputsize=100, grp=grp)
+    daily, de = get_candles(symbol, '1day', outputsize=260, grp=grp)
+    if not we and not de and weekly and daily:
+        status, _, _ = weekly_daily_main_trend_from_candles(weekly, daily)
+        trend = 'bullish' if status == 'FULL BULLISH' else 'bearish' if status == 'FULL BEARISH' else None
+        if trend:
+            wadx = edo_wilder_adx(fully_closed_candles(weekly, '1week'))
+            dadx = edo_wilder_adx(fully_closed_candles(daily, '1day'))
+            if wadx is not None and dadx is not None and wadx >= EDO_SHORT_TF_ADX_THRESHOLD and dadx >= EDO_SHORT_TF_ADX_THRESHOLD:
+                allowed.add(trend)
+    # Conflicting signals from the two routes are unsafe: fail closed.
+    return allowed if len(allowed) == 1 else set()
+
+
 def edo_filter_lower_tf_signals(symbol, grp, interval, setups, forming_direction=''):
     """Applies identically to Forex, CFDs and Crypto; WAIT needs trend agreement.
 
@@ -7446,6 +7530,14 @@ def edo_filter_lower_tf_signals(symbol, grp, interval, setups, forming_direction
     """
     if interval not in ('3h', '4h', '8h', '12h'):
         return setups, forming_direction
+    # Special restriction applies to all signal families, all market groups.
+    # A signal MUST be on the permitted side; neither WAIT nor READY
+    # bypasses this check. The existing 8H/12H behaviour is untouched.
+    if interval in ('3h', '4h'):
+        allowed = edo_short_tf_permissions(symbol, grp)
+        permitted = [p for p in setups if p.get('direction') in allowed]
+        forming_side = {'BUY': 'bullish', 'SELL': 'bearish'}.get(forming_direction)
+        return permitted, (forming_direction if forming_side in allowed else '')
     permission, range_info = edo_higher_tf_market_permission(symbol, grp)
     if permission == 'ranging':
         if not range_info:
