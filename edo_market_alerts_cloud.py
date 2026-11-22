@@ -8384,7 +8384,8 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     short_tf_permission = (tuple(sorted(edo_short_tf_permissions(symbol, grp)))
                            if interval in ('3h', '4h') else None)
     if cached and not force_refresh and now - cached["saved_at"] < PATTERN_SIGNAL_CACHE_SECONDS:
-        if interval not in ('3h', '4h') or cached.get('short_tf_permission') == short_tf_permission:
+        if (not (str(grp or '').upper() == 'CFD' and interval == '8h')
+                and (interval not in ('3h', '4h') or cached.get('short_tf_permission') == short_tf_permission)):
             return cached["data"], None
 
     candles, error = get_candles(symbol, interval, outputsize=140, grp=grp)
@@ -10457,6 +10458,25 @@ def edo_cfd_recent_directional_structure(daily_closed):
             return 'bearish'
         if delta >= 2.0*atr and up >= 7 and newer_high > older_high and newer_low > older_low:
             return 'bullish'
+        # Detect a developing directional leg BEFORE an older huge rectangle
+        # incorrectly authorises a counter-move at its distant boundary.
+        # Three comparisons are used so a single large candle cannot classify
+        # every genuine sideways range as a trend.
+        last8 = closes[-8:]
+        last_moves = [b-a for a,b in zip(last8,last8[1:])]
+        recent_down = sum(x < 0 for x in last_moves)
+        recent_up = sum(x > 0 for x in last_moves)
+        older_mid = sum(closes[-12:-6]) / 6.0
+        newer_mid = sum(closes[-6:]) / 6.0
+        recent_delta = last8[-1] - last8[0]
+        if (recent_delta <= -1.15*atr and recent_down >= 4
+                and newer_mid < older_mid - 0.55*atr
+                and (newer_high < older_high or newer_low < older_low)):
+            return 'bearish'
+        if (recent_delta >= 1.15*atr and recent_up >= 4
+                and newer_mid > older_mid + 0.55*atr
+                and (newer_high > older_high or newer_low > older_low)):
+            return 'bullish'
         return None
     except (KeyError, TypeError, ValueError, ZeroDivisionError, OverflowError):
         return None
@@ -10475,8 +10495,18 @@ def edo_weekly_daily_range(weekly_closed, daily_closed, grp=None):
     # CFD-specific protection: a historical four-touch range must not
     # override a decisive newer Daily directional leg. The guard uses only
     # completed bars, and applies whether the range source is Daily or Weekly.
-    if str(grp or '').upper() == 'CFD' and edo_cfd_recent_directional_structure(daily_closed):
-        return None
+    if str(grp or '').upper() == 'CFD':
+        if edo_cfd_recent_directional_structure(daily_closed):
+            return None
+        # A very wide historical rectangle is NOT evidence of current
+        # sideways action. Compare any proposed boundary with current DAILY
+        # volatility, including when the rectangle came from Weekly pivots.
+        recent_daily = list(daily_closed or [])[-20:]
+        daily_volatility = avg_range(recent_daily, length=20)
+        if len(recent_daily) < 15 or daily_volatility <= 0:
+            return None  # Without sufficient CFD daily evidence, fail closed.
+    else:
+        daily_volatility = None
     daily_range = edo_confirmed_horizontal_range(daily_closed)
     weekly_range = edo_confirmed_horizontal_range(weekly_closed)
     if not daily_range and not weekly_range:
@@ -10484,6 +10514,8 @@ def edo_weekly_daily_range(weekly_closed, daily_closed, grp=None):
     sources = tuple(tf for tf, valid in (
         ('1week', weekly_range), ('1day', daily_range)) if valid)
     selected = daily_range if daily_range else weekly_range
+    if daily_volatility is not None and selected['width'] > 10.0 * daily_volatility:
+        return None
     return dict(selected, source_interval=('1day' if daily_range else '1week'),
                 source_intervals=sources)
 
