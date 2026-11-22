@@ -8384,7 +8384,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     short_tf_permission = (tuple(sorted(edo_short_tf_permissions(symbol, grp)))
                            if interval in ('3h', '4h') else None)
     if cached and not force_refresh and now - cached["saved_at"] < PATTERN_SIGNAL_CACHE_SECONDS:
-        if (not (str(grp or '').upper() == 'CFD' and interval == '8h')
+        if (str(grp or '').upper() != 'CFD'
                 and (interval not in ('3h', '4h') or cached.get('short_tf_permission') == short_tf_permission)):
             return cached["data"], None
 
@@ -10514,8 +10514,47 @@ def edo_weekly_daily_range(weekly_closed, daily_closed, grp=None):
     sources = tuple(tf for tf, valid in (
         ('1week', weekly_range), ('1day', daily_range)) if valid)
     selected = daily_range if daily_range else weekly_range
-    if daily_volatility is not None and selected['width'] > 10.0 * daily_volatility:
-        return None
+    if daily_volatility is not None:
+        if selected['width'] > 10.0 * daily_volatility:
+            return None
+        # CFD V3: historical four-touch channels cannot be promoted to a
+        # CURRENT trading range unless BOTH edges have recently been tested.
+        # Being merely INSIDE a wide old rectangle is not a range confirmation.
+        # Require meaningful tests of the actual boundaries within the most
+        # recent 35 completed Daily candles (and enough intervening bars).
+        # This fails closed: it does not manufacture a new SELL trend.
+        recent = list(daily_closed or [])[-35:]
+        if len(recent) < 25:
+            return None
+        upper = float(selected['upper'])
+        lower = float(selected['lower'])
+        width = upper - lower
+        if width <= 0:
+            return None
+        # 0.6 * daily ATR is the maximum distance from either boundary to
+        # count as a recent touch, capped at 5% of the range's width.
+        tolerance = min(0.60 * daily_volatility, 0.05 * width)
+        high_touches = [i for i, bar in enumerate(recent)
+                        if abs(float(bar['high']) - upper) <= tolerance]
+        low_touches = [i for i, bar in enumerate(recent)
+                       if abs(float(bar['low']) - lower) <= tolerance]
+        if not high_touches or not low_touches:
+            return None
+        if min(abs(i-j) for i in high_touches for j in low_touches) < 4 and (
+                not any(abs(i-j) >= 4 for i in high_touches for j in low_touches)):
+            return None
+        # The latest 10 Daily bars must still belong to the same sideways
+        # structure; a fresh sequence of consecutive lower highs AND lower
+        # lows (or the bullish inverse) is a directional transition, not range.
+        last = recent[-10:]
+        highs = [float(b['high']) for b in last]
+        lows = [float(b['low']) for b in last]
+        falling = sum(highs[i] < highs[i-1] and lows[i] < lows[i-1]
+                      for i in range(1, len(last)))
+        rising = sum(highs[i] > highs[i-1] and lows[i] > lows[i-1]
+                     for i in range(1, len(last)))
+        if falling >= 5 or rising >= 5:
+            return None
     return dict(selected, source_interval=('1day' if daily_range else '1week'),
                 source_intervals=sources)
 
