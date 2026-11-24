@@ -1834,7 +1834,7 @@ a{text-decoration:none}
                     <b>2. Higher-Timeframe Agreement:</b> {{newest['analysis']['higher']}}<br>
                     <span><b>Weekly + Daily Pullbacks:</b> {{newest['analysis'].get('pullback_agreement', 'Not available')}}</span><br>
                     <b>3. Reward-to-Risk:</b> {{newest['analysis']['rr_text']}}<br>
-                    {% if newest['analysis']['entry'] is not none %}<span>Illustrative entry {{'%.5f'|format(newest['analysis']['entry'])}}, stop {{'%.5f'|format(newest['analysis']['stop'])}}, target {{'%.5f'|format(newest['analysis']['target'])}}</span><br>{% endif %}
+                    {% if newest['analysis']['entry'] is not none %}<span>Illustrative entry {{'%.5f'|format(newest['analysis']['entry'])}}, stop {{'%.5f'|format(newest['analysis']['stop'])}}, target {% if newest['analysis']['target'] is not none %}{{'%.5f'|format(newest['analysis']['target'])}}{% else %}unavailable (no valid swing){% endif %}</span><br>{% endif %}
                     <b>4. Market Volatility:</b> {{newest['analysis']['volatility']}}<br>
                     <b>5. Historical Performance:</b> {{newest['analysis']['history']}}<br>
                     <span style="color:#f2c94c">Advisory only. Strength is not win probability. Prices are hypothetical, not orders; past outcomes do not predict future returns.</span>
@@ -1864,9 +1864,9 @@ a{text-decoration:none}
                        <b>1. Signal Strength:</b> {{p['analysis']['score'] if p['analysis']['score'] is not none else 'Unavailable'}}/100 — {{p['analysis']['rating']}}<br>
                        {{p['analysis']['reason']}}<br>
                        <b>2. Higher Timeframe:</b> {{p['analysis']['higher']}}<br>
-                       <span><b>Weekly + Daily Pullbacks:</b> {{newest['analysis'].get('pullback_agreement', 'Not available')}}</span><br>
+                       <span><b>Weekly + Daily Pullbacks:</b> {{p['analysis'].get('pullback_agreement', 'Not available')}}</span><br>
                     <b>3. Reward-to-Risk:</b> {{p['analysis']['rr_text']}}<br>
-                       {% if p['analysis']['entry'] is not none %}Illustrative entry {{'%.5f'|format(p['analysis']['entry'])}}, stop {{'%.5f'|format(p['analysis']['stop'])}}, target {{'%.5f'|format(p['analysis']['target'])}}<br>{% endif %}
+                       {% if p['analysis']['entry'] is not none %}Illustrative entry {{'%.5f'|format(p['analysis']['entry'])}}, stop {{'%.5f'|format(p['analysis']['stop'])}}, target {% if p['analysis']['target'] is not none %}{{'%.5f'|format(p['analysis']['target'])}}{% else %}unavailable (no valid swing){% endif %}<br>{% endif %}
                        <b>4. Volatility:</b> {{p['analysis']['volatility']}}<br>
                        <b>5. Historical Performance:</b> {{p['analysis']['history']}}<br>
                        <span style="color:#f2c94c">Advisory only. Not a probability or trade recommendation.</span>
