@@ -6887,6 +6887,21 @@ def describe_setup(p, interval=None):
         else:
             level_text += " • Stop: unavailable (no confirmed swing)"
 
+    if p.get('edo_higher_targets_checked'):
+        # The original Stop/Target text above remains for legacy compatibility.
+        if interval == '1month':
+            level_text += (' • Monthly swing target: %.5f' % p['edo_monthly_target']
+                           if p.get('edo_monthly_target') is not None
+                           else ' • Monthly swing target: unavailable')
+        else:
+            level_text += (' • Weekly swing target: %.5f' % p['edo_weekly_target']
+                           if p.get('edo_weekly_target') is not None
+                           else ' • Weekly swing target: unavailable')
+            level_text += (' • Monthly long-term target: %.5f' % p['edo_monthly_target']
+                           if p.get('edo_monthly_target') is not None
+                           else ' • Monthly long-term target: unavailable')
+        level_text += ' • Stops: beyond setup swing (small ATR buffer)'
+
     # Visual-only distinction: Edo uses 4H Trend Pullback mainly as an entry/re-entry
     # inside the larger trend. Detection rules are unchanged.
     display_name = ('GAP RETEST SETUP' if p.get('gap_no_sr_required') else p["name"])
@@ -8446,6 +8461,145 @@ def edo_setup_swing_levels(candles, pattern):
     return stop, target, 'Previous swing high' if side=='bullish' else 'Previous swing low'
 
 
+def edo_higher_swing_target(higher_candles, pattern, interval_label):
+    """Select a *historically known* prior confirmed pivot, never a future level.
+
+    The closest previous meaningful swing IN TIME is preferred. If it is
+    already behind the entry, do not skip it to select a distant target.
+    """
+    if not higher_candles:
+        return None
+    side = pattern.get('direction')
+    if side not in ('bullish', 'bearish'):
+        return None
+    signal_dt = parse_candle_utc(pattern.get('confirmation_date'))
+    if signal_dt is None:
+        return None
+    signal_ts = signal_dt.timestamp()
+    # A candle must be closed before the confirmation candle even starts.
+    # Weekly bars require 7 days; monthly bars require the next calendar month.
+    historical = []
+    for bar in higher_candles:
+        bdt = parse_candle_utc(bar.get('datetime') or bar.get('date'))
+        if bdt is None:
+            continue
+        if interval_label == '1week':
+            finished = bdt.timestamp() + 7*86400 <= signal_ts
+        else:
+            year, month = bdt.year, bdt.month
+            next_year, next_month = (year+1,1) if month == 12 else (year,month+1)
+            from datetime import timezone as _timezone
+            finished = datetime(next_year,next_month,1,tzinfo=_timezone.utc).timestamp() <= signal_ts
+        if finished:
+            historical.append(bar)
+    if len(historical) < 6:
+        return None
+    kind = 'high' if side == 'bullish' else 'low'
+    pivot_list = swing_points(historical, kind, left=2, right=2)
+    if not pivot_list:
+        return None
+    entry = float(pattern.get('confirmation_close') or 0)
+    if not entry:
+        return None
+    # The last structural level is the FIRST one price must overcome.
+    latest = float(pivot_list[-1][1])
+    return latest if ((latest > entry) if side == 'bullish' else (latest < entry)) else None
+
+
+def edo_cfd_monthly_from_fxcm_daily(daily_candles):
+    """Build native-FXCM monthly CFD bars; never switch to an ETF price proxy."""
+    buckets = {}
+    for c in daily_candles or []:
+        stamp = str(c.get('datetime') or c.get('date') or '')
+        if len(stamp) < 7:
+            continue
+        key = stamp[:7]
+        if key not in buckets:
+            buckets[key] = {'datetime': key+'-01T00:00:00Z',
+                            'open': float(c['open']), 'high': float(c['high']),
+                            'low': float(c['low']), 'close': float(c['close'])}
+        else:
+            b = buckets[key]
+            b['high'] = max(b['high'],float(c['high']))
+            b['low'] = min(b['low'],float(c['low']))
+            b['close'] = float(c['close'])
+    return [buckets[k] for k in sorted(buckets)]
+
+
+def edo_load_higher_swing_history(grp, symbol, interval):
+    """Optional price-objective context. Feed errors never block normal signals."""
+    weekly = monthly = None
+    try:
+        if interval == '1week':
+            # The caller already has weekly candles, used directly below.
+            weekly = None
+        elif interval != '1month':
+            data, error = get_candles(symbol, '1week', outputsize=140, grp=grp)
+            if not error and data:
+                weekly = data
+    except Exception as exc:
+        print('Optional weekly objective unavailable',type(exc).__name__,flush=True)
+    try:
+        if str(grp).upper() == 'CFD':
+            # CFDs use the same FXCM Bid service as the chart (not an ETF).
+            data, error = get_candles(symbol, '1day', outputsize=500, grp=grp)
+            if not error and data:
+                monthly = edo_cfd_monthly_from_fxcm_daily(data)
+        else:
+            data, error = get_candles(symbol, '1month', outputsize=120, grp=grp)
+            if not error and data:
+                monthly = data
+    except Exception as exc:
+        print('Optional monthly objective unavailable',type(exc).__name__,flush=True)
+    return weekly, monthly
+
+
+def edo_apply_weekly_monthly_objectives(grp,symbol,interval,candles,patterns):
+    """Attach Weekly first + Monthly extended objectives to approved setups.
+
+    Stops and local pattern detection remain exactly as they were. Targets
+    remain advisory if the historical broker feed lacks validated pivots.
+    """
+    if not patterns:
+        return patterns
+    weekly, monthly = edo_load_higher_swing_history(grp,symbol,interval)
+    if interval == '1week':
+        weekly = candles
+    if interval == '1month':
+        monthly = candles
+    for p in patterns:
+        side = p.get('direction')
+        entry = float(p.get('confirmation_close') or 0)
+        weekly_target = edo_higher_swing_target(weekly,p,'1week') if weekly else None
+        monthly_target = edo_higher_swing_target(monthly,p,'1month') if monthly else None
+        if interval == '1month':
+            weekly_target = None
+        # For a Weekly signal, its relevant Weekly swing is the first target.
+        # If a Monthly objective isn't farther along the trade direction, omit it.
+        if weekly_target is not None and monthly_target is not None:
+            farther = (monthly_target > weekly_target if side == 'bullish'
+                       else monthly_target < weekly_target)
+            if not farther:
+                monthly_target = None
+        p['edo_weekly_target'] = weekly_target
+        p['edo_monthly_target'] = monthly_target
+        p['edo_higher_targets_checked'] = True
+        # Weekly is the first structural target for all non-monthly signals.
+        # If unavailable, do not manufacture a target from another timeframe.
+        if interval != '1month':
+            p['target'] = weekly_target
+            p['target1'] = weekly_target
+            p['target1_source'] = 'previous confirmed Weekly swing'
+        else:
+            p['target'] = monthly_target
+            p['target1'] = monthly_target
+            p['target1_source'] = 'previous confirmed Monthly swing'
+        # Do not create a calculated price target if the pivot is missing.
+        p['take_profit'] = None
+        p['take_profit_source'] = None
+    return patterns
+
+
 def edo_apply_all_swing_targets(candles, patterns):
     """Set consistent structural objectives; leave setup detection untouched."""
     for pat in patterns:
@@ -8862,6 +9016,7 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
         closed_candles, interval, found
     )
     edo_apply_all_swing_targets(closed_candles, found)
+    edo_apply_weekly_monthly_objectives(grp,symbol,interval,closed_candles,found)
 
     # FINAL 3H/4H safety gate: do not show a historical grey setup, NEW
     # TRIGGER, or an unapproved forming WAIT if Weekly/Daily permission is absent.
@@ -9836,6 +9991,7 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
         closed_candles, interval, setups
     )
     edo_apply_all_swing_targets(closed_candles, setups)
+    edo_apply_weekly_monthly_objectives(grp,symbol,interval,closed_candles,setups)
     # Final fail-closed check: unapproved 3H/4H patterns cannot enter
     # saved NEW state, blink icon or Pushover notification pipeline.
     if interval in ('3h', '4h'):
