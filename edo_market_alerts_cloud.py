@@ -3545,7 +3545,6 @@ PATTERN_BASELINE_CLOSED = {}
 # Supported saved-market groups: FOREX, CRYPTO, CFD.
 # The scanner does NOT place trades. It only finds setups for manual review.
 PATTERN_TIMEFRAMES = [
-    {"label": "3H", "value": "3h"},
     {"label": "4H", "value": "4h"},
     {"label": "8H", "value": "8h"},
     {"label": "12H", "value": "12h"},
@@ -5157,6 +5156,95 @@ def detect_bounce_retest(candles, conf):
         "take_profit_source": take_profit_source,
     }
 
+# Edo 2026-11-24: S/R proximity is NOT a prerequisite for these Gap Retests.
+# The previous swing defines the gap/return geometry, not a tradeable S/R zone.
+GAP_RETEST_MANUAL_SR_WARNING = (
+    "IMPORTANT: Check the chart for nearby support or resistance BEFORE placing a trade. "
+    "Support/resistance was NOT required to generate this Gap Retest signal."
+)
+
+
+def detect_gap_retest_without_sr(candles, conf):
+    """Detect a separated swing-gap retest without requiring support/resistance.
+
+    Completed 65% opposite-colour confirmation, a clear departure from an
+    earlier swing turning point, a return into the second half (50-100%) of
+    that prior leg, and room to the previous structural swing are required.
+    A prior swing is used only to measure the retest, NOT as an established
+    support/resistance area or a second touch of that level.
+    """
+    i = int(conf.get('index', -1))
+    if i < 18 or i >= len(candles) or float(conf.get('penetration', 0)) < 65.0:
+        return None
+    direction = conf.get('direction')
+    if direction not in ('bullish', 'bearish'):
+        return None
+    ar = avg_range(candles, i + 1, 20)
+    if ar <= 0:
+        return None
+    # Only closed bars on either side of the actual retest participate.
+    test_idx = int(conf.get('retest_candle_index', i - 1))
+    if test_idx >= i or test_idx < 8:
+        return None
+    kind = 'low' if direction == 'bullish' else 'high'
+    pivots = swing_points(candles[:max(0, test_idx - 3)], kind, left=2, right=2)
+    pivots = [(j, float(v)) for j, v in pivots if 8 <= test_idx - j <= 90]
+    candidates = []
+    test_wick = float(candles[test_idx][kind])
+    entry = float(candles[i]['close'])
+    # These pivots represent a completed prior leg, not historical S/R touches.
+    for old_i, pivot in pivots:
+        leg = candles[old_i + 1:test_idx]
+        if len(leg) < 6:
+            continue
+        if direction == 'bullish':
+            away = max(float(c['high']) for c in leg)
+            span = away - pivot
+            depth = (away - test_wick) / span * 100 if span > 0 else 0
+            if entry <= test_wick or test_wick < pivot - ar * 0.85:
+                continue
+        else:
+            away = min(float(c['low']) for c in leg)
+            span = pivot - away
+            depth = (test_wick - away) / span * 100 if span > 0 else 0
+            if entry >= test_wick or test_wick > pivot + ar * 0.85:
+                continue
+        if span < ar * 2.0 or not (50 <= depth <= 115):
+            continue
+        if not sr_gap_retest_has_room(candles, direction, i, test_wick, away, ar):
+            continue
+        t1, tp = sr_structure_targets(candles, direction, test_idx, entry, search_back=120)
+        # Never invent missing swing targets or accept a confirmation already
+        # at/past the nearest historical target.
+        if t1 is not None:
+            if direction == 'bullish' and float(candles[i]['high']) >= t1 - ar * 0.35:
+                continue
+            if direction == 'bearish' and float(candles[i]['low']) <= t1 + ar * 0.35:
+                continue
+        candidates.append((old_i, pivot, away, depth, t1, tp, span))
+    if not candidates:
+        return None
+    # Prefer the most recent complete swing instead of distant old S/R.
+    old_i, pivot, away, depth, t1, tp, span = max(candidates, key=lambda x: x[0])
+    return {
+        'name': 'S/R GAP RETEST SETUP',  # stable internal key for alerts/filters
+        'gap_no_sr_required': True,
+        'manual_sr_warning': GAP_RETEST_MANUAL_SR_WARNING,
+        'direction': direction, 'confirmed': True,
+        'score': min(10.0, 6.0 + min(2.0, span / (ar * 4.0))
+                     + min(2.0, (float(conf['penetration']) - 65.0) / 25.0)),
+        'confirmation_date': conf['date'], 'confirmation_close': entry,
+        'penetration': conf['penetration'], 'retest_depth_pct': depth,
+        'departure_extreme': away, 'level': pivot, 'old_level': pivot,
+        'retest_price': test_wick, 'retest_date': candles[test_idx].get('datetime', ''),
+        'level_source': 'prior swing for retracement measurement only',
+        'old_date': candles[old_i].get('datetime', ''), 'separation': test_idx-old_i,
+        'weak_retest': False,
+        'target': t1, 'target1': t1, 'target1_source': 'structural' if t1 is not None else None,
+        'take_profit': tp, 'take_profit_source': 'structural' if tp is not None else None,
+    }
+
+
 def add_turning_point_gap_strength(candles, setup, interval):
     """Non-blocking confluence information for existing valid D1/W1 retests.
 
@@ -5164,6 +5252,10 @@ def add_turning_point_gap_strength(candles, setup, interval):
     Never changes whether a setup meets Edo's existing confirmation rules.
     """
     if not setup or interval not in ("1day", "1week") or setup.get("name") != "S/R GAP RETEST SETUP":
+        return setup
+    # No S/R strengthening is necessary for a signal explicitly independent
+    # of support/resistance, even if historical pivots happen to coincide.
+    if setup.get('gap_no_sr_required'):
         return setup
     setup = dict(setup)
     if setup.get("diagonal"):
@@ -6576,6 +6668,15 @@ def describe_setup(p, interval=None):
                 f"Retest: {p['retest_price']:.5f} ({format_signal_time_perth(p['retest_date'])}) • "
                 f"Close: {p['confirmation_close']:.5f}"
             )
+        elif p.get('gap_no_sr_required'):
+            detail = (f"Swing Gap Retest • {p.get('retest_depth_pct', 0):.0f}% retracement "
+                      f"• {p['penetration']:.0f}% closed-candle confirmation • "
+                      + GAP_RETEST_MANUAL_SR_WARNING)
+            level_text = (
+                f"Earlier swing: {p['old_level']:.5f} ({format_signal_time_perth(p['old_date'])}) • "
+                f"Retest: {p['retest_price']:.5f} ({format_signal_time_perth(p['retest_date'])}) • "
+                f"Confirmed close: {p['confirmation_close']:.5f}"
+            )
         else:
             detail = f"Horizontal S/R retest • {p.get('retest_depth_pct', 0):.0f}% level retest • {p['penetration']:.0f}% candle confirmation"
             level_text = (
@@ -6584,6 +6685,8 @@ def describe_setup(p, interval=None):
                 f"Retest: {p['retest_price']:.5f} ({format_signal_time_perth(p['retest_date'])}) • "
                 f"Close: {p['confirmation_close']:.5f}"
             )
+        if p.get('manual_sr_warning') and not p.get('gap_no_sr_required'):
+            detail += " • " + p['manual_sr_warning']
         if p.get("turning_point_strength"):
             detail += " • " + p["turning_point_strength"]
             if p.get("strength_turning_points"):
@@ -6646,7 +6749,7 @@ def describe_setup(p, interval=None):
 
     # Visual-only distinction: Edo uses 4H Trend Pullback mainly as an entry/re-entry
     # inside the larger trend. Detection rules are unchanged.
-    display_name = p["name"]
+    display_name = ('GAP RETEST SETUP' if p.get('gap_no_sr_required') else p["name"])
     if interval == "4h" and p["name"] == "TREND PULLBACK SETUP":
         display_name = "4H PULLBACK ENTRY"
         # Only setups that have passed the strict higher-timeframe gate
@@ -8374,6 +8477,8 @@ def edo_add_analysis(grp,symbol,interval,closed_candles,found):
     return assessed
 
 def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
+    if interval == "3h":
+        return None, "3H signal scanning has been disabled for all markets."
     # Monthly special reversals apply across Forex, CFD, and Crypto;
     # Monthly Trend Pullback remains restricted by pullback_interval_enabled().
     cache_key = f"{grp}|{symbol}|{interval}"
@@ -8509,11 +8614,19 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    The 50% previous-candle BODY rule applies ONLY to this signal.
     if sr_gap_retest_interval_enabled(grp, interval):
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9, grp=grp):
-            sr_setup = detect_bounce_retest(closed_candles, sr_conf)
+            # Weekly, Daily and 8H: true swing Gap Retest, no S/R prerequisite.
+            # Crypto 12H retains its existing detection until separately requested.
+            unrestricted_gap_tf = interval in ('1week', '1day', '8h')
+            sr_setup = (detect_gap_retest_without_sr(closed_candles, sr_conf)
+                        if unrestricted_gap_tf else detect_bounce_retest(closed_candles, sr_conf))
             if sr_setup:
                 found.append(add_turning_point_gap_strength(closed_candles, sr_setup, interval))
+            # Diagonal trendline retests are a separate optional pattern and
+            # must not replace the unrestricted Gap Retest test above.
             diagonal_setup = detect_diagonal_gap_retest(closed_candles, sr_conf)
             if diagonal_setup:
+                if unrestricted_gap_tf:
+                    diagonal_setup['manual_sr_warning'] = GAP_RETEST_MANUAL_SR_WARNING
                 found.append(add_turning_point_gap_strength(closed_candles, diagonal_setup, interval))
 
     # Avoid duplicate descriptions of the same setup/direction/confirmation.
@@ -8758,6 +8871,11 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
             summary = ('Confirmed range-boundary setup with enough room toward '
                        'the opposite side. Review swing stop and target before trading.')
 
+    # Make the manual S/R check visible at the TOP of every active new Gap
+    # Retest, not merely in the expanded setup and the phone push message.
+    if any(p.get('gap_no_sr_required') for p in current_patterns):
+        summary = ((summary + " • ") if summary else "") + GAP_RETEST_MANUAL_SR_WARNING
+
     # Weekly Spike disabled: Edo wants ONLY his requested trading signals.
     weekly_spike = None
 
@@ -8991,6 +9109,8 @@ def _save_pattern_monitor_baseline(grp, symbol, interval, latest_closed_date):
 
 
 def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, grp="FOREX"):
+    if interval == "3h":
+        return  # 3H alerts permanently disabled for Forex, Crypto and CFD.
     """
     Notify only for a genuinely NEW fully closed candle.
 
@@ -9241,7 +9361,17 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                     f"price moved away and retested it (touch {p.get('trendline_touches',3)}). "
                     f"Opposite-colour confirmation closed {p.get('penetration', 0):.0f}% "
                     f"through the previous body. {direction_word} possibility."
-                    f"{target_lines} Review chart before trading."
+                    f"{target_lines} {GAP_RETEST_MANUAL_SR_WARNING}"
+                )
+            elif p.get('gap_no_sr_required'):
+                push_body = (
+                    f"GAP RETEST confirmed on the NEWEST CLOSED {tf_label} candle "
+                    f"({format_signal_time_perth(confirmation_date)}). "
+                    f"Prior price swing moved away and price returned "
+                    f"{p.get('retest_depth_pct', 0):.0f}% of that leg. "
+                    f"Closed opposite-colour confirmation: {p.get('penetration', 0):.0f}%. "
+                    f"{direction_word} possibility.{target_lines} "
+                    f"{GAP_RETEST_MANUAL_SR_WARNING}"
                 )
             else:
                 push_body = (
@@ -9315,6 +9445,8 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
 
 
 def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
+    if interval == "3h":
+        return [], None, "3H signal scanning has been disabled for all markets."
     # Monthly CFD is enabled for Weekly/Monthly special reversals only;
     # other CFD Monthly patterns remain excluded by their dedicated gates.
     """
@@ -9454,11 +9586,19 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     #    supply the cleaner version of the same price structure.
     if sr_gap_retest_interval_enabled(grp, interval):
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9, grp=grp):
-            sr_setup = detect_bounce_retest(closed_candles, sr_conf)
+            # Weekly, Daily and 8H: true swing Gap Retest, no S/R prerequisite.
+            # Crypto 12H retains its existing detection until separately requested.
+            unrestricted_gap_tf = interval in ('1week', '1day', '8h')
+            sr_setup = (detect_gap_retest_without_sr(closed_candles, sr_conf)
+                        if unrestricted_gap_tf else detect_bounce_retest(closed_candles, sr_conf))
             if sr_setup:
                 found.append(add_turning_point_gap_strength(closed_candles, sr_setup, interval))
+            # Diagonal trendline retests are a separate optional pattern and
+            # must not replace the unrestricted Gap Retest test above.
             diagonal_setup = detect_diagonal_gap_retest(closed_candles, sr_conf)
             if diagonal_setup:
+                if unrestricted_gap_tf:
+                    diagonal_setup['manual_sr_warning'] = GAP_RETEST_MANUAL_SR_WARNING
                 found.append(add_turning_point_gap_strength(closed_candles, diagonal_setup, interval))
 
     # A simultaneous same-direction Gap Retest takes priority over a
@@ -9609,6 +9749,8 @@ def save_price_action_status(grp, symbol, setups, latest_closed_date):
 
 
 def save_timeframe_ready_status(grp, symbol, interval, setups, latest_closed_date, forming_direction=""):
+    if interval == "3h":
+        return  # No 3H READY/WAIT/NEW records may be created.
     """Store independent unread status; only fully closed current-candle setups count."""
     current = [p for p in (setups or []) if p.get('confirmation_date') == latest_closed_date]
     buy = any(p.get('direction') == 'bullish' for p in current)
@@ -9659,7 +9801,7 @@ def unread_timeframes(grp, symbol):
     with db_conn() as c:
         rows=c.execute("""
             SELECT interval FROM price_action_timeframe_status
-            WHERE grp=? AND symbol=? AND status='READY'
+            WHERE grp=? AND symbol=? AND status='READY' AND interval != '3h'
               AND confirmation_date != acknowledged_date
         """,(grp,symbol)).fetchall()
     return {r['interval'] for r in rows}
@@ -9711,7 +9853,6 @@ def pattern_signal_monitor():
     # One API job at a time still protects the FXCM/Bybit services.
     due_seconds = {
         "1h": 15 * 60,  # raw hourly data is never a trading signal
-        "3h": 10 * 60,
         "4h": 10 * 60,
         "8h": 10 * 60,
         "12h": 10 * 60,
@@ -9745,6 +9886,8 @@ def pattern_signal_monitor():
 
                 for tf in PATTERN_TIMEFRAMES:
                     interval = tf["value"]
+                    if interval == "3h":
+                        continue  # 3H disabled in every market, including background scans.
                     # 12H automatic pattern scan is only for Bybit Crypto Gap-Retest.
                     if interval == "12h" and grp != "CRYPTO":
                         continue
@@ -9926,7 +10069,7 @@ def save_trend_snapshot(symbol, states):
                 states.get("12H", ""),
                 states.get("8H", ""),
                 states.get("4H", ""),
-                states.get("3H", ""),
+                "",  # 3H signal snapshots retired; keep DB schema compatible.
                 datetime.utcnow().isoformat(),
             )
         )
@@ -11949,7 +12092,7 @@ def home():
             saved_wait_timeframes = {}
             wait_rows = c.execute("""
                 SELECT grp,symbol,interval FROM price_action_timeframe_status
-                WHERE status='FORMING' AND direction IN ('BUY','SELL') AND updated IS NOT NULL AND updated != ''
+                WHERE status='FORMING' AND interval != '3h' AND direction IN ('BUY','SELL') AND updated IS NOT NULL AND updated != ''
                 ORDER BY grp,symbol,interval
             """).fetchall()
             for wr in wait_rows:
@@ -11958,12 +12101,12 @@ def home():
             # Any unread READY timeframe lights the HOME Price Action icon.
             unread_rows = c.execute("""
                 SELECT grp,symbol,interval,direction,confirmation_date FROM price_action_timeframe_status
-                WHERE status='READY' AND confirmation_date != acknowledged_date
+                WHERE status='READY' AND interval != '3h' AND confirmation_date != acknowledged_date
             """).fetchall()
             # Include READY signals even after NEW was acknowledged.
             # No candle API calls on the home screen.
             ready_analysis_rows=c.execute("""SELECT grp,symbol,interval,confirmation_date
-                FROM price_action_timeframe_status WHERE status='READY'
+                FROM price_action_timeframe_status WHERE status='READY' AND interval != '3h'
                 ORDER BY confirmation_date DESC""").fetchall()
             analysis_ready_pairs={}
             for ar in ready_analysis_rows:
@@ -12029,7 +12172,6 @@ def home():
                     '12H': r['h12'] or '',
                     '8H': r['h8'] or '',
                     '6H': r['h4'] or '',
-                    '3H': r['h3'] or '',
                     'updated': r['updated'] or ''
                 }
                 for r in snapshot_rows
@@ -12250,7 +12392,7 @@ def signal(i):
         and not (f['grp'] != 'CRYPTO' and x['value'] == '12h')
     ]
     allowed = {x["value"]: x["label"] for x in signal_timeframes}
-    unread_on_entry = unread_timeframes(f['grp'], f['symbol'])
+    unread_on_entry = unread_timeframes(f['grp'], f['symbol']) - {"3h"}
     default_tf = next((x["value"] for x in signal_timeframes if x["value"] in unread_on_entry), "4h" if f['grp'] == 'CRYPTO' else "8h")
     selected_tf = request.args.get("tf", default_tf)
 
