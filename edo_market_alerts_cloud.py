@@ -4193,7 +4193,7 @@ def confirmation_at(candles, i):
     NORMAL pullback rule:
       - previous candle and confirmation candle must be opposite colours
       - confirmation candle must be fully closed by the caller
-      - NO 50% body-penetration requirement
+      - Weekly/Daily require at least 65% body confirmation (other TFs unchanged)
 
     The minimum 2 same-colour pullback candles are checked separately by
     detect_trend_pullback().
@@ -4223,6 +4223,31 @@ def confirmation_at(candles, i):
             "close": float(curr["close"]),
         }
 
+    return None
+
+
+# Weekly/Daily Trend Pullback: signal candle must close at least 65% of the
+# immediately preceding opposite-colour REAL BODY. Wicks are disregarded.
+# This is separate from the existing Gap Retest confirmation method.
+WEEKLY_DAILY_PULLBACK_MIN_BODY_PCT = 65.0
+PULLBACK_MANUAL_SR_WARNING = (
+    "IMPORTANT: Check the chart for nearby support or resistance BEFORE placing a trade. "
+    "Support/resistance was NOT required for this Trend Pullback signal."
+)
+
+
+def weekly_daily_pullback_confirmation_pct(candles, i):
+    if not (0 < i < len(candles)):
+        return None
+    prev, curr = candles[i-1], candles[i]
+    po, pc, cc = float(prev['open']), float(prev['close']), float(curr['close'])
+    body = abs(po - pc)
+    if body <= 0:
+        return None
+    if po > pc and candle_colour(curr) == 'green':
+        return 100.0 * (cc - pc) / body
+    if po < pc and candle_colour(curr) == 'red':
+        return 100.0 * (pc - cc) / body
     return None
 
 
@@ -5896,6 +5921,89 @@ def clean_pullback_run(candles, run_start, confirm_index, run_colour):
 
 
 
+# Edo 2026-11-24: Higher-timeframe clean pullback quality, Weekly/Daily only.
+# The impulse must be visible BEFORE the opposite-colour retracement. This is
+# not support/resistance detection and does not change diagonal Gap Retests.
+EDO_WD_MAX_PULLBACK_IMPULSE_RETRACE = 0.65
+EDO_WD_MIN_REAL_BODY_RANGE_RATIO = 0.43
+
+
+def edo_weekly_daily_clean_pullback(candles, run_start, confirm_index, run_colour):
+    """Return (accepted, diagnostics) for a clean continuation pullback.
+
+    Reject indecision/wick-dominant candles, weak/overlapping pullback legs,
+    missing pre-pullback impulse and deep reversals. All data must be fully
+    closed; the caller is responsible for excluding a still-forming candle.
+    """
+    if run_start < 3 or confirm_index <= run_start or confirm_index >= len(candles):
+        return False, {'reason': 'not enough closed history'}
+    run = candles[run_start:confirm_index]
+    if len(run) < 2 or run_colour not in ('red', 'green'):
+        return False, {'reason': 'minimum two opposite candles required'}
+
+    # Each candle in the retracement must carry a meaningful real body. Avoid
+    # indecision candles with very long wicks relative to the real body.
+    for bar in run:
+        hi, lo = float(bar['high']), float(bar['low'])
+        body = abs(float(bar['close']) - float(bar['open']))
+        candle_range = hi - lo
+        if candle_range <= 0 or body / candle_range < EDO_WD_MIN_REAL_BODY_RANGE_RATIO:
+            return False, {'reason': 'indecision / excessive-wick pullback candle'}
+
+    if run_colour == 'red':
+        # A red pullback needs an established green impulse before it.
+        impulse_colour, sign = 'green', 1
+    else:
+        impulse_colour, sign = 'red', -1
+    # Take the most recent consecutive impulse run, capped at 8 bars. The
+    # latest pre-pullback bars must themselves have a clear direction.
+    impulse_start = run_start
+    while (impulse_start > 0 and run_start - impulse_start < 8 and
+           candle_colour(candles[impulse_start-1]) == impulse_colour):
+        impulse_start -= 1
+    impulse = candles[impulse_start:run_start]
+    if len(impulse) < 2:
+        return False, {'reason': 'no clean 2+ candle trend leg before pullback'}
+
+    impulse_open = float(impulse[0]['open'])
+    impulse_close = float(impulse[-1]['close'])
+    impulse_progress = sign * (impulse_close - impulse_open)
+    if impulse_progress <= 0:
+        return False, {'reason': 'trend impulse not progressing'}
+    for bar in impulse:
+        hi, lo = float(bar['high']), float(bar['low'])
+        body = abs(float(bar['close'])-float(bar['open']))
+        if hi <= lo or body / (hi-lo) < 0.38:
+            return False, {'reason': 'indecision candle in preceding trend leg'}
+
+    # Use the impulse's actual extreme, rather than the confirming candle, to
+    # measure how much of the previous move the countertrend leg has returned.
+    if sign == 1:
+        prior_extreme = max(float(b['high']) for b in impulse)
+        retrace_extreme = min(float(b['low']) for b in run)
+        retraced = max(0.0, prior_extreme - retrace_extreme)
+        impulse_origin = min(float(b['low']) for b in impulse[:2])
+        impulse_size = prior_extreme - impulse_origin
+    else:
+        prior_extreme = min(float(b['low']) for b in impulse)
+        retrace_extreme = max(float(b['high']) for b in run)
+        retraced = max(0.0, retrace_extreme - prior_extreme)
+        impulse_origin = max(float(b['high']) for b in impulse[:2])
+        impulse_size = impulse_origin - prior_extreme
+    if impulse_size <= 0:
+        return False, {'reason': 'invalid prior trend leg'}
+    depth = retraced / impulse_size
+    if depth > EDO_WD_MAX_PULLBACK_IMPULSE_RETRACE + 1e-9:
+        return False, {'reason': 'pullback too deep', 'retracement_pct': round(100*depth, 1)}
+
+    return True, {
+        'retracement_pct': round(100*depth, 1),
+        'impulse_candles': len(impulse),
+        'pullback_candles': len(run),
+        'clean_quality': 'CLEAN',
+    }
+
+
 def trend_pullback_retracement_preserves_structure(candles, run_start, confirm_index, trend):
     """
     Trend Pullback ONLY: reject a 2+ candle counter-trend run when that run has
@@ -6066,37 +6174,41 @@ def edo_forming_pullback(candles, grp, interval):
         good, _ = clean_pullback_run(candles, run_start, next_i, run_colour)
         if not good or trend_pullback_structure_trend(candles, run_start) != trend:
             continue
+        if interval in ('1day', '1week'):
+            # WAIT uses only closed pullback bars; insert a never-used stub so
+            # the same completed-leg quality gate applies before confirmation.
+            candidate = list(candles) + [dict(candles[-1])]
+            quality_ok, _ = edo_weekly_daily_clean_pullback(
+                candidate, run_start, next_i, run_colour
+            )
+            if not quality_ok:
+                continue
         if not trend_pullback_retracement_preserves_structure(candles, run_start, next_i, trend):
             continue
-        if interval not in ('4h', '8h', '12h'):
-            # Confirm the context from *existing* levels; the latest closed
-            # pullback candle is a temporary reference point, NOT a trigger.
-            candidate = {'direction': trend, 'confirmation_index':next_i-1,
-                         'run_start':run_start}
-            near_sr, _, _ = trend_pullback_near_structural_sr(candles, candidate, interval)
-            if not near_sr:
-                continue
+        # Weekly and Daily WAIT depends on clean 2+ closed pullback candles,
+        # not nearby structural S/R. The next candle must still close and
+        # satisfy the 65% body test before an actual signal can appear.
         return direction
     return ''
 
 
-def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local_trend=True, ranging_context=None, structural_break_context=None):
+def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local_trend=True, ranging_context=None, structural_break_context=None, weekly_daily_65=False):
     """
-    Edo Trend Pullback rule — NO 50% penetration requirement.
+    Edo Trend Pullback: Weekly/Daily require 65% preceding body; other TF unchanged.
 
     BEARISH trend / possible SELL:
       1) Minimum 2 consecutive bullish fully CLOSED candles pull upward.
       2) Next fully CLOSED candle is bearish.
       3) Pullback candles must form a clean, meaningful retracement rather than
          tiny overlapping congestion.
-      4) No minimum body-penetration percentage is required.
+      4) Weekly/Daily confirmation closes >=65% of prior opposite body.
 
     BULLISH trend / possible BUY:
       1) Minimum 2 consecutive bearish fully CLOSED candles pull downward.
       2) Next fully CLOSED candle is bullish.
       3) Pullback candles must form a clean, meaningful retracement rather than
          tiny overlapping congestion.
-      4) No minimum body-penetration percentage is required.
+      4) Weekly/Daily confirmation closes >=65% of prior opposite body.
 
     No forming candle may trigger a signal.
     """
@@ -6125,6 +6237,14 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     else:
         return None
 
+    # Weekly/Daily only: require 65% of the immediately preceding opposite
+    # candle REAL body. Other pullback timeframes retain their own rules.
+    confirmation_pct = None
+    if weekly_daily_65:
+        confirmation_pct = weekly_daily_pullback_confirmation_pct(candles, i)
+        if confirmation_pct is None or confirmation_pct + 1e-9 < WEEKLY_DAILY_PULLBACK_MIN_BODY_PCT:
+            return None
+
     # Hard adjacency rule: only an uninterrupted 2+ run immediately before
     # the confirmation is valid. Never join separated same-colour candles.
     if not exact_adjacent_pullback_run(candles, run_start, i, run_colour):
@@ -6139,6 +6259,14 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     )
     if not clean_ok:
         return None
+
+    edo_clean_details = None
+    if weekly_daily_65:
+        edo_clean_ok, edo_clean_details = edo_weekly_daily_clean_pullback(
+            candles, run_start, i, run_colour
+        )
+        if not edo_clean_ok:
+            return None
 
     # Trend Pullback ONLY: use the dominant recent-structure classifier.
     # Other EdoSignal signal families continue using their existing logic.
@@ -6162,6 +6290,10 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     target = previous_target(candles, direction, run_start)
 
     return {
+        "edo_clean_pullback": edo_clean_details if weekly_daily_65 else None,
+        "weekly_daily_65_rule": bool(weekly_daily_65),
+        "confirmation_body_pct": confirmation_pct,
+        "manual_sr_warning": PULLBACK_MANUAL_SR_WARNING if weekly_daily_65 else "",
         "name": "TREND PULLBACK SETUP",
         "direction": direction,
         "confirmed": True,
@@ -6705,6 +6837,14 @@ def describe_setup(p, interval=None):
         level_text = f"{zone_word}: {p['level']:.5f} • Close: {p['confirmation_close']:.5f}"
     elif p["name"] == "TREND PULLBACK SETUP":
         detail = f"{p['run_count']} {p['run_colour']} pullback candles • Confirmed close"
+        if interval in ('1week', '1day') and p.get('weekly_daily_65_rule'):
+            detail += f" • Confirmation: {p['confirmation_body_pct']:.0f}% of prior candle body (min 65%)"
+            quality = p.get('edo_clean_pullback') or {}
+            if quality:
+                detail += (f" • CLEAN {quality.get('pullback_candles', p['run_count'])}+ pullback candles"
+                           f" • Previous trend leg {quality.get('impulse_candles', '?')} candles"
+                           f" • Retracement {quality.get('retracement_pct', 0):.0f}% (max 65%)")
+            detail += " • " + PULLBACK_MANUAL_SR_WARNING
         if p.get('edo_range_entry'):
             icon = '🟢↑' if bullish else '🔴↓'
             range_line = (f"Confirmed range: {p['edo_range_label']} "
@@ -8590,19 +8730,14 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
                 require_local_trend=(ranging_context is None),
                 ranging_context=ranging_context,
                 structural_break_context=gap_break_context,
+                weekly_daily_65=interval in ('1week', '1day'),
             )
             if not pullback:
                 continue
 
-            # Edo rule:
-            # 4H is the entry/re-entry pullback and S/R is context only, not a blocker.
-            # Daily / Weekly still require meaningful pre-existing S/R.
-            if interval not in ("4h", "8h", "12h"):
-                near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
-                    closed_candles, pullback, interval
-                )
-                if not near_sr:
-                    continue
+            # Weekly/Daily: no historical support/resistance proximity gate.
+            # Keep clean 2+ candles, closed 65% confirmation, structure and
+            # higher-timeframe permissions enforced by the usual pipeline.
 
             found.append(pullback)
 
@@ -8929,7 +9064,7 @@ def pattern_signal_family(p):
     of that type is sent for the same pair/direction on the same Perth day.
 
     Strategy families:
-      TREND PULLBACK = normal minimum-2-candle setup, NO 50% rule.
+      TREND PULLBACK = minimum-2-candle setup, 65% on Weekly/Daily.
       S/R GAP RETEST = separated historical support/resistance retest,
                        WITH the 50% confirmation rule.
     """
@@ -9396,6 +9531,12 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
             else:
                 market_text = f"The larger price structure is {structure_word}. "
 
+            pullback_warning = ""
+            if interval in ('1week', '1day') and p.get('weekly_daily_65_rule'):
+                pullback_warning = (
+                    f"Confirmation: {p['confirmation_body_pct']:.0f}% of previous opposite candle body "
+                    f"(minimum 65%). {PULLBACK_MANUAL_SR_WARNING} "
+                )
             push_body = (
                 f"TREND PULLBACK SETUP confirmed on the NEWEST CLOSED {tf_label} candle "
                 f"({format_signal_time_perth(confirmation_date)}). "
@@ -9403,6 +9544,7 @@ def notify_new_pattern_setups(symbol, interval, patterns, latest_closed_date, gr
                 f"{run_count} {pullback_colour} CLOSED candles pulled against that direction, "
                 f"then the opposite-colour {confirmation_colour} confirmation candle fully CLOSED. "
                 f"{trend_line}"
+                f"{pullback_warning}"
                 f"Possible {continuation_word} continuation. Review the chart before trading."
             )
         else:
@@ -9565,19 +9707,14 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
                 require_local_trend=(ranging_context is None),
                 ranging_context=ranging_context,
                 structural_break_context=gap_break_context,
+                weekly_daily_65=interval in ('1week', '1day'),
             )
             if not pullback:
                 continue
 
-            # Edo rule:
-            # 4H is the entry/re-entry pullback and S/R is context only, not a blocker.
-            # Daily / Weekly still require meaningful pre-existing S/R.
-            if interval not in ("4h", "8h", "12h"):
-                near_sr, sr_kind, sr_level = trend_pullback_near_structural_sr(
-                    closed_candles, pullback, interval
-                )
-                if not near_sr:
-                    continue
+            # Weekly/Daily: no historical support/resistance proximity gate.
+            # Keep clean 2+ candles, closed 65% confirmation, structure and
+            # higher-timeframe permissions enforced by the usual pipeline.
 
             found.append(pullback)
 
