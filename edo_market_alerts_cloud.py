@@ -3448,6 +3448,46 @@ def bybit_get_json(endpoint, params, timeout=15):
     return r.json()
 
 
+# OANDA migration: GET requests only; legacy FXCM journal remains intact.
+OANDA_TOKEN = os.environ.get('OANDA_API_TOKEN', '').strip()
+OANDA_ACCOUNT = os.environ.get('OANDA_ACCOUNT_ID', '').strip()
+OANDA_ENV = os.environ.get('OANDA_ENVIRONMENT', 'practice').strip().lower()
+OANDA_HOST = {'live':'https://api-fxtrade.oanda.com', 'practice':'https://api-fxpractice.oanda.com'}.get(OANDA_ENV)
+OANDA_INTERVALS = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30','1h':'H1','2h':'H2','3h':'H3','4h':'H4','6h':'H6','8h':'H8','12h':'H12','1day':'D','1week':'W','1month':'M'}
+
+def oanda_symbol(symbol):
+    s = str(symbol).upper().strip().replace(' ', '')
+    aliases = {'SP500':'SPX500_USD','US500':'SPX500_USD','S&P500':'SPX500_USD','SPX500':'SPX500_USD', 'US30':'US30_USD','DJ30':'US30_USD','DOW30':'US30_USD','NAS100':'NAS100_USD','NASDAQ100':'NAS100_USD','US100':'NAS100_USD','USTEC':'NAS100_USD','GOLD':'XAU_USD','SILVER':'XAG_USD','GER40':'DE30_EUR','DAX':'DE30_EUR','UK100':'UK100_GBP','AUS200':'AU200_AUD','AU200':'AU200_AUD','USOIL':'WTICO_USD','UKOIL':'BCO_USD'}
+    if s in aliases: return aliases[s]
+    s = s.replace('/', '_').replace('-', '_')
+    if len(s)==6 and s.isalpha(): s=s[:3]+'_'+s[3:]
+    return s
+
+def oanda_get(path, params=None):
+    if not (OANDA_TOKEN and OANDA_ACCOUNT and OANDA_HOST):
+        raise ValueError('OANDA variables missing or invalid environment')
+    r = requests.get(OANDA_HOST + path, params=params, headers={'Authorization':'Bearer '+OANDA_TOKEN}, timeout=12)
+    if not r.ok: raise ValueError('OANDA HTTP '+str(r.status_code))
+    return r.json()
+
+def oanda_ohlc(symbol, interval, outputsize):
+    instrument = oanda_symbol(symbol)
+    granularity = OANDA_INTERVALS.get(interval)
+    if not granularity: return None, 'Unsupported OANDA timeframe: '+interval
+    try:
+        j = oanda_get('/v3/accounts/'+OANDA_ACCOUNT+'/instruments/'+instrument+'/candles', {'granularity':granularity,'count':min(5000,max(40,int(outputsize)+1)), 'price':'B','smooth':'false','dailyAlignment':17,'alignmentTimezone':'America/New_York','weeklyAlignment':'Friday'})
+        rows=[]
+        for r in j.get('candles',[]):
+            stamp=parse_candle_utc(r['time'])
+            if stamp is None: continue
+            b=r['bid']
+            rows.append({'datetime':stamp.strftime('%Y-%m-%d %H:%M:%S'), 'open':float(b['o']),'high':float(b['h']),'low':float(b['l']),'close':float(b['c']), '_source_symbol':instrument,'_source_label':'OANDA '+instrument+' Bid','_oanda_complete':r.get('complete') is True})
+        rows.sort(key=lambda c:c['datetime'])
+        if len(rows)<min(40,outputsize): return None,'Not enough OANDA candles for '+instrument
+        return rows,None
+    except Exception as e:
+        return None, 'OANDA candle request failed: '+(str(e) if isinstance(e,ValueError) else type(e).__name__)+' ('+instrument+')'
+
 def latest_price(symbol, grp=None, force_refresh=False):
     cache_key = (grp or "", symbol.upper().strip())
     now = time.time()
@@ -3485,6 +3525,20 @@ def latest_price(symbol, grp=None, force_refresh=False):
 
         except Exception as e:
             print("Bybit price error", symbol, e)
+            return None
+
+    if grp in ('FOREX','CFD'):
+        try:
+            instrument=oanda_symbol(symbol)
+            j=oanda_get('/v3/accounts/'+OANDA_ACCOUNT+'/pricing', {'instruments':instrument})
+            rows=j.get('prices',[])
+            if not rows or not rows[0].get('tradeable',False): return None
+            price=float(rows[0]['bids'][0]['price'])
+            with _CACHE_LOCK:
+                _PRICE_CACHE[cache_key]={'saved_at':now,'price':price,'source_symbol':instrument}
+            return price
+        except Exception as e:
+            print('OANDA price failed',symbol,type(e).__name__,flush=True)
             return None
 
     if not TWELVE_KEY:
@@ -3817,77 +3871,12 @@ def get_ohlc(symbol, interval, outputsize=140, grp=None):
         if cached and now - cached["saved_at"] < ttl and len(cached["candles"]) >= outputsize:
             return cached["candles"][-outputsize:], None
 
-    # FOREX: use the real FXCM Bid candle feed from the private Railway service.
-    # Weekly remains reference-only and keeps the existing source because the
-    # FXCM helper service currently exposes H4/H8/H12/D1.
-    if grp == "FOREX" and interval in {"4h", "8h", "12h", "1day"}:
-        fxcm_candles, fxcm_error = fxcm_service_get_ohlc(symbol, interval, outputsize)
-        if fxcm_candles:
-            # Keep FXCM H4/D1 candles exactly as supplied by the broker service.
-            # Weekend notification suppression is handled separately and does
-            # not alter the historical candle sequence.
-
-            if len(fxcm_candles) < min(40, outputsize):
-                return None, (
-                    f"Not enough valid {interval} FXCM Forex session candles "
-                    f"returned for {symbol}."
-                )
-
-            with _CACHE_LOCK:
-                _OHLC_CACHE[cache_key] = {
-                    "saved_at": now,
-                    "candles": fxcm_candles
-                }
-            print("FOREX market source", symbol, "-> FXCM private service")
-            return fxcm_candles[-outputsize:], None
-        return None, fxcm_error
-
-    # CFD: for the US indices Edo checks on FXCM, use the SAME broker-native
-    # FXCM Bid candles instead of Twelve Data ETF proxies (SPY/DIA/QQQ).
-    # This prevents a proxy ETF candle sequence from creating a Trend Pullback
-    # that is not visible on Edo's FXCM SPX500/US30/NAS100 chart.
-    if grp == "CFD" and interval in {"4h", "8h", "1day", "1week"}:
-        fxcm_symbol = fxcm_cfd_symbol(symbol)
-        # Use the SAME broker D1 candles for the CFD Daily/Weekly trend.
-        # There is no FXCM native 1week endpoint in Edo's helper service.
-        # The previous weekly SPY/DIA index-proxy fallback could disagree with
-        # the real CFD Daily candles and consumed scarce Twelve Data credits.
-        source_interval = '1day' if interval == '1week' else interval
-        requested = 500 if source_interval == '1day' else outputsize
-        source_key = ('CFD', symbol.upper().strip(), source_interval)
+    if grp in ('FOREX','CFD'):
+        candles,error=oanda_ohlc(symbol,interval,outputsize)
+        if error: return None,error
         with _CACHE_LOCK:
-            prior = _OHLC_CACHE.get(source_key)
-            source_candles = (prior['candles'] if prior and
-                now - prior['saved_at'] < ohlc_cache_seconds(source_interval)
-                and len(prior['candles']) >= (min(350, requested) if source_interval == '1day' else outputsize)
-                else None)
-        fxcm_error = None
-        if source_candles is None:
-            source_candles, fxcm_error = fxcm_service_get_ohlc(
-                fxcm_symbol, source_interval, requested, shared_cfd_cache=True
-            )
-        if source_candles:
-            for c in source_candles:
-                c['_source_symbol'] = fxcm_symbol
-                c['_source_label'] = f'FXCM {fxcm_symbol} Bid'
-            if len(source_candles) < min(40, requested):
-                return None, (f'Not enough {source_interval} FXCM CFD candles for {fxcm_symbol}.')
-            with _CACHE_LOCK:
-                _OHLC_CACHE[source_key] = {'saved_at': now, 'candles': source_candles}
-            if interval == '1week':
-                result = _edo_cfd_fxcm_weekly_from_daily(source_candles)
-                if len(result) < 40:
-                    return None, (f'Not enough completed FXCM CFD Weekly history for {fxcm_symbol} '
-                                  f'({len(result)} weekly candles).')
-                with _CACHE_LOCK:
-                    _OHLC_CACHE[cache_key] = {'saved_at': now, 'candles': result}
-                print('CFD weekly source', symbol, '-> FXCM D1 grouped weeks', len(result))
-                return result[-outputsize:], None
-            print('CFD market source', symbol, '-> FXCM', fxcm_symbol)
-            return source_candles[-outputsize:], None
-        # Do NOT silently fall back to an ETF proxy: its price/volume and
-        # candle breaks are different from the index CFDs Edo trades.
-        return None, f'FXCM CFD candle data unavailable for {fxcm_symbol}: {fxcm_error}'
+            _OHLC_CACHE[cache_key]={'saved_at':now,'candles':candles}
+        return candles[-outputsize:],None
 
     # Crypto uses the same Bybit USDT perpetual market Edo trades.
     # The newest raw candle may still be forming. Signal logic continues to
@@ -4105,6 +4094,9 @@ def fully_closed_candles(candles, interval, now_utc=None):
         # Preserve those exact H4/D1 candle groupings instead of applying the
         # generic UTC start+duration rule, which can shift the broker session
         # and create a colour sequence that does not match the FXCM chart.
+        if '_oanda_complete' in c:
+            if c['_oanda_complete']: closed.append(c)
+            continue
         if c.get("_fxcm_native"):
             # Preserve FXCM's exact broker candle grouping, but exclude the
             # newest live/forming candle from every signal calculation.
@@ -7340,8 +7332,16 @@ def weekly_spike_monitor():
 def monthly_candle_close_utc(candle):
     """Use the next UTC calendar-month boundary, never a fixed 30-day period."""
     start = parse_candle_utc((candle or {}).get("datetime", ""))
-    if start is None or start.day != 1:
+    if start is None:
         return None
+    if start.day != 1:
+        # Native OANDA monthly bars can begin on the previous month's last day.
+        if start.day < 28: return None
+        local=start.astimezone(ZoneInfo('America/New_York'))+timedelta(days=1)
+        year,month=local.year,local.month
+        if local.day != 1: return None
+        y,m=(year+1,1) if month==12 else (year,month+1)
+        return (datetime(y,m,1,17,tzinfo=ZoneInfo('America/New_York'))-timedelta(days=1)).astimezone(timezone.utc)
     if start.month == 12:
         return start.replace(year=start.year + 1, month=1, day=1,
                              hour=0, minute=0, second=0, microsecond=0)
@@ -7353,8 +7353,8 @@ def fully_closed_monthly_candles(candles, now_utc=None):
     """Twelve Data monthly bars include a still-forming current month: exclude it."""
     now_utc = now_utc or datetime.now(timezone.utc)
     return [c for c in (candles or [])
-            if monthly_candle_close_utc(c) is not None
-            and monthly_candle_close_utc(c) <= now_utc]
+            if (c.get('_oanda_complete') is True if '_oanda_complete' in c else
+                monthly_candle_close_utc(c) is not None and monthly_candle_close_utc(c) <= now_utc)]
 
 
 def detect_monthly_support_bounce(closed_monthly):
@@ -7505,7 +7505,7 @@ def collect_monthly_spike(symbol, grp="FOREX"):
     grp = str(grp).upper()
     if grp not in ("FOREX", "CFD", "CRYPTO"):
         return None, None, "Unsupported market for Monthly spikes."
-    if grp == "CFD":
+    if grp == "CFD" and False:
         # The FXCM helper exposes D1 but not 1-month. Use the real CFD's D1
         # history, avoiding an ETF/index proxy and conserving Twelve Data.
         daily, error = get_ohlc(symbol, "1day", outputsize=500, grp="CFD")
@@ -8553,7 +8553,7 @@ def edo_load_higher_swing_history(grp, symbol, interval):
     except Exception as exc:
         print('Optional weekly objective unavailable',type(exc).__name__,flush=True)
     try:
-        if str(grp).upper() == 'CFD':
+        if str(grp).upper() == 'CFD' and False:
             # CFDs use the same FXCM Bid service as the chart (not an ETF).
             data, error = get_candles(symbol, '1day', outputsize=500, grp=grp)
             if not error and data:
@@ -10285,6 +10285,11 @@ def pattern_signal_monitor():
 
 
 def get_daily_candles_for_alignment(symbol, outputsize=1800, grp=None):
+    if grp in ('FOREX','CFD'):
+        candles,error=get_ohlc(symbol,'1day',outputsize,grp)
+        if error: return None,error
+        rows=[(parse_candle_utc(c['datetime']).replace(tzinfo=None),c['close']) for c in fully_closed_candles(candles,'1day')]
+        return (rows,None) if len(rows)>=300 else (None,'Not enough OANDA daily history')
     if not TWELVE_KEY:
         return None, "Twelve Data API key is not configured."
 
@@ -11688,6 +11693,8 @@ def get_candles(symbol, interval, outputsize=60, grp=None):
     The newest API/synthetic candle may still be forming. Signal logic still uses
     last_closed_candle(), so live candles never trigger a signal.
     """
+    if grp in ('FOREX','CFD'):
+        return get_ohlc(symbol,interval,outputsize=max(40,outputsize),grp=grp)
     if interval == "3h":
         source_size = max(60, outputsize * 3 + 9)
         candles_1h, error = get_ohlc(symbol, "1h", outputsize=source_size, grp=grp)
@@ -11862,6 +11869,9 @@ def weekly_card_completed_candles(candles, now_utc=None):
         hour=0, minute=0, second=0, microsecond=0)
     completed = []
     for candle in candles or []:
+        if '_oanda_complete' in candle:
+            if candle['_oanda_complete']: completed.append(candle)
+            continue
         start = parse_candle_utc(candle.get("datetime"))
         if start is None:
             continue
