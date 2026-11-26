@@ -5502,6 +5502,11 @@ def detect_diagonal_gap_retest(candles, conf):
             if b-a < 10 or i-b > 32:
                 continue
             slope = (vb-va)/(b-a)
+            # Diagonal-only safety: line orientation must follow trade direction.
+            # Rising support is for BUY; falling resistance is for SELL.
+            # The horizontal two-touch Gap Retest is completely separate.
+            if (direction == "bullish" and slope <= 0) or (direction == "bearish" and slope >= 0):
+                continue
             if abs(slope)*(b-a) < ar*0.8:
                 continue  # horizontal detector retains horizontal/double-top/bottom
             tolerance = ar*0.48
@@ -5518,14 +5523,11 @@ def detect_diagonal_gap_retest(candles, conf):
             test_idx = int(conf.get("retest_candle_index", i-1))
             if test_idx<=b+3 or test_idx>=i:
                 continue
-            # Third-touch diagonal Gap Retest ONLY: follow the established
-            # structure BEFORE this retest. A bearish market permits resistance
-            # swing-high SELLs; bullish permits support swing-low BUYs.
-            # When structure is genuinely mixed/ranging, allow either side.
-            # The separate horizontal/double-top/double-bottom detector stays
-            # unchanged. This function is called only on Gap Retest timeframes.
+            # Diagonal-only safety: require a CONFIRMED same-direction local
+            # trend before the retest. Mixed/ranging is not trend alignment.
+            # Horizontal two-touch Gap Retests are unaffected.
             market_trend = local_structure_trend(candles, test_idx)
-            if market_trend in ("bullish", "bearish") and direction != market_trend:
+            if market_trend != direction:
                 continue
             projected = va+slope*(i-a)
             if projected<=0:
@@ -7852,6 +7854,17 @@ def edo_filter_gap_retests_all_timeframes(symbol, grp, interval, setups):
             kept.append(p)
             continue
         direction = p.get('direction')
+        # Only DIAGONAL Gap Retests must agree with a confirmed higher-timeframe
+        # trend. Do not grant them the range-boundary exception that remains
+        # available to the unchanged horizontal two-touch detector.
+        if p.get('diagonal'):
+            if permission in ('bullish', 'bearish') and direction == permission:
+                kept.append(p)
+            else:
+                print('diagonal gap retest suppressed: not aligned with confirmed '
+                      'Weekly/Daily trend:', grp, symbol, interval, direction,
+                      permission or 'unconfirmed', flush=True)
+            continue
         if permission in ('bullish', 'bearish') and direction == permission:
             kept.append(p)
         elif permission == 'ranging' and range_info and edo_range_entry_ok(
