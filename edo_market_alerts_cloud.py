@@ -31,8 +31,6 @@ def apple_touch_icon():
 PROCESS_STARTED_UTC = datetime.now(timezone.utc)
 
 DB = os.environ.get('EDO_DB', 'edo_market_alerts.db')
-FXCM_SERVICE_URL = os.environ.get("FXCM_SERVICE_URL", "").rstrip("/")
-EDO_FXCM_HISTORY_KEY = os.environ.get('EDO_FXCM_HISTORY_KEY', '').strip()
 EDO_HISTORY_PASSWORD = os.environ.get('EDO_HISTORY_PASSWORD', '')
 TWELVE_KEY = os.environ.get('TWELVE_DATA_API_KEY', '')
 PUSHOVER_APP_TOKEN = os.environ.get('PUSHOVER_APP_TOKEN', '')
@@ -816,7 +814,7 @@ a{text-decoration:none}
 <div class="wrap">
 
 <h1>📈 EDO MARKET ALERTS</h1>
-<div style="margin:8px 0"><a href="/trade-history" style="text-decoration:none"><button type="button" title="Private read-only FXCM trade recovery journal">📜 Trade History</button></a></div>
+<div style="margin:8px 0"><a href="/trade-history" style="text-decoration:none"><button type="button" title="Trade history — MT5 integration pending">📜 Trade History</button></a></div>
 <div class="small">Forex • Crypto • CFD • Cloud price alarms</div>
 
 <div class="card">
@@ -3142,14 +3140,14 @@ def _post_news_overall_bias(symbol, grp, event_time_utc):
                 break
 
         if target_index is None:
-            return "WAITING", "MIXED", "Waiting for the FXCM 8H candle containing/following the news to close"
+            return "WAITING", "MIXED", "Waiting for the OANDA 8H candle containing/following the news to close"
 
         trend = str(local_structure_trend(closed, target_index) or "mixed").upper()
         bias = trend if trend in ("BULLISH", "BEARISH") else "UNCLEAR"
         close_text = target_close_time.astimezone(PERTH).strftime("%d %b %Y %H:%M Perth") if target_close_time else ""
         if bias == "UNCLEAR":
-            return "UNCLEAR", "MIXED", f"First FXCM 8H close after news ({close_text}) does not give a clear broader structure"
-        return bias, bias, f"First FXCM 8H close after news ({close_text}) gives {bias.lower()} broader structure"
+            return "UNCLEAR", "MIXED", f"First OANDA 8H close after news ({close_text}) does not give a clear broader structure"
+        return bias, bias, f"First OANDA 8H close after news ({close_text}) gives {bias.lower()} broader structure"
     except Exception as e:
         print("post-news overall bias error", symbol, grp, e)
         return "WAITING", "MIXED", "8H bias data temporarily unavailable"
@@ -3448,7 +3446,7 @@ def bybit_get_json(endpoint, params, timeout=15):
     return r.json()
 
 
-# OANDA migration: GET requests only; legacy FXCM journal remains intact.
+# OANDA market data: GET requests only.
 OANDA_TOKEN = os.environ.get('OANDA_API_TOKEN', '').strip()
 OANDA_ACCOUNT = os.environ.get('OANDA_ACCOUNT_ID', '').strip()
 OANDA_ENV = os.environ.get('OANDA_ENVIRONMENT', 'practice').strip().lower()
@@ -3631,233 +3629,6 @@ CORE_PATTERN_INTERVALS = SR_GAP_RETEST_INTERVALS
 
 
 
-
-def fxcm_cfd_symbol(symbol):
-    """Map Edo's saved CFD names to the FXCM instrument names used on his charts."""
-    s = str(symbol or "").upper().strip().replace(" ", "")
-    return {
-        "SP500": "SPX500",
-        "US500": "SPX500",
-        "S&P500": "SPX500",
-        "SPX500": "SPX500",
-        "DJ30": "US30",
-        "US30": "US30",
-        "DOW30": "US30",
-        "NAS100": "NAS100",
-        "NASDAQ100": "NAS100",
-        "US100": "NAS100",
-        "USTEC": "NAS100",
-    }.get(s, s)
-
-
-def _edo_cfd_fxcm_weekly_from_daily(daily_candles, now_utc=None):
-    """Make CFD weekly candles from the SAME FXCM Bid D1 bars as its Daily trend.
-
-    A Sunday FXCM session belongs to the following ISO trading week.  Only
-    already-completed daily candles can contribute, and the still-forming
-    current weekly candle is explicitly marked.  This avoids mixing SPX500
-    with SPY or US30 with DIA and saves the Twelve Data weekly requests.
-    """
-    from datetime import timedelta
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    current_monday = (now_utc - timedelta(days=now_utc.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0)
-    weeks = {}
-    for c in daily_candles or []:
-        if c.get('_fxcm_forming'):
-            continue
-        dt = parse_candle_utc(c.get('datetime'))
-        if dt is None:
-            continue
-        # FXCM's Sunday session is part of the following trading week.
-        effective = dt + timedelta(days=1) if dt.weekday() == 6 else dt
-        monday = (effective - timedelta(days=effective.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0)
-        bucket = weeks.setdefault(monday, [])
-        bucket.append((dt, c))
-    results = []
-    for monday, entries in sorted(weeks.items()):
-        entries.sort(key=lambda x: x[0])
-        rows = [c for _, c in entries]
-        if not rows:
-            continue
-        # The earliest bucket may have begun before the downloaded history.
-        # Never infer a historical complete week from a truncated first bar.
-        if monday == min(weeks) and len(rows) < 3:
-            continue
-        results.append({
-            'datetime': monday.strftime('%Y-%m-%d %H:%M:%S'),
-            'open': float(rows[0]['open']),
-            'high': max(float(c['high']) for c in rows),
-            'low': min(float(c['low']) for c in rows),
-            'close': float(rows[-1]['close']),
-            '_source_symbol': rows[-1].get('_source_symbol', ''),
-            '_source_label': rows[-1].get('_source_label', 'FXCM Bid') + ' (Weekly from FXCM D1)',
-            '_fxcm_native': True,
-            '_fxcm_forming': monday >= current_monday,
-        })
-    return results
-
-
-# Shared short FXCM backoff across Gunicorn workers. A failed DNS/connect attempt
-# must not block every symbol's page request in succession. Only successful
-# broker responses are cached; no stale or synthetic candles are used as signals.
-_EDO_FXCM_COOLDOWN_PATH = os.path.join(_EDO_TWELVE_CACHE_DIR, 'fxcm_unreachable_until.json')
-_EDO_FXCM_COOLDOWN_SECONDS = 90
-
-
-def _edo_fxcm_cooling_down():
-    try:
-        with open(_EDO_FXCM_COOLDOWN_PATH, 'r', encoding='utf-8') as stream:
-            return time.time() < float(json.load(stream).get('until', 0))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return False
-
-
-def _edo_fxcm_mark_unreachable():
-    try:
-        os.makedirs(_EDO_TWELVE_CACHE_DIR, exist_ok=True)
-        tmp = (_EDO_FXCM_COOLDOWN_PATH + '.' + str(os.getpid()) + '.' +
-               str(threading.get_ident()) + '.tmp')
-        with open(tmp, 'w', encoding='utf-8') as stream:
-            json.dump({'until': time.time() + _EDO_FXCM_COOLDOWN_SECONDS}, stream)
-        os.replace(tmp, _EDO_FXCM_COOLDOWN_PATH)
-    except OSError as exc:
-        print('FXCM cooldown file unavailable:', exc, flush=True)
-
-
-def fxcm_service_get_ohlc(symbol, interval, outputsize=140, shared_cfd_cache=False):
-    """Read FXCM Bid candles from EdoSignal's private Railway FXCM service."""
-    if not FXCM_SERVICE_URL:
-        return None, "FXCM service URL is not configured."
-
-    timeframe_map = {
-        "4h": "H4",
-        "8h": "H8",
-        "12h": "H12",
-        "1day": "D1",
-    }
-    tf = timeframe_map.get(str(interval).lower())
-    if not tf:
-        return None, f"FXCM service does not provide {interval}."
-
-    # Only CFD requests share a short-lived, disk-backed FXCM response cache.
-    # This works across Gunicorn workers and avoids repeat index requests
-    # when Home trends, Weekly patterns and Price Action open together.
-    # Forex's existing fetch behaviour is intentionally not changed.
-    cfd_cache_path = None
-    cfd_cache_ttl = 0
-    if shared_cfd_cache:
-        cfd_cache_ttl = {'D1': 420, 'H8': 240, 'H4': 210}.get(tf, 180)
-        cache_spec = f'{symbol.upper()}|{tf}|{int(outputsize)}'
-        cfd_cache_path = os.path.join(
-            _EDO_TWELVE_CACHE_DIR,
-            'fxcm_cfd_' + hashlib.sha256(cache_spec.encode('utf-8')).hexdigest() + '.json')
-        cached_response = _edo_load_twelve_cache(cfd_cache_path, cfd_cache_ttl)
-        if cached_response is not None and cached_response.get('ok') and cached_response.get('rows'):
-            payload = cached_response
-        else:
-            payload = None
-    else:
-        payload = None
-
-    # Forex and CFD can share successful FXCM responses across threads/workers.
-    # Do not use old candles after the cache TTL: a signal must never be
-    # generated from a stale response just because the provider is unreachable.
-    if cfd_cache_path is None:
-        cache_spec = f'{symbol.upper()}|{tf}|{int(outputsize)}'
-        cfd_cache_path = os.path.join(
-            _EDO_TWELVE_CACHE_DIR,
-            'fxcm_forex_' + hashlib.sha256(cache_spec.encode('utf-8')).hexdigest() + '.json')
-        ttl = {'D1': 420, 'H8': 240, 'H4': 210, 'H12': 270}.get(tf, 180)
-        payload = _edo_load_twelve_cache(cfd_cache_path, ttl)
-
-    try:
-        if payload is None:
-            if _edo_fxcm_cooling_down():
-                return None, 'FXCM connection temporarily unavailable; retrying shortly.'
-            try:
-                r = requests.get(
-                    FXCM_SERVICE_URL + "/candles",
-                    params={
-                        "symbol": symbol,
-                        "timeframe": tf,
-                        "count": max(10, min(int(outputsize), 500)),
-                    },
-                    # A 20s wait in each symbol/TF can exceed Gunicorn's
-                    # default 30s request timeout. Bound the connect and read.
-                    timeout=(2, 4),
-                )
-                r.raise_for_status()
-                payload = r.json()
-            except (requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout) as exc:
-                _edo_fxcm_mark_unreachable()
-                print('FXCM service temporarily unreachable:', type(exc).__name__, flush=True)
-                return None, 'FXCM service temporarily unreachable; retrying shortly.'
-            if (isinstance(payload, dict) and payload.get('ok') and payload.get('rows')):
-                try:
-                    os.makedirs(_EDO_TWELVE_CACHE_DIR, exist_ok=True)
-                    temp_file = (cfd_cache_path + '.' + str(os.getpid()) + '.' +
-                                 str(threading.get_ident()) + '.tmp')
-                    with open(temp_file, 'w', encoding='utf-8') as f:
-                        json.dump({'saved_at': time.time(), 'response': payload}, f)
-                    os.replace(temp_file, cfd_cache_path)
-                except OSError as exc:
-                    print('FXCM response cache write skipped', exc, flush=True)
-
-        if not payload.get("ok"):
-            return None, "FXCM service error: " + str(payload.get("error", "Unknown error"))
-
-        candles = []
-        for row in payload.get("rows") or []:
-            candles.append({
-                "datetime": str(row.get("datetime", "")),
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
-                "_source_symbol": symbol,
-                "_source_label": "FXCM Bid",
-                # Mark these as broker-native FXCM candles. Their labels must
-                # not be shifted/rebucketed by generic UTC candle logic.
-                "_fxcm_native": True,
-            })
-
-        candles.sort(key=lambda x: x["datetime"])
-        # The FXCM helper has occasionally supplied a synthetic D1 candle
-        # stamped on Saturday evening UTC (e.g. GBP/USD 2026-10-24 21:00Z).
-        # Spot FX is closed then. Treating that row as an independent Daily
-        # candle inflated Edo's consecutive red/green pullback counts.
-        # Preserve the raw provider bars on all intraday timeframes; this
-        # guard applies ONLY to Forex D1, not to crypto or index CFDs.
-        if tf == "D1" and str(symbol).strip().upper() not in {
-            "SPX500", "US30", "NAS100", "GER30", "UK100", "FRA40",
-            "JPN225", "AUS200", "HK33", "US2000"
-        }:
-            kept = []
-            for candle in candles:
-                session_time = parse_candle_utc(candle.get("datetime"))
-                if session_time is not None and session_time.weekday() == 5:
-                    print("FXCM D1 closed-market Saturday bar excluded:",
-                          symbol, candle.get("datetime"))
-                    continue
-                kept.append(candle)
-            candles = kept
-        if not candles:
-            return None, "FXCM service returned no candles."
-
-        # FXCM's newest row is the current live broker candle while Forex is
-        # open. It must never confirm a setup.
-        if not forex_weekend_closed():
-            candles[-1]["_fxcm_forming"] = True
-
-        return candles[-outputsize:], None
-
-    except Exception as e:
-        print("FXCM service OHLC error:", symbol, interval, e)
-        return None, f"FXCM service error: {e}"
 
 
 def get_ohlc(symbol, interval, outputsize=140, grp=None):
@@ -12975,123 +12746,6 @@ def health():
 
 
 
-# ================================================================
-# Read-only FXCM trade journal: separate from signal generation.
-# Only grand-youth stores personal trading information; the candle
-# service does not persist trade records. Never logs secrets/trades.
-# ================================================================
-
-def edo_history_init_db():
-    with db_conn() as c:
-        c.execute('''CREATE TABLE IF NOT EXISTS edo_fxcm_trades (
-          trade_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL,
-          open_time TEXT, close_time TEXT, entry REAL NOT NULL,
-          mark REAL, amount REAL, status TEXT NOT NULL,
-          worst_mark REAL, best_mark REAL, adverse_seen INTEGER DEFAULT 0,
-          recovery_time TEXT, gross_pl REAL, commission REAL, rollover REAL,
-          data_quality TEXT NOT NULL DEFAULT 'OBSERVED_SINCE_SYNC',
-          last_seen TEXT NOT NULL
-        )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS edo_fxcm_history_sync (
-          name TEXT PRIMARY KEY, last_success TEXT, last_error TEXT
-        )''')
-
-
-def edo_history_save_snapshot(payload):
-    now = datetime.now(timezone.utc).isoformat()
-    if not isinstance(payload, dict) or payload.get('ok') is not True:
-        return
-    all_rows = (payload.get('open') or []) + (payload.get('closed') or [])
-    with db_conn() as c:
-        for item in all_rows:
-            try:
-                tid = str(item.get('trade_id', ''))[:128]
-                symbol = str(item.get('symbol', ''))[:80]
-                side = item.get('direction')
-                entry = float(item['entry'])
-                if not tid or not symbol or side not in ('BUY', 'SELL') or not (0 < entry < 1000000000):
-                    continue
-                status = item.get('status')
-                if status not in ('OPEN', 'CLOSED'):
-                    continue
-                mark = item.get('exit')
-                mark = float(mark) if mark is not None else None
-                prev = c.execute('SELECT * FROM edo_fxcm_trades WHERE trade_id=?', (tid,)).fetchone()
-                # A prior CLOSED record is final. A single missing SDK row
-                # is not evidence of a closed trade.
-                if prev is not None and prev['status'] == 'CLOSED':
-                    continue
-                adverse = bool(prev['adverse_seen']) if prev else False
-                recovery = prev['recovery_time'] if prev else None
-                worst = prev['worst_mark'] if prev else None
-                best = prev['best_mark'] if prev else None
-                if mark is not None and 0 <= mark < 1000000000:
-                    worst = min(worst, mark) if worst is not None else mark
-                    best = max(best, mark) if best is not None else mark
-                    if (side == 'BUY' and mark < entry) or (side == 'SELL' and mark > entry):
-                        adverse = True
-                    if adverse and not recovery and ((side == 'BUY' and mark >= entry) or
-                                                      (side == 'SELL' and mark <= entry)):
-                        # Approximate: timestamp is FIRST POLL observing recovery;
-                        # it is not the exact market crossing time.
-                        recovery = now
-                if status == 'CLOSED' and mark is None:
-                    # Broker table lacked a usable close quote; do not fabricate.
-                    continue
-                # Preserve actual broker values when they exist. Never claim
-                # gross P/L is net after financing / commission.
-                gross = item.get('gross_pl') if status == 'CLOSED' else None
-                commission = item.get('commission')
-                rollover = item.get('rollover')
-                quality = 'PARTIAL_HISTORY' if not prev and status == 'CLOSED' else 'OBSERVED_SINCE_SYNC'
-                c.execute('''INSERT INTO edo_fxcm_trades (
-                  trade_id,symbol,side,open_time,close_time,entry,mark,amount,
-                  status,worst_mark,best_mark,adverse_seen,recovery_time,
-                  gross_pl,commission,rollover,data_quality,last_seen)
-                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                  ON CONFLICT(trade_id) DO UPDATE SET
-                    symbol=excluded.symbol,side=excluded.side,
-                    close_time=excluded.close_time,mark=excluded.mark,
-                    status=excluded.status,worst_mark=excluded.worst_mark,
-                    best_mark=excluded.best_mark,adverse_seen=excluded.adverse_seen,
-                    recovery_time=excluded.recovery_time,gross_pl=excluded.gross_pl,
-                    commission=excluded.commission,rollover=excluded.rollover,
-                    data_quality=edo_fxcm_trades.data_quality,last_seen=excluded.last_seen
-                ''', (tid, symbol, side, item.get('open_time'), item.get('close_time'),
-                       entry, mark, item.get('amount'), status, worst, best,
-                       int(adverse), recovery, gross, commission, rollover, quality, now))
-            except (ValueError, TypeError, OverflowError, KeyError):
-                continue
-        c.execute('''INSERT INTO edo_fxcm_history_sync(name,last_success,last_error)
-           VALUES ('last',?,NULL) ON CONFLICT(name) DO UPDATE SET
-           last_success=excluded.last_success,last_error=NULL''', (now,))
-
-
-def edo_history_sync_loop():
-    # Keep this polling cycle independent of pattern scans. No account API
-    # request ever executes on a page-rendering thread.
-    while True:
-        try:
-            if len(EDO_FXCM_HISTORY_KEY) >= 32 and FXCM_SERVICE_URL and EDO_HISTORY_PASSWORD:
-                r = requests.get(FXCM_SERVICE_URL + '/trades',
-                    headers={'X-Edo-History-Key': EDO_FXCM_HISTORY_KEY},
-                    timeout=(2.0, 5.0))
-                if r.status_code == 200:
-                    edo_history_save_snapshot(r.json())
-                elif r.status_code not in (503,):
-                    with db_conn() as c:
-                        c.execute('''INSERT INTO edo_fxcm_history_sync(name,last_error)
-                          VALUES ('last',?) ON CONFLICT(name) DO UPDATE SET
-                          last_error=excluded.last_error''', ('Broker history request returned HTTP ' + str(r.status_code),))
-        except Exception as exc:
-            with db_conn() as c:
-                c.execute('''INSERT INTO edo_fxcm_history_sync(name,last_error)
-                  VALUES ('last',?) ON CONFLICT(name) DO UPDATE SET
-                  last_error=excluded.last_error''', (type(exc).__name__,))
-        time.sleep(60)
-
-
-# A signed, persistent, Trade History-only login (365 days).
 # No server-side session storage is needed, so Railway restarts do not log you out.
 EDO_HISTORY_LOGIN_DAYS = 365
 EDO_HISTORY_COOKIE = 'edo_history_login'
@@ -13100,8 +12754,8 @@ EDO_HISTORY_LOGIN_SECONDS = EDO_HISTORY_LOGIN_DAYS * 24 * 60 * 60
 
 def edo_history_cookie_signature(stamp):
     # Password rotation invalidates previously issued cookies.
-    secret = hashlib.sha256((EDO_HISTORY_PASSWORD + ':' + EDO_FXCM_HISTORY_KEY +
-                             ':edo-history-cookie-v1').encode('utf-8')).digest()
+    secret = hashlib.sha256((EDO_HISTORY_PASSWORD +
+                             ':edo-history-cookie-v2').encode('utf-8')).digest()
     return hmac.new(secret, str(stamp).encode('ascii'), hashlib.sha256).hexdigest()
 
 
@@ -13122,7 +12776,7 @@ def edo_history_auth_ok():
 
 @APP.route('/trade-history/login', methods=['GET', 'POST'])
 def edo_history_login():
-    if not EDO_HISTORY_PASSWORD or len(EDO_FXCM_HISTORY_KEY) < 32:
+    if not EDO_HISTORY_PASSWORD:
         return ('Trade History is not configured.', 503)
     if request.method == 'POST':
         submitted = request.form.get('password', '')
@@ -13169,46 +12823,22 @@ def edo_history_logout():
 
 @APP.route('/trade-history')
 def edo_history_page():
-    if not EDO_HISTORY_PASSWORD or len(EDO_FXCM_HISTORY_KEY) < 32:
-        return ('Trade History is not configured. Add EDO_HISTORY_PASSWORD and '
-                'EDO_FXCM_HISTORY_KEY to grand-youth, and the same '
-                'EDO_FXCM_HISTORY_KEY to caring-celebration.', 503)
+    if not EDO_HISTORY_PASSWORD:
+        return ('Trade History is not configured.', 503)
     if not edo_history_auth_ok():
         return redirect('/trade-history/login')
-    with db_conn() as c:
-        trades = c.execute('''SELECT * FROM edo_fxcm_trades
-                           ORDER BY COALESCE(open_time,last_seen) DESC LIMIT 500''').fetchall()
-        sync = c.execute("SELECT * FROM edo_fxcm_history_sync WHERE name='last'").fetchone()
-    records = [dict(t) for t in trades]
-    recovered = sum(bool(x['recovery_time']) for x in records)
-    unresolved = sum(x['status'] == 'OPEN' and not x['recovery_time'] for x in records)
-    return render_template_string('''<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="Cache-Control" content="no-store"><title>EdoSignal Trade History</title>
-    <style>body{background:#0c1525;color:#e6edf7;font-family:Arial,sans-serif;max-width:1100px;margin:20px auto;padding:12px}
-    .box{background:#15263f;border-radius:12px;padding:16px;margin:12px 0}.sub{color:#afc4e0}
-    table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #3a4a60;padding:9px;text-align:left}
-    .scroll{overflow-x:auto}.pill{background:#345274;padding:5px 12px;border-radius:8px;color:white;text-decoration:none}
-    </style></head><body><a class="pill" href="/">← Back</a> <form method="post" action="/trade-history/logout" style="display:inline;margin-left:10px"><button class="pill" type="submit" style="border:0;cursor:pointer">Log out</button></form> <h2>📜 FXCM Trade Recovery History</h2>
-    <div class="box"><b>Tracked: {{n}} | Recovered after observed drawdown: {{recovered}} | Open awaiting recovery: {{unresolved}}</b>
-    <p class="sub">Last successful sync: {{sync.last_success if sync else 'Not yet synced'}}
-    {% if sync and sync.last_error %} | Latest sync issue: {{sync.last_error}}{% endif %}</p>
-    <p class="sub">Recovery means a sampled close-out quote returned to the entry AFTER an adverse sampled quote.
-    Overnight moves between polls can be missed; this is not a verified lifetime recovery rate.
-    Older imported trades may have incomplete histories. P/L is gross if supplied by FXCM.</p></div>
-    <div class="box scroll"><table><thead><tr><th>Pair</th><th>Side</th><th>Opened</th><th>Entry</th><th>Status</th>
-    <th>Latest/exit</th><th>Worst observed</th><th>Recovery observed</th><th>Gross P/L</th><th>History quality</th></tr></thead><tbody>
-    {% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.side}}</td><td>{{t.open_time or '—'}}</td>
-    <td>{{'%.5f'|format(t.entry)}}</td><td>{{t.status}}</td><td>{{t.mark if t.mark is not none else '—'}}</td>
-    <td>{{(t.worst_mark if t.side == 'BUY' else t.best_mark) if (t.worst_mark if t.side == 'BUY' else t.best_mark) is not none else '—'}}</td>
-    <td>{{t.recovery_time or 'Not observed'}}</td><td>{{t.gross_pl if t.gross_pl is not none else '—'}}</td>
-    <td>{{t.data_quality}}</td></tr>{% endfor %}</tbody></table>
-    {% if not trades %}<p class="sub">No FXCM trades collected yet. Trade import runs once per minute when enabled.</p>{% endif %}
-    </div></body></html>''', trades=records, n=len(records), recovered=recovered, unresolved=unresolved,
-        sync=dict(sync) if sync else None)
+    return render_template_string('''<!doctype html><html><head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EdoSignal Trade History</title>
+    <style>body{background:#07111f;color:#eef6ff;font-family:Arial,sans-serif;max-width:760px;margin:auto;padding:18px} .card{background:#0d1b2a;border-radius:18px;padding:16px;margin:12px 0} a{color:#5dade2} button{padding:10px;border:0;border-radius:9px}</style>
+    </head><body><a href="/">← Back</a><h2>📜 Trade History</h2>
+    <div class="card"><b>OANDA ONE / MetaTrader 5</b><p>No trades imported. View your actual trading history in MetaTrader 5. Automatic MT5 history integration is not configured.</p></div>
+    <form method="post" action="/trade-history/logout"><button>Sign out</button></form></body></html>'''), 200, {'Cache-Control':'no-store'}
+
+
 
 
 init_db()
-edo_history_init_db()
 
 # A Gunicorn worker imports this module separately from every other worker.
 # Starting all monitor threads on every import duplicates scans, requests,
@@ -13231,7 +12861,6 @@ def _edo_start_monitors_once():
                 return False
         _EDO_MONITOR_LEADER_HANDLE = handle  # keep fd open for worker lifetime
         for name, target in (
-            ('edo-fxcm-history', edo_history_sync_loop),
             ('edo-price-alerts', monitor),
             ('edo-trailing-stop', trailing_stop_monitor),
             ('edo-trend', active_trend_monitor),
