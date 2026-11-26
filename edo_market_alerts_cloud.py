@@ -8687,15 +8687,14 @@ def build_pattern_signal(symbol, interval, grp="FOREX", force_refresh=False):
     #    The 50% previous-candle BODY rule applies ONLY to this signal.
     if sr_gap_retest_interval_enabled(grp, interval):
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9, grp=grp):
-            # Weekly, Daily and 8H: true swing Gap Retest, no S/R prerequisite.
-            # Crypto 12H retains its existing detection until separately requested.
+            # PROTECTED: use the existing original two-point detector unchanged.
+            # The loose separated-swing detector is not an authorised substitute.
             unrestricted_gap_tf = interval in ('1week', '1day', '8h')
-            sr_setup = (detect_gap_retest_without_sr(closed_candles, sr_conf)
-                        if unrestricted_gap_tf else detect_bounce_retest(closed_candles, sr_conf))
+            sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
                 found.append(add_turning_point_gap_strength(closed_candles, sr_setup, interval))
             # Diagonal trendline retests are a separate optional pattern and
-            # must not replace the unrestricted Gap Retest test above.
+            # must not replace the protected two-point Gap Retest test above.
             diagonal_setup = detect_diagonal_gap_retest(closed_candles, sr_conf)
             if diagonal_setup:
                 if unrestricted_gap_tf:
@@ -9662,15 +9661,14 @@ def collect_closed_pattern_setups(symbol, interval, grp="FOREX"):
     #    supply the cleaner version of the same price structure.
     if sr_gap_retest_interval_enabled(grp, interval):
         for sr_conf in recent_sr_confirmations(closed_candles, lookback=9, grp=grp):
-            # Weekly, Daily and 8H: true swing Gap Retest, no S/R prerequisite.
-            # Crypto 12H retains its existing detection until separately requested.
+            # PROTECTED: use the existing original two-point detector unchanged.
+            # The loose separated-swing detector is not an authorised substitute.
             unrestricted_gap_tf = interval in ('1week', '1day', '8h')
-            sr_setup = (detect_gap_retest_without_sr(closed_candles, sr_conf)
-                        if unrestricted_gap_tf else detect_bounce_retest(closed_candles, sr_conf))
+            sr_setup = detect_bounce_retest(closed_candles, sr_conf)
             if sr_setup:
                 found.append(add_turning_point_gap_strength(closed_candles, sr_setup, interval))
             # Diagonal trendline retests are a separate optional pattern and
-            # must not replace the unrestricted Gap Retest test above.
+            # must not replace the protected two-point Gap Retest test above.
             diagonal_setup = detect_diagonal_gap_retest(closed_candles, sr_conf)
             if diagonal_setup:
                 if unrestricted_gap_tf:
