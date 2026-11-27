@@ -4196,109 +4196,28 @@ def local_structure_trend(candles, end_index):
 
 
 
+# PROTECTED EDO PULLBACK RULE — approved 27 Nov 2026.
+# Do not modify without explicit user approval. Independent of e-Gap Retest.
 def trend_pullback_structure_trend(candles, end_index):
-    """
-    Trend direction used ONLY by the normal TREND PULLBACK detector.
+    """Strict HH+HL / LH+LL on confirmed pre-pullback swings only.
 
-    Purpose: identify the dominant RECENT structure before the pullback starts,
-    without letting an old large impulse dominate after market structure has
-    genuinely changed.  No EMA/RSI and no changes to other EdoSignal signals.
-
-    Evidence is deliberately recent and layered:
-      1) newest confirmed swing highs/lows (HH+HL or LH+LL),
-      2) directional progress across 12/20/28-candle windows,
-      3) conflicting evidence returns MIXED rather than forcing a direction.
+    Use the existing 28-candle structure window and two bars on each
+    side of a pivot. No momentum fallback, no forming/future candles.
+    Equal, missing or contradictory swings are MIXED (no pullback).
     """
     if end_index < 12:
         return "mixed"
-
-    history = candles[:end_index]
-    if len(history) < 12:
+    history = candles[max(0, end_index - 28):end_index]
+    highs = swing_points(history, "high", left=2, right=2)
+    lows = swing_points(history, "low", left=2, right=2)
+    if len(highs) < 2 or len(lows) < 2:
         return "mixed"
-
-    # Structural vote from the newest confirmed swings.  Use at most the last
-    # 28 pre-pullback candles so a much older trend cannot control a new regime.
-    structural = history[-28:]
-    highs = swing_points(structural, "high", left=2, right=2)
-    lows = swing_points(structural, "low", left=2, right=2)
-
-    swing_vote = None
-    if len(highs) >= 2 and len(lows) >= 2:
-        hh = highs[-1][1] > highs[-2][1]
-        hl = lows[-1][1] > lows[-2][1]
-        lh = highs[-1][1] < highs[-2][1]
-        ll = lows[-1][1] < lows[-2][1]
-        if hh and hl:
-            swing_vote = "bullish"
-        elif lh and ll:
-            swing_vote = "bearish"
-
-    # Recent-progress votes.  Averaging three closes at each end reduces the
-    # chance that one spike/wick or one unusually large candle flips the trend.
-    progress_votes = []
-    for n in (12, 20, 28):
-        if len(history) < n:
-            continue
-        part = history[-n:]
-        first = sum(float(c["close"]) for c in part[:3]) / 3.0
-        last = sum(float(c["close"]) for c in part[-3:]) / 3.0
-        move = last - first
-        ar = avg_range(part, end=len(part), length=len(part))
-        threshold = max(ar * 1.10, abs(first) * 0.0010)
-        if move > threshold:
-            progress_votes.append("bullish")
-        elif move < -threshold:
-            progress_votes.append("bearish")
-
-    bulls = progress_votes.count("bullish")
-    bears = progress_votes.count("bearish")
-
-    # Recent-regime override for Trend Pullback only.  A strong fresh move can
-    # establish a new trend before the slower 20/28-candle swing structure has
-    # fully caught up.  This prevents an older bearish/bullish leg from causing
-    # a pullback alert in the wrong direction after a clear reversal.
-    recent_n = min(12, len(history))
-    recent = history[-recent_n:]
-    if len(recent) >= 8:
-        k = min(3, max(2, len(recent) // 4))
-        first_recent = sum(float(c["close"]) for c in recent[:k]) / k
-        last_recent = sum(float(c["close"]) for c in recent[-k:]) / k
-        recent_move = last_recent - first_recent
-        recent_ar = avg_range(recent, end=len(recent), length=len(recent))
-        strong_move = max(recent_ar * 2.25, abs(first_recent) * 0.0015)
-
-        up_steps = sum(
-            1 for j in range(1, len(recent))
-            if float(recent[j]["close"]) > float(recent[j-1]["close"])
-        )
-        down_steps = sum(
-            1 for j in range(1, len(recent))
-            if float(recent[j]["close"]) < float(recent[j-1]["close"])
-        )
-        step_need = max(4, (len(recent) - 1) // 2 + 1)
-
-        # Require both substantial displacement and a majority of progressing
-        # closes, so one oversized candle alone cannot flip the trend.
-        if recent_move > strong_move and up_steps >= step_need and up_steps > down_steps:
-            return "bullish"
-        if recent_move < -strong_move and down_steps >= step_need and down_steps > up_steps:
-            return "bearish"
-
-    # A confirmed newest HH+HL / LH+LL has priority unless recent price
-    # progress clearly contradicts it in at least two windows.
-    if swing_vote == "bullish" and bears < 2:
+    if highs[-1][1] > highs[-2][1] and lows[-1][1] > lows[-2][1]:
         return "bullish"
-    if swing_vote == "bearish" and bulls < 2:
+    if highs[-1][1] < highs[-2][1] and lows[-1][1] < lows[-2][1]:
         return "bearish"
-
-    # Without a complete swing pair, require agreement from at least two recent
-    # windows.  Otherwise stay MIXED and suppress the Trend Pullback signal.
-    if bulls >= 2 and bears == 0:
-        return "bullish"
-    if bears >= 2 and bulls == 0:
-        return "bearish"
-
     return "mixed"
+
 
 def previous_target(candles, direction, before_index, search_back=60):
     """
@@ -6036,13 +5955,14 @@ def detect_trend_pullback(candles, conf, allow_sr_exception=False, require_local
     # Trend Pullback ONLY: use the dominant recent-structure classifier.
     # Other EdoSignal signal families continue using their existing logic.
     trend = trend_pullback_structure_trend(candles, run_start)
-    if require_local_trend and trend != required_trend and structural_break_context is None:
+    # PROTECTED: range and gap-break exceptions cannot bypass HH/HL or LH/LL.
+    if trend != required_trend:
         return None
 
     # The counter-trend run must remain a retracement.  If it has already
     # broken the pre-pullback swing structure, the old trend is invalidated and
     # the confirmation candle must NOT create a continuation signal.
-    if ranging_context is None and structural_break_context is None and not trend_pullback_retracement_preserves_structure(
+    if not trend_pullback_retracement_preserves_structure(
         candles, run_start, i, required_trend
     ):
         return None
